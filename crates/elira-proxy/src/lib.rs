@@ -6,14 +6,14 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
 use http::header::{
-    HeaderName, HeaderValue, CACHE_CONTROL, CONNECTION, CONTENT_TYPE, HOST, SERVER,
-    TRANSFER_ENCODING,
+    HeaderName, HeaderValue, CACHE_CONTROL, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, SERVER,
+    TRANSFER_ENCODING, UPGRADE,
 };
 use http::uri::Authority;
 use http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
@@ -22,9 +22,12 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
-use hyper_util::rt::TokioExecutor;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::sync::Semaphore;
 
-use elira_config::Config;
+use elira_config::{Config, Health};
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub type Body = BoxBody<Bytes, BoxError>;
@@ -36,7 +39,9 @@ pub struct Proxy {
 
 struct Inner {
     router: Router,
+    pools: Vec<Arc<Pool>>,
     client: Client<HttpConnector, Incoming>,
+    tunnels: Arc<Semaphore>,
     timeout: Duration,
 }
 
@@ -47,13 +52,28 @@ struct Router {
 
 struct Pool {
     servers: Vec<Authority>,
+    health: Vec<AtomicBool>,
     next: AtomicUsize,
 }
 
 impl Pool {
     fn pick(&self) -> &Authority {
-        let i = self.next.fetch_add(1, Ordering::Relaxed);
-        &self.servers[i % self.servers.len()]
+        let start = self.next.fetch_add(1, Ordering::Relaxed);
+        for offset in 0..self.servers.len() {
+            let index = (start + offset) % self.servers.len();
+            if self.health[index].load(Ordering::Relaxed) {
+                return &self.servers[index];
+            }
+        }
+        // Everything looks down. Send traffic anyway: a broken probe should
+        // not turn into an outage, and the checker will correct itself.
+        &self.servers[start % self.servers.len()]
+    }
+
+    fn set_health(&self, index: usize, up: bool) {
+        if self.health[index].swap(up, Ordering::Relaxed) != up {
+            tracing::warn!(upstream = %self.servers[index], healthy = up, "upstream health changed");
+        }
     }
 }
 
@@ -75,14 +95,17 @@ impl Proxy {
                 })?;
                 servers.push(authority);
             }
+            let health = (0..servers.len()).map(|_| AtomicBool::new(true)).collect();
             pools.insert(
                 up.name.clone(),
                 Arc::new(Pool {
                     servers,
+                    health,
                     next: AtomicUsize::new(0),
                 }),
             );
         }
+        let all_pools: Vec<Arc<Pool>> = pools.values().cloned().collect();
 
         let mut by_host = HashMap::new();
         let mut default = None;
@@ -114,33 +137,49 @@ impl Proxy {
         Ok(Self {
             inner: Arc::new(Inner {
                 router: Router { by_host, default },
+                pools: all_pools,
                 client,
+                tunnels: Arc::new(Semaphore::new(cfg.limits.max_connections)),
                 timeout: Duration::from_secs(cfg.limits.upstream_timeout_secs),
             }),
         })
     }
 
-    pub async fn handle(&self, req: Request<Incoming>, peer: SocketAddr) -> Response<Body> {
-        self.forward(req, peer).await.unwrap_or_else(|err| err)
+    /// Probe every upstream once and update its health flag.
+    pub async fn check_health(&self, cfg: &Health) {
+        if !cfg.enabled {
+            return;
+        }
+        let timeout = Duration::from_secs(cfg.timeout_secs);
+        for pool in &self.inner.pools {
+            for (index, server) in pool.servers.iter().enumerate() {
+                let up = probe(server, &cfg.path, timeout).await;
+                pool.set_health(index, up);
+            }
+        }
+    }
+
+    pub async fn handle(
+        &self,
+        req: Request<Incoming>,
+        peer: SocketAddr,
+        scheme: &'static str,
+    ) -> Response<Body> {
+        self.forward(req, peer, scheme)
+            .await
+            .unwrap_or_else(|err| err)
     }
 
     async fn forward(
         &self,
-        req: Request<Incoming>,
+        mut req: Request<Incoming>,
         peer: SocketAddr,
+        scheme: &'static str,
     ) -> Result<Response<Body>, Response<Body>> {
         if req.method() == Method::CONNECT {
             return Err(text(
                 StatusCode::METHOD_NOT_ALLOWED,
                 "CONNECT is not supported",
-            ));
-        }
-        // No upgrade path yet: passing Upgrade through would orphan the
-        // connection on the client side.
-        if req.headers().contains_key(http::header::UPGRADE) {
-            return Err(text(
-                StatusCode::NOT_IMPLEMENTED,
-                "upgrade is not supported",
             ));
         }
         // hyper decodes only the chunked layer. `gzip, chunked` would reach
@@ -150,6 +189,29 @@ impl Proxy {
                 StatusCode::NOT_IMPLEMENTED,
                 "only chunked transfer encoding is supported",
             ));
+        }
+
+        let requested_upgrade = wants_upgrade(req.headers());
+        let client_upgrade = requested_upgrade
+            .as_ref()
+            .map(|_| hyper::upgrade::on(&mut req));
+
+        // No upgrade protocol carries a body. Refusing one keeps the raw
+        // upstream write from sending a Content-Length with zero bytes.
+        if requested_upgrade.is_some() {
+            let has_body = req
+                .headers()
+                .get(CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.trim() != "0")
+                .unwrap_or(false)
+                || req.headers().contains_key(TRANSFER_ENCODING);
+            if has_body {
+                return Err(text(
+                    StatusCode::BAD_REQUEST,
+                    "upgrade requests cannot carry a body",
+                ));
+            }
         }
 
         let host = req
@@ -208,9 +270,23 @@ impl Proxy {
         // had them dropped above.
         headers.insert(HOST, header(&forward_host));
         headers.insert("x-forwarded-for", header(&peer.ip().to_string()));
-        headers.insert("x-forwarded-proto", HeaderValue::from_static("http"));
+        headers.insert("x-forwarded-proto", HeaderValue::from_static(scheme));
         headers.insert("x-forwarded-host", header(&forward_host));
         headers.insert("via", HeaderValue::from_static("1.1 elira"));
+
+        // Upgrade is hop-by-hop, but dropping it would break websockets.
+        // Put it back only when the client actually asked for it.
+        if let Some(upgrade) = &requested_upgrade {
+            headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
+            headers.insert(UPGRADE, upgrade.clone());
+        }
+
+        if let Some(upgrade) = requested_upgrade.clone() {
+            let client = client_upgrade.expect("created together with requested_upgrade");
+            return self
+                .forward_upgrade(upstream, client, upgrade, server.clone())
+                .await;
+        }
 
         let response =
             match tokio::time::timeout(self.inner.timeout, self.inner.client.request(upstream))
@@ -226,6 +302,15 @@ impl Proxy {
                     return Err(text(StatusCode::GATEWAY_TIMEOUT, "gateway timeout"));
                 }
             };
+
+        // Same rule as the request side: hyper only unwraps `chunked`, so
+        // anything else would reach the client still transfer-coded.
+        if !transfer_encoding_is_plain_chunked(response.headers()) {
+            return Err(text(
+                StatusCode::BAD_GATEWAY,
+                "unsupported transfer encoding from upstream",
+            ));
+        }
 
         let (parts, body) = response.into_parts();
         let drop = connection_tokens(&parts.headers);
@@ -247,6 +332,15 @@ impl Proxy {
                 headers.append(name, value.clone());
             }
             headers.insert(SERVER, HeaderValue::from_static("elira"));
+
+            // A 101 without these two headers is a 101 the client cannot
+            // act on. They are hop-by-hop, so they were stripped above.
+            if parts.status == StatusCode::SWITCHING_PROTOCOLS {
+                if let Some(upgrade) = &requested_upgrade {
+                    headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
+                    headers.insert(UPGRADE, upgrade.clone());
+                }
+            }
         }
 
         let body = body.map_err(|err| -> BoxError { Box::new(err) }).boxed();
@@ -255,6 +349,240 @@ impl Proxy {
             .body(body)
             .map_err(|_| text(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"))
     }
+
+    /// Upgrades cannot go through the connection pool: hyper has to hand the
+    /// socket over instead of returning it. Open a raw connection and tunnel.
+    async fn forward_upgrade(
+        &self,
+        upstream: Request<Incoming>,
+        client_upgrade: hyper::upgrade::OnUpgrade,
+        upgrade: HeaderValue,
+        server: Authority,
+    ) -> Result<Response<Body>, Response<Body>> {
+        // Tunnels outlive the connection task that the accept loop tracks,
+        // so they need their own bound.
+        let permit = match self.inner.tunnels.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => return Err(text(StatusCode::SERVICE_UNAVAILABLE, "too many tunnels")),
+        };
+
+        let host = server.host().trim_start_matches('[').trim_end_matches(']');
+        let port = server.port_u16().unwrap_or(80);
+
+        let mut stream = match tokio::time::timeout(
+            self.inner.timeout,
+            TcpStream::connect((host, port)),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => stream,
+            _ => return Err(text(StatusCode::BAD_GATEWAY, "bad gateway")),
+        };
+
+        let head = serialize_head(&upstream);
+        match tokio::time::timeout(self.inner.timeout, stream.write_all(head.as_bytes())).await {
+            Ok(Ok(())) => {}
+            _ => return Err(text(StatusCode::BAD_GATEWAY, "bad gateway")),
+        }
+
+        let (status, mut headers, upstream_upgrade, leftover) =
+            read_head(&mut stream, self.inner.timeout).await?;
+
+        if status != StatusCode::SWITCHING_PROTOCOLS {
+            // The upstream refused the upgrade. Pass the answer through with
+            // an empty body; upgrade attempts are small and rare.
+            headers.insert(SERVER, HeaderValue::from_static("elira"));
+            let body = Full::new(Bytes::new())
+                .map_err(|never| match never {})
+                .boxed();
+            return Response::builder()
+                .status(status)
+                .body(body)
+                .map(|mut response| {
+                    *response.headers_mut() = headers;
+                    response
+                })
+                .map_err(|_| text(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"));
+        }
+
+        // The upstream decides which protocol it accepted.
+        let upgrade = upstream_upgrade.unwrap_or(upgrade);
+        headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
+        headers.insert(UPGRADE, upgrade);
+        headers.insert(SERVER, HeaderValue::from_static("elira"));
+
+        tokio::spawn(async move {
+            let _permit = permit;
+            match client_upgrade.await {
+                Ok(client) => {
+                    let mut client = TokioIo::new(client);
+                    let mut upstream = stream;
+                    // Bytes the upstream sent right after the 101 would
+                    // otherwise be dropped by copy_bidirectional.
+                    if !leftover.is_empty() && client.write_all(&leftover).await.is_err() {
+                        return;
+                    }
+                    if let Err(err) =
+                        tokio::io::copy_bidirectional(&mut client, &mut upstream).await
+                    {
+                        tracing::debug!(error = %err, "tunnel closed");
+                    }
+                }
+                Err(err) => tracing::debug!(error = %err, "client upgrade failed"),
+            }
+        });
+
+        let body = Full::new(Bytes::new())
+            .map_err(|never| match never {})
+            .boxed();
+        Response::builder()
+            .status(StatusCode::SWITCHING_PROTOCOLS)
+            .body(body)
+            .map(|mut response| {
+                *response.headers_mut() = headers;
+                response
+            })
+            .map_err(|_| text(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"))
+    }
+}
+
+fn serialize_head(req: &Request<Incoming>) -> String {
+    let path = req
+        .uri()
+        .path_and_query()
+        .map(|p| p.as_str())
+        .unwrap_or("/");
+    let mut out = format!("{} {} HTTP/1.1\r\n", req.method(), path);
+    for (name, value) in req.headers() {
+        if let Ok(value) = value.to_str() {
+            out.push_str(name.as_str());
+            out.push_str(": ");
+            out.push_str(value);
+            out.push_str("\r\n");
+        }
+    }
+    out.push_str("\r\n");
+    out
+}
+
+async fn read_head(
+    stream: &mut TcpStream,
+    timeout: Duration,
+) -> Result<(StatusCode, HeaderMap, Option<HeaderValue>, Vec<u8>), Response<Body>> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 1024];
+
+    loop {
+        let read = match tokio::time::timeout(timeout, stream.read(&mut chunk)).await {
+            Ok(Ok(read)) => read,
+            _ => return Err(text(StatusCode::BAD_GATEWAY, "bad gateway")),
+        };
+        if read == 0 {
+            return Err(text(StatusCode::BAD_GATEWAY, "bad gateway"));
+        }
+        buf.extend_from_slice(&chunk[..read]);
+
+        while let Some(end) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&buf[..end]).to_string();
+            let rest = buf[end + 4..].to_vec();
+            let mut lines = head.split("\r\n");
+            let status_line = lines.next().unwrap_or_default();
+            let code = status_line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|code| code.parse::<u16>().ok())
+                .unwrap_or(502);
+            let status = StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY);
+
+            // 100 Continue and 103 Early Hints are not the answer.
+            if status.is_informational() && status != StatusCode::SWITCHING_PROTOCOLS {
+                buf = rest;
+                continue;
+            }
+
+            let mut raw = HeaderMap::new();
+            for line in lines {
+                let Some((name, value)) = line.split_once(':') else {
+                    continue;
+                };
+                let Ok(name) = HeaderName::from_bytes(name.trim().as_bytes()) else {
+                    continue;
+                };
+                let Ok(value) = HeaderValue::from_str(value.trim()) else {
+                    continue;
+                };
+                raw.append(name, value);
+            }
+
+            let upgrade = raw.get(UPGRADE).cloned();
+            let tokens = connection_tokens(&raw);
+
+            let mut headers = HeaderMap::new();
+            for (name, value) in raw.iter() {
+                if is_hop_by_hop(name) || tokens.contains(name) || name == CONTENT_LENGTH {
+                    continue;
+                }
+                headers.append(name, value.clone());
+            }
+
+            return Ok((status, headers, upgrade, rest));
+        }
+
+        if buf.len() > 64 * 1024 {
+            return Err(text(StatusCode::BAD_GATEWAY, "bad gateway"));
+        }
+    }
+}
+
+/// One health probe: a plain HTTP/1.1 GET with `Connection: close`.
+/// Anything 2xx or 3xx counts as up.
+async fn probe(server: &Authority, path: &str, timeout: Duration) -> bool {
+    let host = server.host().trim_start_matches('[').trim_end_matches(']');
+    let port = server.port_u16().unwrap_or(80);
+
+    let mut stream = match tokio::time::timeout(timeout, TcpStream::connect((host, port))).await {
+        Ok(Ok(stream)) => stream,
+        _ => return false,
+    };
+
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {server}\r\nConnection: close\r\n\r\n");
+    match tokio::time::timeout(timeout, stream.write_all(request.as_bytes())).await {
+        Ok(Ok(())) => {}
+        _ => return false,
+    }
+
+    let mut buf = Vec::new();
+    loop {
+        let mut chunk = [0u8; 64];
+        let read = match tokio::time::timeout(timeout, stream.read(&mut chunk)).await {
+            Ok(Ok(read)) if read > 0 => read,
+            _ => return false,
+        };
+        buf.extend_from_slice(&chunk[..read]);
+
+        if let Some(end) = buf.windows(2).position(|window| window == b"\r\n") {
+            let line = String::from_utf8_lossy(&buf[..end]);
+            return matches!(
+                line.split_whitespace().nth(1),
+                Some(code)
+                    if code.len() == 3
+                        && (code.starts_with('2') || code.starts_with('3'))
+            );
+        }
+
+        if buf.len() > 1024 {
+            return false;
+        }
+    }
+}
+
+fn wants_upgrade(headers: &HeaderMap) -> Option<HeaderValue> {
+    let upgrade = headers.get(UPGRADE)?.clone();
+    let connection = headers.get(CONNECTION)?.to_str().ok()?;
+    connection
+        .split(',')
+        .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+        .then_some(upgrade)
 }
 
 fn canonical_host(raw: &str) -> Option<(String, String)> {
@@ -446,5 +774,18 @@ mod tests {
 
         headers.insert(TRANSFER_ENCODING, HeaderValue::from_static("gzip, chunked"));
         assert!(!transfer_encoding_is_plain_chunked(&headers));
+    }
+
+    #[test]
+    fn upgrade_needs_both_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(UPGRADE, HeaderValue::from_static("websocket"));
+        assert!(wants_upgrade(&headers).is_none());
+
+        headers.insert(CONNECTION, HeaderValue::from_static("keep-alive, Upgrade"));
+        assert_eq!(
+            wants_upgrade(&headers),
+            Some(HeaderValue::from_static("websocket"))
+        );
     }
 }

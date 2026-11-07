@@ -71,6 +71,7 @@ struct Runtime {
     proxy: Proxy,
     tls: Option<Arc<rustls::ServerConfig>>,
     log: LogFormat,
+    health: elira::config::Health,
 }
 
 impl Runtime {
@@ -83,6 +84,7 @@ impl Runtime {
             proxy: Proxy::new(cfg)?,
             tls,
             log: cfg.log.format,
+            health: cfg.health.clone(),
         })
     }
 }
@@ -106,11 +108,20 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
     let max_connections = cfg.limits.max_connections;
     let max_headers = cfg.limits.max_headers;
     let max_buf_size = cfg.limits.max_header_bytes;
+    let idle_timeout = Duration::from_secs(cfg.limits.idle_timeout_secs);
+    let opts = ConnOptions {
+        max_headers,
+        max_buf_size,
+        idle_timeout,
+        h2: false,
+        secure: false,
+    };
     let semaphore = Arc::new(Semaphore::new(max_connections));
 
     let (stop_tx, stop_rx) = watch::channel(false);
     let (reload_tx, mut reload_rx) = watch::channel(0u64);
     spawn_signal_task(stop_tx.clone(), reload_tx)?;
+    spawn_health_loop(runtime.clone(), stop_rx.clone());
 
     let mut stop_wait = stop_rx.clone();
     let mut connections = tokio::task::JoinSet::new();
@@ -123,7 +134,7 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
                 if changed.is_err() {
                     continue;
                 }
-                reload(&path, &cfg, &runtime, max_connections, max_headers, max_buf_size);
+                reload(&path, &cfg, &runtime, max_connections, max_headers, max_buf_size).await;
             }
 
             accepted = listener.accept() => {
@@ -138,16 +149,21 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
                     }
                 };
 
-                let permit = match semaphore.clone().acquire_owned().await {
+                // Blocking here would stop the accept loop from noticing
+                // SIGTERM or SIGHUP. When the limit is hit, drop the socket.
+                let permit = match semaphore.clone().try_acquire_owned() {
                     Ok(permit) => permit,
-                    Err(_) => break,
+                    Err(_) => {
+                        tracing::debug!(%peer, "connection limit reached");
+                        continue;
+                    }
                 };
 
-                let runtime = runtime.load_full();
+                let runtime = runtime.clone();
                 let mut stop = stop_rx.clone();
                 connections.spawn(async move {
                     let _permit = permit;
-                    serve(stream, peer, runtime, max_headers, max_buf_size, &mut stop).await;
+                    serve(stream, peer, runtime, opts, &mut stop).await;
                 });
             }
         }
@@ -170,7 +186,7 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn reload(
+async fn reload(
     path: &Path,
     current: &Config,
     runtime: &ArcSwap<Runtime>,
@@ -198,13 +214,22 @@ fn reload(
         tracing::warn!("connection and header limits apply after a restart");
     }
 
-    match Runtime::build(&next) {
-        Ok(next) => {
-            runtime.store(Arc::new(next));
-            tracing::info!("config reloaded");
+    let built = match Runtime::build(&next) {
+        Ok(built) => built,
+        Err(err) => {
+            tracing::error!(error = %err, "reload failed, keeping the old config");
+            return;
         }
-        Err(err) => tracing::error!(error = %err, "reload failed, keeping the old config"),
+    };
+
+    // Probe before publishing, otherwise every server looks healthy again
+    // for one interval after reload.
+    if built.health.enabled {
+        built.proxy.check_health(&built.health).await;
     }
+
+    runtime.store(Arc::new(built));
+    tracing::info!("config reloaded");
 }
 
 #[cfg(unix)]
@@ -243,57 +268,69 @@ fn spawn_signal_task(stop: watch::Sender<bool>, _reload: watch::Sender<u64>) -> 
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct ConnOptions {
+    max_headers: usize,
+    max_buf_size: usize,
+    idle_timeout: Duration,
+    h2: bool,
+    secure: bool,
+}
+
 async fn serve(
     stream: TcpStream,
     peer: SocketAddr,
-    runtime: Arc<Runtime>,
-    max_headers: usize,
-    max_buf_size: usize,
+    runtime: Arc<ArcSwap<Runtime>>,
+    opts: ConnOptions,
     stop: &mut watch::Receiver<bool>,
 ) {
-    match runtime.tls.clone() {
+    let tls = runtime.load().tls.clone();
+    let secure = tls.is_some();
+
+    match tls {
         Some(config) => {
             let acceptor = TlsAcceptor::from(config);
-            match acceptor.accept(stream).await {
-                Ok(stream) => {
+            // A client that never sends ClientHello must not hold a permit,
+            // and with it the accept loop, forever.
+            match tokio::time::timeout(Duration::from_secs(10), acceptor.accept(stream)).await {
+                Ok(Ok(stream)) => {
                     let h2 = stream.get_ref().1.alpn_protocol() == Some(b"h2".as_slice());
-                    serve_conn(stream, peer, runtime, h2, max_headers, max_buf_size, stop).await;
+                    let opts = ConnOptions { h2, secure, ..opts };
+                    serve_conn(stream, peer, runtime, opts, stop).await;
                 }
-                Err(err) => tracing::debug!(%peer, error = %err, "tls handshake failed"),
+                Ok(Err(err)) => tracing::debug!(%peer, error = %err, "tls handshake failed"),
+                Err(_) => tracing::debug!(%peer, "tls handshake timed out"),
             }
         }
-        None => {
-            serve_conn(
-                stream,
-                peer,
-                runtime,
-                false,
-                max_headers,
-                max_buf_size,
-                stop,
-            )
-            .await
-        }
+        None => serve_conn(stream, peer, runtime, opts, stop).await,
     }
 }
 
 async fn serve_conn<I>(
     io: I,
     peer: SocketAddr,
-    runtime: Arc<Runtime>,
-    h2: bool,
-    max_headers: usize,
-    max_buf_size: usize,
+    runtime: Arc<ArcSwap<Runtime>>,
+    opts: ConnOptions,
     stop: &mut watch::Receiver<bool>,
 ) where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let log = runtime.log;
-    let proxy = runtime.proxy.clone();
+    let idle = Arc::new(tokio::sync::Notify::new());
+    let idle_for_service = idle.clone();
+    let scheme = if opts.secure { "https" } else { "http" };
 
     let service = service_fn(move |req: hyper::Request<Incoming>| {
-        let proxy = proxy.clone();
+        let runtime = runtime.clone();
+        let idle = idle_for_service.clone();
         async move {
+            // Reset the keep-alive watchdog: a request means the client is
+            // still there, even if the response takes a while.
+            idle.notify_one();
+
+            // Load per request, so a reload applies to the next request on
+            // an existing keep-alive connection rather than the next one.
+            let current = runtime.load_full();
+
             let started = Instant::now();
             let method = req.method().clone();
             let host = req
@@ -317,7 +354,7 @@ async fn serve_conn<I>(
                 .map(str::to_owned);
             let id = request_id();
 
-            let response = proxy.handle(req, peer).await;
+            let response = current.proxy.handle(req, peer, scheme).await;
             let bytes = response.body().size_hint().exact().unwrap_or(0);
             let entry = Entry {
                 peer: peer.ip(),
@@ -332,7 +369,7 @@ async fn serve_conn<I>(
                 request_id: id,
             };
 
-            match log {
+            match current.log {
                 LogFormat::Text => tracing::info!(target: "access", "{}", entry.line()),
                 LogFormat::Json => tracing::info!(target: "access", "{}", entry.json()),
             }
@@ -341,11 +378,12 @@ async fn serve_conn<I>(
         }
     });
 
-    if h2 {
+    if opts.h2 {
         let conn = http2::Builder::new(TokioExecutor::new())
             .timer(TokioTimer::new())
             .keep_alive_interval(Some(Duration::from_secs(30)))
             .keep_alive_timeout(Duration::from_secs(20))
+            .max_header_list_size(opts.max_buf_size as u32)
             .serve_connection(TokioIo::new(io), service);
         let mut conn = std::pin::pin!(conn);
 
@@ -357,16 +395,24 @@ async fn serve_conn<I>(
             }
             _ = stop.changed() => {
                 conn.as_mut().graceful_shutdown();
-                let _ = conn.await;
+                drain(conn.as_mut(), peer).await;
+            }
+            _ = idle_watch(idle.clone(), opts.idle_timeout) => {
+                conn.as_mut().graceful_shutdown();
+                drain(conn.as_mut(), peer).await;
             }
         }
     } else {
         let conn = http1::Builder::new()
             .timer(TokioTimer::new())
             .header_read_timeout(Some(Duration::from_secs(30)))
-            .max_headers(max_headers)
-            .max_buf_size(max_buf_size)
-            .serve_connection(TokioIo::new(io), service);
+            .max_headers(opts.max_headers)
+            .max_buf_size(opts.max_buf_size)
+            .serve_connection(TokioIo::new(io), service)
+            // Without this hyper refuses to hand the socket over and
+            // OnUpgrade resolves with "upgrade expected but low level API
+            // in use".
+            .with_upgrades();
         let mut conn = std::pin::pin!(conn);
 
         tokio::select! {
@@ -377,8 +423,62 @@ async fn serve_conn<I>(
             }
             _ = stop.changed() => {
                 conn.as_mut().graceful_shutdown();
-                let _ = conn.await;
+                drain(conn.as_mut(), peer).await;
+            }
+            _ = idle_watch(idle.clone(), opts.idle_timeout) => {
+                conn.as_mut().graceful_shutdown();
+                drain(conn.as_mut(), peer).await;
             }
         }
     }
+}
+
+/// Let the current request finish, but do not wait forever: a client that
+/// trickles a body would otherwise pin the permit until the process dies.
+async fn drain<C>(conn: std::pin::Pin<&mut C>, peer: SocketAddr)
+where
+    C: std::future::Future<Output = Result<(), hyper::Error>>,
+{
+    if tokio::time::timeout(Duration::from_secs(5), conn)
+        .await
+        .is_err()
+    {
+        tracing::debug!(%peer, "connection did not drain in time");
+    }
+}
+
+/// Close a connection that has not seen a request for `timeout`.
+/// A zero timeout disables the watchdog.
+async fn idle_watch(idle: Arc<tokio::sync::Notify>, timeout: Duration) {
+    if timeout.is_zero() {
+        std::future::pending::<()>().await;
+        return;
+    }
+
+    loop {
+        match tokio::time::timeout(timeout, idle.notified()).await {
+            Ok(()) => continue,
+            Err(_) => return,
+        }
+    }
+}
+
+fn spawn_health_loop(runtime: Arc<ArcSwap<Runtime>>, mut stop: watch::Receiver<bool>) {
+    tokio::spawn(async move {
+        loop {
+            let current = runtime.load_full();
+            let interval = if current.health.enabled {
+                Duration::from_secs(current.health.interval_secs)
+            } else {
+                Duration::from_secs(30)
+            };
+
+            tokio::select! {
+                _ = stop.changed() => break,
+                _ = tokio::time::sleep(interval) => {
+                    current.proxy.check_health(&current.health).await;
+                }
+            }
+        }
+    });
 }

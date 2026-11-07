@@ -20,6 +20,8 @@ pub struct Config {
     pub tls: Option<Tls>,
     #[serde(default)]
     pub log: Log,
+    #[serde(default)]
+    pub health: Health,
     pub upstreams: Vec<Upstream>,
     pub routes: Vec<Route>,
 }
@@ -42,6 +44,11 @@ pub struct Limits {
     /// How many client connections may be open at once.
     #[serde(default = "Limits::default_max_connections")]
     pub max_connections: usize,
+
+    /// Close a keep-alive connection after this many seconds without a
+    /// request. Zero disables the timer.
+    #[serde(default = "Limits::default_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
 }
 
 impl Default for Limits {
@@ -51,6 +58,7 @@ impl Default for Limits {
             max_header_bytes: Self::default_max_header_bytes(),
             upstream_timeout_secs: Self::default_upstream_timeout_secs(),
             max_connections: Self::default_max_connections(),
+            idle_timeout_secs: Self::default_idle_timeout_secs(),
         }
     }
 }
@@ -70,6 +78,51 @@ impl Limits {
 
     fn default_max_connections() -> usize {
         1024
+    }
+
+    fn default_idle_timeout_secs() -> u64 {
+        60
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Health {
+    #[serde(default)]
+    pub enabled: bool,
+
+    #[serde(default = "Health::default_path")]
+    pub path: String,
+
+    #[serde(default = "Health::default_interval_secs")]
+    pub interval_secs: u64,
+
+    #[serde(default = "Health::default_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+impl Default for Health {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: Self::default_path(),
+            interval_secs: Self::default_interval_secs(),
+            timeout_secs: Self::default_timeout_secs(),
+        }
+    }
+}
+
+impl Health {
+    fn default_path() -> String {
+        "/health".to_owned()
+    }
+
+    fn default_interval_secs() -> u64 {
+        5
+    }
+
+    fn default_timeout_secs() -> u64 {
+        2
     }
 }
 
@@ -153,6 +206,20 @@ impl Config {
         }
         if self.limits.max_connections == 0 {
             return Err(Error::MaxConnectionsZero);
+        }
+
+        if self.health.enabled {
+            if !self.health.path.starts_with('/')
+                || self.health.path.chars().any(|c| c.is_control() || c == ' ')
+            {
+                return Err(Error::BadHealthPath);
+            }
+            if self.health.interval_secs == 0 {
+                return Err(Error::BadHealthInterval);
+            }
+            if self.health.timeout_secs == 0 {
+                return Err(Error::BadHealthTimeout);
+            }
         }
 
         if self.routes.is_empty() {
@@ -261,6 +328,15 @@ pub enum Error {
 
     #[error("limits.max_connections must be greater than zero")]
     MaxConnectionsZero,
+
+    #[error("health.path must start with '/' and contain no spaces or control characters")]
+    BadHealthPath,
+
+    #[error("health.interval_secs must be greater than zero")]
+    BadHealthInterval,
+
+    #[error("health.timeout_secs must be greater than zero")]
+    BadHealthTimeout,
 
     #[error("tls.cert is required when [tls] is set and must not be empty")]
     TlsMissingCert,
@@ -414,5 +490,19 @@ upstream = "app"
             Config::parse(&text),
             Err(Error::MaxHeaderBytesTooSmall)
         ));
+    }
+
+    #[test]
+    fn rejects_bad_health_path() {
+        let text = format!("{MINIMAL}\n[health]\nenabled = true\npath = \"health\"\n");
+        assert!(matches!(Config::parse(&text), Err(Error::BadHealthPath)));
+    }
+
+    #[test]
+    fn health_is_disabled_by_default() {
+        let cfg = Config::parse(MINIMAL).expect("valid config");
+        assert!(!cfg.health.enabled);
+        assert_eq!(cfg.health.path, "/health");
+        assert_eq!(cfg.limits.idle_timeout_secs, 60);
     }
 }

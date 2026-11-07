@@ -25,6 +25,7 @@ max_headers = 64
 max_header_bytes = 16384
 upstream_timeout_secs = 30
 max_connections = 1024
+idle_timeout_secs = 60
 
 [tls]
 cert = "/etc/elira/cert.pem"
@@ -32,6 +33,12 @@ key = "/etc/elira/key.pem"
 
 [log]
 format = "text"          # or "json"
+
+[health]
+enabled = true
+path = "/health"
+interval_secs = 5
+timeout_secs = 2
 
 [[upstreams]]
 name = "app"
@@ -48,23 +55,27 @@ upstream = "app"
 - round-robins across the servers of an upstream
 - TLS via rustls, ALPN `h2` then `http/1.1`, certificates reload on SIGHUP
 - HTTP/1.1 and HTTP/2
+- websockets and other `Upgrade` protocols, tunneled over a raw upstream socket
 - access log in text or JSON, with a request id per line
+- active health checks: a server that stops answering 2xx/3xx stops receiving
+  traffic, and comes back on its own
 - strips hop-by-hop headers, including the tokens named in `Connection`
 - drops client-supplied `Forwarded`, any `X-Forwarded-*`, `X-Real-IP`,
   `X-Original-URL`, `X-Rewrite-URL`, and the underscore aliases, then sets
   its own
-- 64 headers, 16 KiB buffer, 30 s header read timeout, 1024 connections
+- 64 headers, 16 KiB buffer, 30 s header read timeout, 1024 connections,
+  60 s idle timeout
 - 30 s upstream timeout, 10 s drain on SIGINT or SIGTERM
 
 ## Not yet
 
-HTTP/3, health checks, active upstream discovery, websockets. `CONNECT` and
-`Upgrade` get a 405 and 501 rather than a half-open connection.
+HTTP/3. It needs a QUIC endpoint and a separate UDP listener; the HTTP/1.1
+and HTTP/2 path does not share code with it. `CONNECT` still gets a 405.
 
 ## Layout
 
 - `crates/elira-config` — parsing and validation, no I/O beyond reading the file
-- `crates/elira-proxy` — request forwarding, header hygiene
+- `crates/elira-proxy` — request forwarding, header hygiene, health probing
 - `crates/elira-tls` — certificate loading
 - `crates/elira-accesslog` — log formatting
 - `crates/elira` — the binary
