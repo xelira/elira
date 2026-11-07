@@ -41,6 +41,7 @@ struct Inner {
     pools: Vec<Arc<Pool>>,
     client: Client<HttpConnector, Body>,
     tunnels: Arc<Semaphore>,
+    connect: Option<Vec<Authority>>,
     timeout: Duration,
 }
 
@@ -124,6 +125,21 @@ impl Proxy {
             }
         }
 
+        let connect =
+            if cfg.connect.enabled {
+                let mut allowed = Vec::with_capacity(cfg.connect.allow.len());
+                for target in &cfg.connect.allow {
+                    allowed.push(target.parse::<Authority>().map_err(|_| {
+                        Error::BadConnectTarget {
+                            target: target.clone(),
+                        }
+                    })?);
+                }
+                Some(allowed)
+            } else {
+                None
+            };
+
         let mut connector = HttpConnector::new();
         connector.set_connect_timeout(Some(Duration::from_secs(5)));
         connector.set_nodelay(true);
@@ -139,6 +155,7 @@ impl Proxy {
                 pools: all_pools,
                 client,
                 tunnels: Arc::new(Semaphore::new(cfg.limits.max_connections)),
+                connect,
                 timeout: Duration::from_secs(cfg.limits.upstream_timeout_secs),
             }),
         })
@@ -169,6 +186,69 @@ impl Proxy {
             .unwrap_or_else(|err| err)
     }
 
+    /// CONNECT is only useful when the target is already trusted; anything
+    /// else turns the proxy into an open relay.
+    async fn connect(&self, mut req: Request<Body>) -> Result<Response<Body>, Response<Body>> {
+        let Some(allowed) = &self.inner.connect else {
+            return Err(text(StatusCode::METHOD_NOT_ALLOWED, "CONNECT is disabled"));
+        };
+
+        let target = req
+            .uri()
+            .authority()
+            .map(|value| value.as_str().to_owned())
+            // hyper may hand authority-form CONNECT targets via the path.
+            .or_else(|| {
+                req.uri()
+                    .path()
+                    .parse::<Authority>()
+                    .ok()
+                    .map(|value| value.as_str().to_owned())
+            })
+            .ok_or_else(|| text(StatusCode::BAD_REQUEST, "CONNECT needs host:port"))?;
+
+        if !allowed.iter().any(|entry| entry.as_str() == target) {
+            return Err(text(StatusCode::FORBIDDEN, "CONNECT target is not allowed"));
+        }
+
+        let permit = match self.inner.tunnels.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => return Err(text(StatusCode::SERVICE_UNAVAILABLE, "too many tunnels")),
+        };
+
+        let mut stream =
+            match tokio::time::timeout(self.inner.timeout, TcpStream::connect(target.as_str()))
+                .await
+            {
+                Ok(Ok(stream)) => stream,
+                _ => return Err(text(StatusCode::BAD_GATEWAY, "cannot reach the target")),
+            };
+
+        let client_upgrade = hyper::upgrade::on(&mut req);
+
+        tokio::spawn(async move {
+            let _permit = permit;
+            match client_upgrade.await {
+                Ok(client) => {
+                    let mut client = TokioIo::new(client);
+                    if let Err(err) = tokio::io::copy_bidirectional(&mut client, &mut stream).await
+                    {
+                        tracing::debug!(error = %err, "CONNECT tunnel closed");
+                    }
+                }
+                Err(err) => tracing::debug!(error = %err, "CONNECT upgrade failed"),
+            }
+        });
+
+        let body = Full::new(Bytes::new())
+            .map_err(|never| match never {})
+            .boxed();
+        Response::builder()
+            .status(StatusCode::OK)
+            .body(body)
+            .map_err(|_| text(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"))
+    }
+
     async fn forward(
         &self,
         mut req: Request<Body>,
@@ -176,10 +256,7 @@ impl Proxy {
         scheme: &'static str,
     ) -> Result<Response<Body>, Response<Body>> {
         if req.method() == Method::CONNECT {
-            return Err(text(
-                StatusCode::METHOD_NOT_ALLOWED,
-                "CONNECT is not supported",
-            ));
+            return self.connect(req).await;
         }
         // hyper decodes only the chunked layer. `gzip, chunked` would reach
         // the backend still gzipped and without the header saying so.
@@ -707,6 +784,9 @@ pub enum Error {
 
     #[error("route points to unknown upstream \"{upstream}\"")]
     UnknownUpstream { upstream: String },
+
+    #[error("connect target \"{target}\" is not host:port")]
+    BadConnectTarget { target: String },
 }
 
 #[cfg(test)]

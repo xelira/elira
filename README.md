@@ -45,6 +45,10 @@ listen = "0.0.0.0:443"
 cert = "/etc/elira/cert.pem"
 key = "/etc/elira/key.pem"
 
+[connect]
+enabled = false                 # an open CONNECT proxy is an SSRF pivot
+allow = ["10.0.0.5:5432"]       # exact host:port destinations only
+
 [[upstreams]]
 name = "app"
 servers = ["127.0.0.1:3000", "127.0.0.1:3001"]
@@ -61,6 +65,7 @@ upstream = "app"
 - TLS via rustls, ALPN `h2` then `http/1.1`, certificates reload on SIGHUP
 - HTTP/1.1, HTTP/2, and HTTP/3 over QUIC on a separate UDP listener
 - websockets and other `Upgrade` protocols, tunneled over a raw upstream socket
+- `CONNECT` tunnels, off by default and limited to an explicit `host:port` list
 - access log in text or JSON, with a request id per line
 - active health checks: a server that stops answering 2xx/3xx stops receiving
   traffic, and comes back on its own
@@ -74,9 +79,10 @@ upstream = "app"
 
 ## Not yet
 
-HTTP/3 request bodies are buffered up to 8 MiB; larger ones get a 413. The
-response side streams. `CONNECT` still gets a 405. The HTTP/3 listener is
-configured at startup and needs a restart to change.
+`CONNECT` is disabled unless `[connect]` names the destinations, and it is
+HTTP/1.1 only. HTTP/3 request bodies are streamed now, not buffered.
+The HTTP/3 listener is restarted on SIGHUP, which resets its live
+connections; HTTP/1.1 and HTTP/2 connections survive a reload.
 
 ## Layout
 

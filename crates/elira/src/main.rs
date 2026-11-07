@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use arc_swap::ArcSwap;
 use clap::{Parser, Subcommand};
-use elira::config::{Config, LogFormat};
+use elira::config::{Config, Http3, LogFormat};
 use elira::proxy::{BoxError, Proxy};
 use elira_accesslog::{request_id, Entry};
 use http_body::Body as _;
@@ -77,6 +77,7 @@ struct Runtime {
     tls: Option<Arc<rustls::ServerConfig>>,
     log: LogFormat,
     health: elira::config::Health,
+    http3: Option<Http3>,
 }
 
 impl Runtime {
@@ -90,8 +91,31 @@ impl Runtime {
             tls,
             log: cfg.log.format,
             health: cfg.health.clone(),
+            http3: cfg.http3.clone(),
         })
     }
+}
+
+fn spawn_h3(
+    runtime: Arc<ArcSwap<Runtime>>,
+    stop: watch::Receiver<bool>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let current = runtime.load_full();
+    let http3 = current.http3.clone()?;
+    let proxy = current.proxy.clone();
+    let log = current.log;
+    drop(current);
+
+    Some(tokio::spawn(async move {
+        let cfg = elira_h3::Config {
+            listen: http3.listen,
+            cert: http3.cert,
+            key: http3.key,
+        };
+        if let Err(err) = elira_h3::serve(cfg, proxy, log, stop).await {
+            tracing::error!(error = %err, "http/3 listener stopped");
+        }
+    }))
 }
 
 async fn run(path: PathBuf) -> anyhow::Result<()> {
@@ -128,23 +152,7 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
     spawn_signal_task(stop_tx.clone(), reload_tx)?;
     spawn_health_loop(runtime.clone(), stop_rx.clone());
 
-    if let Some(http3) = &cfg.http3 {
-        let cfg = elira_h3::Config {
-            listen: http3.listen,
-            cert: http3.cert.clone(),
-            key: http3.key.clone(),
-        };
-        let current = runtime.load_full();
-        let proxy = current.proxy.clone();
-        let log = current.log;
-        let stop = stop_rx.clone();
-
-        tokio::spawn(async move {
-            if let Err(err) = elira_h3::serve(cfg, proxy, log, stop).await {
-                tracing::error!(error = %err, "http/3 listener stopped");
-            }
-        });
-    }
+    let mut h3_task = spawn_h3(runtime.clone(), stop_rx.clone());
 
     let mut stop_wait = stop_rx.clone();
     let mut connections = tokio::task::JoinSet::new();
@@ -158,6 +166,15 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
                     continue;
                 }
                 reload(&path, &cfg, &runtime, max_connections, max_headers, max_buf_size).await;
+
+                // The new Runtime carries its own http3 config. Restart the
+                // listener against it instead of keeping the old one.
+                if let Some(handle) = h3_task.take() {
+                    handle.abort();
+                    // Wait for the QUIC endpoint to drop before rebinding.
+                    let _ = handle.await;
+                }
+                h3_task = spawn_h3(runtime.clone(), stop_rx.clone());
             }
 
             accepted = listener.accept() => {
@@ -206,6 +223,12 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
         tracing::warn!("some connections did not finish in time");
     }
 
+    // The listener got the stop signal and closed its endpoint on its own;
+    // this is only a fallback for a stuck task.
+    if let Some(handle) = h3_task.take() {
+        handle.abort();
+    }
+
     Ok(())
 }
 
@@ -235,9 +258,6 @@ async fn reload(
         || next.limits.max_header_bytes != max_buf_size
     {
         tracing::warn!("connection and header limits apply after a restart");
-    }
-    if next.http3.is_some() != current.http3.is_some() {
-        tracing::warn!("http/3 listener changes need a restart");
     }
 
     let built = match Runtime::build(&next) {

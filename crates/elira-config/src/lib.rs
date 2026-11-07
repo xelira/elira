@@ -23,6 +23,8 @@ pub struct Config {
     #[serde(default)]
     pub health: Health,
     #[serde(default)]
+    pub connect: Connect,
+    #[serde(default)]
     pub http3: Option<Http3>,
     pub upstreams: Vec<Upstream>,
     pub routes: Vec<Route>,
@@ -126,6 +128,18 @@ impl Health {
     fn default_timeout_secs() -> u64 {
         2
     }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Connect {
+    /// Off by default: an open CONNECT proxy is an SSRF pivot, and a reverse
+    /// proxy has no reason to offer one.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Exact `host:port` destinations the tunnel may reach.
+    #[serde(default)]
+    pub allow: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -242,6 +256,22 @@ impl Config {
             }
             if http3.key.as_os_str().is_empty() {
                 return Err(Error::Http3MissingKey);
+            }
+        }
+
+        if self.connect.enabled {
+            if self.connect.allow.is_empty() {
+                return Err(Error::ConnectEmptyAllow);
+            }
+            for target in &self.connect.allow {
+                let parsed: Authority = target.parse().map_err(|_| Error::BadConnectTarget {
+                    target: target.clone(),
+                })?;
+                if parsed.port_u16().is_none() || target.contains('@') || target.contains('/') {
+                    return Err(Error::BadConnectTarget {
+                        target: target.clone(),
+                    });
+                }
             }
         }
 
@@ -366,6 +396,12 @@ pub enum Error {
 
     #[error("http3.key must not be empty")]
     Http3MissingKey,
+
+    #[error("connect.enabled requires a non-empty connect.allow list")]
+    ConnectEmptyAllow,
+
+    #[error("connect target \"{target}\" is not host:port")]
+    BadConnectTarget { target: String },
 
     #[error("tls.cert is required when [tls] is set and must not be empty")]
     TlsMissingCert,
@@ -541,5 +577,29 @@ upstream = "app"
         let text =
             format!("{MINIMAL}\n[http3]\nlisten = \"127.0.0.1:4433\"\ncert = \"cert.pem\"\n");
         assert!(matches!(Config::parse(&text), Err(Error::Http3MissingKey)));
+    }
+
+    #[test]
+    fn connect_is_off_by_default() {
+        let cfg = Config::parse(MINIMAL).expect("valid config");
+        assert!(!cfg.connect.enabled);
+    }
+
+    #[test]
+    fn connect_needs_targets_when_enabled() {
+        let text = format!("{MINIMAL}\n[connect]\nenabled = true\n");
+        assert!(matches!(
+            Config::parse(&text),
+            Err(Error::ConnectEmptyAllow)
+        ));
+    }
+
+    #[test]
+    fn connect_rejects_target_without_port() {
+        let text = format!("{MINIMAL}\n[connect]\nenabled = true\nallow = [\"10.0.0.5\"]\n");
+        assert!(matches!(
+            Config::parse(&text),
+            Err(Error::BadConnectTarget { .. })
+        ));
     }
 }

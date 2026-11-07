@@ -18,6 +18,10 @@ format = "text"   # or "json"
 # cert = "/etc/elira/cert.pem"
 # key = "/etc/elira/key.pem"
 
+# [connect]
+# enabled = true
+# allow = ["127.0.0.1:5432"]
+
 [[upstreams]]
 name = "app"
 servers = ["127.0.0.1:3000"]
