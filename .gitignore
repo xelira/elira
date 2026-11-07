@@ -1,0 +1,8 @@
+# build output
+target/
+node_modules/
+dist/
+*.tgz
+
+# personal notes
+notes/
