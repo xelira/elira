@@ -65,6 +65,16 @@ pub enum Error {
 /// Client certificates are not requested: this proxy faces browsers, and mutual
 /// TLS would need a trust store we do not have.
 pub fn server_config(cert: &Path, key: &Path) -> Result<ServerConfig, Error> {
+    build(cert, key, &ALPN_PROTOCOLS)
+}
+
+/// Same material, but for QUIC: HTTP/3 is the only protocol a QUIC endpoint
+/// can negotiate, so the ALPN list is shorter.
+pub fn quic_server_config(cert: &Path, key: &Path) -> Result<ServerConfig, Error> {
+    build(cert, key, &[b"h3"])
+}
+
+fn build(cert: &Path, key: &Path, alpn: &[&[u8]]) -> Result<ServerConfig, Error> {
     let chain = load_chain(cert)?;
     let key_der = load_key(key)?;
 
@@ -77,7 +87,7 @@ pub fn server_config(cert: &Path, key: &Path) -> Result<ServerConfig, Error> {
             source,
         })?;
 
-    config.alpn_protocols = ALPN_PROTOCOLS.iter().map(|p| p.to_vec()).collect();
+    config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
     Ok(config)
 }
 

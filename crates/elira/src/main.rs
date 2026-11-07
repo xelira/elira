@@ -7,9 +7,10 @@ use anyhow::Context;
 use arc_swap::ArcSwap;
 use clap::{Parser, Subcommand};
 use elira::config::{Config, LogFormat};
-use elira::proxy::Proxy;
+use elira::proxy::{BoxError, Proxy};
 use elira_accesslog::{request_id, Entry};
 use http_body::Body as _;
+use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
@@ -43,6 +44,10 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // rustls refuses to guess when more than one crypto backend is compiled
+    // in, and quinn pulls in its own feature set. Pick one, once.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     match Cli::parse().command {
         Command::Check { config } => {
             let cfg = Config::load(&config)?;
@@ -122,6 +127,24 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
     let (reload_tx, mut reload_rx) = watch::channel(0u64);
     spawn_signal_task(stop_tx.clone(), reload_tx)?;
     spawn_health_loop(runtime.clone(), stop_rx.clone());
+
+    if let Some(http3) = &cfg.http3 {
+        let cfg = elira_h3::Config {
+            listen: http3.listen,
+            cert: http3.cert.clone(),
+            key: http3.key.clone(),
+        };
+        let current = runtime.load_full();
+        let proxy = current.proxy.clone();
+        let log = current.log;
+        let stop = stop_rx.clone();
+
+        tokio::spawn(async move {
+            if let Err(err) = elira_h3::serve(cfg, proxy, log, stop).await {
+                tracing::error!(error = %err, "http/3 listener stopped");
+            }
+        });
+    }
 
     let mut stop_wait = stop_rx.clone();
     let mut connections = tokio::task::JoinSet::new();
@@ -212,6 +235,9 @@ async fn reload(
         || next.limits.max_header_bytes != max_buf_size
     {
         tracing::warn!("connection and header limits apply after a restart");
+    }
+    if next.http3.is_some() != current.http3.is_some() {
+        tracing::warn!("http/3 listener changes need a restart");
     }
 
     let built = match Runtime::build(&next) {
@@ -354,6 +380,7 @@ async fn serve_conn<I>(
                 .map(str::to_owned);
             let id = request_id();
 
+            let req = req.map(|body| body.map_err(|err| -> BoxError { Box::new(err) }).boxed());
             let response = current.proxy.handle(req, peer, scheme).await;
             let bytes = response.body().size_hint().exact().unwrap_or(0);
             let entry = Entry {

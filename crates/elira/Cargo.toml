@@ -9,6 +9,7 @@ description = "HTTP server and reverse proxy"
 [dependencies]
 elira-accesslog = { path = "../elira-accesslog" }
 elira-config = { path = "../elira-config" }
+elira-h3 = { path = "../elira-h3" }
 elira-proxy = { path = "../elira-proxy" }
 elira-tls = { path = "../elira-tls" }
 anyhow = { workspace = true }
@@ -16,6 +17,7 @@ arc-swap = { workspace = true }
 clap = { workspace = true }
 http = { workspace = true }
 http-body = { workspace = true }
+http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 rustls = { workspace = true }

@@ -19,7 +19,6 @@ use http::uri::Authority;
 use http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -40,7 +39,7 @@ pub struct Proxy {
 struct Inner {
     router: Router,
     pools: Vec<Arc<Pool>>,
-    client: Client<HttpConnector, Incoming>,
+    client: Client<HttpConnector, Body>,
     tunnels: Arc<Semaphore>,
     timeout: Duration,
 }
@@ -161,7 +160,7 @@ impl Proxy {
 
     pub async fn handle(
         &self,
-        req: Request<Incoming>,
+        req: Request<Body>,
         peer: SocketAddr,
         scheme: &'static str,
     ) -> Response<Body> {
@@ -172,7 +171,7 @@ impl Proxy {
 
     async fn forward(
         &self,
-        mut req: Request<Incoming>,
+        mut req: Request<Body>,
         peer: SocketAddr,
         scheme: &'static str,
     ) -> Result<Response<Body>, Response<Body>> {
@@ -354,7 +353,7 @@ impl Proxy {
     /// socket over instead of returning it. Open a raw connection and tunnel.
     async fn forward_upgrade(
         &self,
-        upstream: Request<Incoming>,
+        upstream: Request<Body>,
         client_upgrade: hyper::upgrade::OnUpgrade,
         upgrade: HeaderValue,
         server: Authority,
@@ -446,7 +445,7 @@ impl Proxy {
     }
 }
 
-fn serialize_head(req: &Request<Incoming>) -> String {
+fn serialize_head(req: &Request<Body>) -> String {
     let path = req
         .uri()
         .path_and_query()

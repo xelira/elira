@@ -40,6 +40,11 @@ path = "/health"
 interval_secs = 5
 timeout_secs = 2
 
+[http3]
+listen = "0.0.0.0:443"
+cert = "/etc/elira/cert.pem"
+key = "/etc/elira/key.pem"
+
 [[upstreams]]
 name = "app"
 servers = ["127.0.0.1:3000", "127.0.0.1:3001"]
@@ -54,7 +59,7 @@ upstream = "app"
 - routes on Host, ignoring case, port and userinfo; HTTP/2 uses `:authority`
 - round-robins across the servers of an upstream
 - TLS via rustls, ALPN `h2` then `http/1.1`, certificates reload on SIGHUP
-- HTTP/1.1 and HTTP/2
+- HTTP/1.1, HTTP/2, and HTTP/3 over QUIC on a separate UDP listener
 - websockets and other `Upgrade` protocols, tunneled over a raw upstream socket
 - access log in text or JSON, with a request id per line
 - active health checks: a server that stops answering 2xx/3xx stops receiving
@@ -69,8 +74,9 @@ upstream = "app"
 
 ## Not yet
 
-HTTP/3. It needs a QUIC endpoint and a separate UDP listener; the HTTP/1.1
-and HTTP/2 path does not share code with it. `CONNECT` still gets a 405.
+HTTP/3 request bodies are buffered up to 8 MiB; larger ones get a 413. The
+response side streams. `CONNECT` still gets a 405. The HTTP/3 listener is
+configured at startup and needs a restart to change.
 
 ## Layout
 
@@ -78,6 +84,7 @@ and HTTP/2 path does not share code with it. `CONNECT` still gets a 405.
 - `crates/elira-proxy` — request forwarding, header hygiene, health probing
 - `crates/elira-tls` — certificate loading
 - `crates/elira-accesslog` — log formatting
+- `crates/elira-h3` — HTTP/3 over QUIC
 - `crates/elira` — the binary
 
 ## License

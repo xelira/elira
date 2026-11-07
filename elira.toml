@@ -13,6 +13,11 @@ max_connections = 1024
 [log]
 format = "text"   # or "json"
 
+# [http3]
+# listen = "127.0.0.1:4443"
+# cert = "/etc/elira/cert.pem"
+# key = "/etc/elira/key.pem"
+
 [[upstreams]]
 name = "app"
 servers = ["127.0.0.1:3000"]

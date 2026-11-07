@@ -22,6 +22,8 @@ pub struct Config {
     pub log: Log,
     #[serde(default)]
     pub health: Health,
+    #[serde(default)]
+    pub http3: Option<Http3>,
     pub upstreams: Vec<Upstream>,
     pub routes: Vec<Route>,
 }
@@ -128,6 +130,14 @@ impl Health {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct Http3 {
+    pub listen: SocketAddr,
+    pub cert: PathBuf,
+    pub key: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Upstream {
     pub name: String,
     pub servers: Vec<String>,
@@ -219,6 +229,15 @@ impl Config {
             }
             if self.health.timeout_secs == 0 {
                 return Err(Error::BadHealthTimeout);
+            }
+        }
+
+        if let Some(http3) = &self.http3 {
+            if http3.cert.as_os_str().is_empty() {
+                return Err(Error::Http3MissingCert);
+            }
+            if http3.key.as_os_str().is_empty() {
+                return Err(Error::Http3MissingKey);
             }
         }
 
@@ -337,6 +356,12 @@ pub enum Error {
 
     #[error("health.timeout_secs must be greater than zero")]
     BadHealthTimeout,
+
+    #[error("http3.cert must not be empty")]
+    Http3MissingCert,
+
+    #[error("http3.key must not be empty")]
+    Http3MissingKey,
 
     #[error("tls.cert is required when [tls] is set and must not be empty")]
     TlsMissingCert,
@@ -504,5 +529,13 @@ upstream = "app"
         assert!(!cfg.health.enabled);
         assert_eq!(cfg.health.path, "/health");
         assert_eq!(cfg.limits.idle_timeout_secs, 60);
+        assert!(cfg.http3.is_none());
+    }
+
+    #[test]
+    fn rejects_http3_without_key() {
+        let text =
+            format!("{MINIMAL}\n[http3]\nlisten = \"127.0.0.1:4433\"\ncert = \"cert.pem\"\n");
+        assert!(matches!(Config::parse(&text), Err(Error::Http3MissingKey)));
     }
 }
