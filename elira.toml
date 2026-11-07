@@ -1,0 +1,14 @@
+listen = "127.0.0.1:8080"
+
+[limits]
+max_headers = 64
+max_header_bytes = 16384
+upstream_timeout_secs = 30
+
+[[upstreams]]
+name = "app"
+servers = ["127.0.0.1:3000"]
+
+[[routes]]
+host = "*"
+upstream = "app"
