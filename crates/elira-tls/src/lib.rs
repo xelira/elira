@@ -7,6 +7,7 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
@@ -78,7 +79,12 @@ fn build(cert: &Path, key: &Path, alpn: &[&[u8]]) -> Result<ServerConfig, Error>
     let chain = load_chain(cert)?;
     let key_der = load_key(key)?;
 
-    let mut config = ServerConfig::builder()
+    // Pick the provider explicitly. Relying on the process default breaks as
+    // soon as another crate enables a second backend, which quinn does.
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut config = ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("aws-lc-rs provides TLS 1.2 and 1.3")
         .with_no_client_auth()
         .with_single_cert(chain, key_der)
         .map_err(|source| Error::Tls {

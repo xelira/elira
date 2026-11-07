@@ -132,7 +132,11 @@ impl Health {
 #[serde(deny_unknown_fields)]
 pub struct Http3 {
     pub listen: SocketAddr,
+    // Defaults so a missing field names itself in the error instead of
+    // surfacing as a bare serde "missing field".
+    #[serde(default)]
     pub cert: PathBuf,
+    #[serde(default)]
     pub key: PathBuf,
 }
 
