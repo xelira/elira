@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/elira", "crates/elira-config", "crates/elira-proxy"]
+members = [
+    "crates/elira",
+    "crates/elira-config",
+    "crates/elira-proxy",
+    "crates/elira-tls",
+    "crates/elira-accesslog",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -9,9 +15,9 @@ license = "MIT"
 repository = "https://github.com/xelira/elira"
 
 [workspace.dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal", "time"] }
-hyper = { version = "1", features = ["server", "client", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal", "time", "sync", "io-util"] }
+hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1", "server-auto"] }
 http = "1"
 http-body-util = "0.1"
 bytes = "1"
@@ -22,3 +28,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 thiserror = "2"
+http-body = "1"
+arc-swap = "1"
+rustls = "0.23"
+rustls-pemfile = "2"
+tokio-rustls = "0.26"

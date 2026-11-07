@@ -4,6 +4,14 @@ listen = "127.0.0.1:8080"
 max_headers = 64
 max_header_bytes = 16384
 upstream_timeout_secs = 30
+max_connections = 1024
+
+# [tls]
+# cert = "/etc/elira/cert.pem"
+# key = "/etc/elira/key.pem"
+
+[log]
+format = "text"   # or "json"
 
 [[upstreams]]
 name = "app"
