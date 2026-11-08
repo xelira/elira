@@ -134,6 +134,55 @@ impl Files {
         self.send(req, &resolved, &meta).await
     }
 
+    pub(crate) async fn resolve(&self, raw_path: &str) -> Option<PathBuf> {
+        let decoded = percent_encoding::percent_decode_str(raw_path)
+            .decode_utf8()
+            .ok()?
+            .into_owned();
+
+        let mut relative = PathBuf::new();
+        for segment in decoded.split('/') {
+            match segment {
+                "" | "." => continue,
+                ".." => return None,
+                segment if segment.contains('\0') || segment.contains('\\') => return None,
+                segment => relative.push(segment),
+            }
+        }
+
+        let root = tokio::fs::canonicalize(&self.root).await.ok()?;
+        let mut candidate = root.join(&relative);
+        let mut meta = tokio::fs::metadata(&candidate).await.ok();
+
+        if let Some(current) = &meta {
+            if current.is_dir() {
+                if !decoded.ends_with('/') {
+                    return None;
+                }
+                match self.index_for(&candidate).await {
+                    Some((path, index_meta)) => {
+                        candidate = path;
+                        meta = Some(index_meta);
+                    }
+                    None => return None,
+                }
+            }
+        }
+
+        if meta.is_none() {
+            candidate = self.try_files(&root, &relative).await?;
+            meta = tokio::fs::metadata(&candidate).await.ok();
+        }
+
+        meta?;
+        let resolved = tokio::fs::canonicalize(&candidate).await.ok()?;
+        if !resolved.starts_with(&root) {
+            return None;
+        }
+
+        Some(resolved)
+    }
+
     async fn index_for(&self, dir: &Path) -> Option<(PathBuf, std::fs::Metadata)> {
         for name in &self.index {
             let path = dir.join(name);
@@ -358,7 +407,7 @@ fn redirect(path: &str) -> Response<BoxBody<Bytes, BoxError>> {
     response
 }
 
-fn etag(len: u64, modified: Option<SystemTime>) -> String {
+pub fn etag(len: u64, modified: Option<SystemTime>) -> String {
     let stamp = modified
         .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
         .map(|duration| duration.as_millis())
@@ -463,7 +512,7 @@ fn escape_html(value: &str) -> String {
     out
 }
 
-fn content_type(path: &Path) -> &'static str {
+pub fn content_type(path: &Path) -> &'static str {
     let extension = path
         .extension()
         .and_then(|value| value.to_str())

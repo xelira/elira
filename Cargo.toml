@@ -49,4 +49,5 @@ percent-encoding = "2"
 httpdate = "1"
 ipnet = "2"
 socket2 = { version = "0.5", features = ["all"] }
+libc = "0.2"
 async-compression = { version = "0.4", features = ["tokio", "gzip", "brotli"] }

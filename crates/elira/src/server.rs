@@ -77,6 +77,7 @@ pub struct Options {
     pub max_buf_size: usize,
     pub idle_timeout: Duration,
     pub proxy_protocol: bool,
+    pub sendfile: bool,
     pub acme: Option<Arc<elira_acme::Acme>>,
 }
 
@@ -88,6 +89,7 @@ impl Options {
             max_buf_size: cfg.limits.max_header_bytes,
             idle_timeout: Duration::from_secs(cfg.limits.idle_timeout_secs),
             proxy_protocol: cfg.proxy_protocol,
+            sendfile: cfg.sendfile,
             acme: None,
         }
     }
@@ -261,6 +263,18 @@ async fn serve_stream(
 
     let tls = runtime.load().tls.clone();
     let secure = tls.is_some();
+
+    // Plain HTTP/1.1 only: TLS and HTTP/2 have their own write paths, and the
+    // fast path would duplicate them.
+    if options.sendfile
+        && tls.is_none()
+        && crate::sendfile::try_serve(&mut stream, &runtime, &metrics, peer)
+            .await
+            .is_some()
+    {
+        return;
+    }
+
     let conn = ConnOptions { secure, ..conn };
 
     match tls {

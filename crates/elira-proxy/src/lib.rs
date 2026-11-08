@@ -37,7 +37,7 @@ use elira_config::{Balance, Compression, Config, Health};
 use elira_limit::RateLimiter;
 use elira_upstream::{https_connector, TlsOptions};
 
-mod files;
+pub mod files;
 
 use files::Files;
 
@@ -395,6 +395,36 @@ impl Proxy {
                 timeout: Duration::from_secs(cfg.limits.upstream_timeout_secs),
             }),
         })
+    }
+
+    /// Resolve a request to a static file, if the route is a static one and
+    /// nothing about it needs the full response pipeline. The zero-copy path
+    /// writes headers itself, so per-route headers, a hidden `Server` or
+    /// `Alt-Svc` send the request through hyper instead.
+    pub async fn static_file(&self, host: &str, path: &str) -> Option<std::path::PathBuf> {
+        let (key, _) = canonical_host(host)?;
+        let entry = self.inner.router.pick(&key, path)?;
+
+        if !entry.add_headers.is_empty()
+            || !entry.remove_headers.is_empty()
+            || !self.inner.server_header
+            || self.inner.alt_svc.is_some()
+        {
+            return None;
+        }
+
+        match &entry.target {
+            Target::Files(files) => files.resolve(path).await,
+            _ => None,
+        }
+    }
+
+    /// Spend one rate-limit token, if the limiter is on.
+    pub fn rate_allows(&self, peer: std::net::IpAddr) -> bool {
+        match &self.inner.limiter {
+            Some(limiter) => limiter.check(peer, Instant::now()),
+            None => true,
+        }
     }
 
     /// How many upstream servers are up, and how many are down.
@@ -1193,7 +1223,7 @@ fn wants_upgrade(headers: &HeaderMap) -> Option<HeaderValue> {
         .then_some(upgrade)
 }
 
-pub(crate) fn preferred_encoding(headers: &HeaderMap) -> Option<&'static str> {
+pub fn preferred_encoding(headers: &HeaderMap) -> Option<&'static str> {
     let value = headers.get(ACCEPT_ENCODING)?.to_str().ok()?;
 
     let mut br = 0.0f32;
@@ -1224,7 +1254,7 @@ pub(crate) fn preferred_encoding(headers: &HeaderMap) -> Option<&'static str> {
     }
 }
 
-fn compressible(content_type: &str) -> bool {
+pub fn compressible(content_type: &str) -> bool {
     let kind = content_type
         .split(';')
         .next()

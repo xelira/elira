@@ -1160,3 +1160,89 @@ async fn self_signed_tls_upstream_is_rejected_by_default() {
     .await;
     assert_eq!(status(&response), "HTTP/1.1 502 Bad Gateway");
 }
+
+#[tokio::test]
+async fn sendfile_serves_a_plain_static_get() {
+    let root = temp_root("sendfile");
+    std::fs::write(root.join("app.bin"), vec![b'x'; 256 * 1024]).unwrap();
+
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[routes]]
+host = "*"
+root = "{}"
+"#,
+        root.display()
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let response = roundtrip(
+        addr,
+        "GET /app.bin HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&response), "HTTP/1.1 200 OK");
+
+    // The zero-copy path writes its own headers, so the hyper `Server` header
+    // is absent. Its presence would mean the request took the slow path.
+    assert!(
+        !response
+            .to_ascii_lowercase()
+            .lines()
+            .any(|line| line.starts_with("server:")),
+        "expected the sendfile path"
+    );
+
+    let body = response.split("\r\n\r\n").nth(1).expect("body");
+    assert_eq!(body.len(), 256 * 1024);
+}
+
+#[tokio::test]
+async fn sendfile_falls_back_for_ranges_and_compression() {
+    let root = temp_root("sendfile-fallback");
+    std::fs::write(root.join("app.bin"), vec![b'y'; 4096]).unwrap();
+    std::fs::write(root.join("app.txt"), "hello ".repeat(4096)).unwrap();
+
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[routes]]
+host = "*"
+root = "{}"
+"#,
+        root.display()
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let ranged = roundtrip(
+        addr,
+        "GET /app.bin HTTP/1.1\r\nHost: example.com\r\nRange: bytes=0-9\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&ranged), "HTTP/1.1 206 Partial Content");
+
+    // Conditional requests carry an ETag from the fast path but must be
+    // answered by hyper, which owns the 304 logic.
+    let first = roundtrip(
+        addr,
+        "GET /app.txt HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    let etag = first
+        .lines()
+        .find(|line| line.to_ascii_lowercase().starts_with("etag:"))
+        .map(|line| line["etag:".len()..].trim().to_owned())
+        .expect("etag");
+
+    let cached = roundtrip(
+        addr,
+        &format!(
+            "GET /app.txt HTTP/1.1\r\nHost: example.com\r\nIf-None-Match: {etag}\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await;
+    assert_eq!(status(&cached), "HTTP/1.1 304 Not Modified");
+}

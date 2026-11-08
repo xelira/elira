@@ -33,6 +33,10 @@ pub struct Config {
     /// Let a replacement process bind the same ports. Required for SIGUSR2.
     #[serde(default)]
     pub reuse_port: bool,
+    /// Answer simple static GET/HEAD with sendfile(2) before hyper sees the
+    /// request. Linux only.
+    #[serde(default = "Config::default_sendfile")]
+    pub sendfile: bool,
     #[serde(default)]
     pub tls: Option<Tls>,
     #[serde(default)]
@@ -437,6 +441,10 @@ impl<'de> Deserialize<'de> for LogFormat {
 
 impl Config {
     fn default_server_header() -> bool {
+        true
+    }
+
+    fn default_sendfile() -> bool {
         true
     }
 

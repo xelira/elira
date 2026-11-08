@@ -5,6 +5,7 @@
 //! process, and so the proxy can be embedded.
 
 pub mod proxy_protocol;
+mod sendfile;
 pub mod server;
 
 pub use elira_config as config;

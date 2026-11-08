@@ -33,6 +33,7 @@ elira check --config /etc/elira/elira.toml
 | `listen` | `IP:порт` | нет, обязательно | TCP-адрес основного HTTP-листенера |
 | `proxy_protocol` | bool | `false` | ждать PROXY protocol (v1/v2) на каждом соединении |
 | `reuse_port` | bool | `false` | SO_REUSEPORT; нужен для hot restart по SIGUSR2 |
+| `sendfile` | bool | `true` | zero-copy статика на Linux через `sendfile(2)` |
 | `server_header` | bool | `true` | отдавать `Server: elira` и сохранять заголовок upstream |
 | `limits` | таблица | значения по умолчанию | лимиты соединений и заголовков |
 | `tls` | таблица | нет (HTTP без TLS) | сертификат для TCP-листенера |
@@ -49,6 +50,14 @@ elira check --config /etc/elira/elira.toml
 
 `routes` — единственное обязательное поле помимо `listen`. Пустой массив
 отклоняется с ошибкой `no routes configured`.
+
+`sendfile` включает быстрый путь для статики: первый запрос на открытом
+HTTP/1.1-соединении подглядывается до hyper, и простой `GET`/`HEAD` файла
+отдаётся системным `sendfile(2)` без копирования через userspace. Быстрый
+путь не используется для `Range`, `If-None-Match`, `If-Modified-Since`,
+`Upgrade`, при наличии предсжатого `.br`/`.gz`, а также если у маршрута есть
+`add_headers`/`remove_headers`, выключен `server_header` или задан
+`Alt-Svc` — всё это уходит в hyper. Работает только на Linux.
 
 `proxy_protocol` включает разбор заголовка PROXY до TLS и до HTTP. Поддержаны
 версии 1 и 2. Заголовок при этом обязателен: соединение без него закрывается

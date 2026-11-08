@@ -15,9 +15,11 @@ elira-metrics = { path = "../elira-metrics" }
 elira-proxy = { path = "../elira-proxy" }
 elira-tls = { path = "../elira-tls" }
 anyhow = { workspace = true }
+libc = { workspace = true }
 arc-swap = { workspace = true }
 clap = { workspace = true }
 http = { workspace = true }
+httpdate = { workspace = true }
 http-body = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
