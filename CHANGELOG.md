@@ -100,6 +100,7 @@
 - Метрики TLS handshake и принятых QUIC-соединений.
 - Имя upstream в текстовом/JSON access-логе и `$upstream`.
 - Gauge активных запросов по пулам upstream.
+- Счётчики stale-попаданий кэша и health-проверок.
 - `cache.shared`: read-through общего дискового кэша между воркерами,
   общий бюджет, advisory-lock и стабильное имя файла на key+Vary.
 - `http3.idle_timeout_secs` и `http3.early_data` (0-RTT проверен QUIC-клиентом);

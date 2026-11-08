@@ -865,18 +865,26 @@ impl Proxy {
     }
 
     /// Probe every upstream once and update its health flag.
-    pub async fn check_health(&self, cfg: &Health) {
+    pub async fn check_health(&self, cfg: &Health) -> (usize, usize) {
         if !cfg.enabled {
-            return;
+            return (0, 0);
         }
+        let mut ok = 0;
+        let mut failed = 0;
         let timeout = Duration::from_secs(cfg.timeout_secs);
         for pool in &self.inner.pools {
             let path = pool.health_path.as_deref().unwrap_or(&cfg.path);
             for (index, server) in pool.servers.iter().enumerate() {
                 let up = probe(server, path, timeout, pool.scheme == "https", &pool.tls).await;
                 pool.set_health(index, up);
+                if up {
+                    ok += 1;
+                } else {
+                    failed += 1;
+                }
             }
         }
+        (ok, failed)
     }
 
     pub async fn handle(

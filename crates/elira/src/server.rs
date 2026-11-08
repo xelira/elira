@@ -346,7 +346,13 @@ pub fn spawn_health_loop(
             tokio::select! {
                 _ = stop.changed() => break,
                 _ = tokio::time::sleep(interval) => {
-                    current.proxy.check_health(&current.health).await;
+                    let (ok, failed) = current.proxy.check_health(&current.health).await;
+                    for _ in 0..ok {
+                        metrics.health_check(true);
+                    }
+                    for _ in 0..failed {
+                        metrics.health_check(false);
+                    }
                     let (up, down) = current.proxy.upstream_counts();
                     metrics.set_upstreams(up, down);
                     for (upstream, active) in current.proxy.pool_loads() {
@@ -597,6 +603,7 @@ async fn serve_conn<I>(
                 .and_then(|v| v.to_str().ok())
             {
                 Some("HIT") => metrics.cache_hit(),
+                Some("STALE") => metrics.cache_stale(),
                 Some("MISS") => metrics.cache_miss(),
                 _ => {}
             }

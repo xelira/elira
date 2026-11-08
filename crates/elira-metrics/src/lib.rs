@@ -157,6 +157,9 @@ pub struct Delta {
     pub cache_hits: u64,
     /// Cache lookups that were misses.
     pub cache_misses: u64,
+    pub cache_stale: u64,
+    pub health_checks_ok: u64,
+    pub health_checks_failed: u64,
     /// Request body bytes read from clients.
     pub request_bytes: u64,
     /// Response body bytes written to clients.
@@ -208,6 +211,9 @@ impl Delta {
                 .all(|(_, sum, count)| *sum == 0 && *count == 0)
             && self.cache_hits == 0
             && self.cache_misses == 0
+            && self.cache_stale == 0
+            && self.health_checks_ok == 0
+            && self.health_checks_failed == 0
             && self.request_bytes == 0
             && self.response_bytes == 0
             && self.reloads_ok == 0
@@ -235,6 +241,9 @@ pub struct Metrics {
     upstreams: Mutex<BTreeMap<String, Labeled>>,
     cache_hits: AtomicU64,
     cache_misses: AtomicU64,
+    cache_stale: AtomicU64,
+    health_checks_ok: AtomicU64,
+    health_checks_failed: AtomicU64,
     request_bytes: AtomicU64,
     response_bytes: AtomicU64,
     reloads_ok: AtomicU64,
@@ -259,6 +268,9 @@ impl Metrics {
             upstreams: Mutex::new(BTreeMap::new()),
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
+            cache_stale: AtomicU64::new(0),
+            health_checks_ok: AtomicU64::new(0),
+            health_checks_failed: AtomicU64::new(0),
             request_bytes: AtomicU64::new(0),
             response_bytes: AtomicU64::new(0),
             reloads_ok: AtomicU64::new(0),
@@ -324,6 +336,20 @@ impl Metrics {
     /// Record one cache miss.
     pub fn cache_miss(&self) {
         add_saturating(&self.cache_misses, 1);
+    }
+
+    /// Record one stale cache hit.
+    pub fn cache_stale(&self) {
+        add_saturating(&self.cache_stale, 1);
+    }
+
+    /// Record one upstream health probe.
+    pub fn health_check(&self, ok: bool) {
+        if ok {
+            add_saturating(&self.health_checks_ok, 1);
+        } else {
+            add_saturating(&self.health_checks_failed, 1);
+        }
     }
 
     /// Record request body bytes read from clients.
@@ -436,6 +462,9 @@ impl Metrics {
             upstream_duration,
             cache_hits: self.cache_hits.swap(0, Ordering::Relaxed),
             cache_misses: self.cache_misses.swap(0, Ordering::Relaxed),
+            cache_stale: self.cache_stale.swap(0, Ordering::Relaxed),
+            health_checks_ok: self.health_checks_ok.swap(0, Ordering::Relaxed),
+            health_checks_failed: self.health_checks_failed.swap(0, Ordering::Relaxed),
             request_bytes: self.request_bytes.swap(0, Ordering::Relaxed),
             response_bytes: self.response_bytes.swap(0, Ordering::Relaxed),
             reloads_ok: self.reloads_ok.swap(0, Ordering::Relaxed),
@@ -492,6 +521,9 @@ impl Metrics {
 
         add_saturating(&self.cache_hits, delta.cache_hits);
         add_saturating(&self.cache_misses, delta.cache_misses);
+        add_saturating(&self.cache_stale, delta.cache_stale);
+        add_saturating(&self.health_checks_ok, delta.health_checks_ok);
+        add_saturating(&self.health_checks_failed, delta.health_checks_failed);
         add_saturating(&self.request_bytes, delta.request_bytes);
         add_saturating(&self.response_bytes, delta.response_bytes);
         add_saturating(&self.reloads_ok, delta.reloads_ok);
@@ -635,6 +667,24 @@ impl Metrics {
             out,
             "elira_cache_requests_total{{result=\"miss\"}} {}",
             self.cache_misses.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            out,
+            "elira_cache_requests_total{{result=\"stale\"}} {}",
+            self.cache_stale.load(Ordering::Relaxed)
+        );
+
+        out.push_str("# HELP elira_health_checks_total Upstream health probes by result.\n");
+        out.push_str("# TYPE elira_health_checks_total counter\n");
+        let _ = writeln!(
+            out,
+            "elira_health_checks_total{{result=\"ok\"}} {}",
+            self.health_checks_ok.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            out,
+            "elira_health_checks_total{{result=\"failed\"}} {}",
+            self.health_checks_failed.load(Ordering::Relaxed)
         );
 
         out.push_str("# HELP elira_request_bytes_total Request body bytes read from clients.\n");
@@ -1750,5 +1800,23 @@ mod tests {
             .contains("elira_upstream_active_requests{upstream=\"app\"} 3"));
         let delta = metrics.take_delta();
         assert_eq!(delta.upstream_load, vec![("app".to_owned(), 3)]);
+    }
+
+    #[test]
+    fn stale_and_health_counters_render() {
+        let metrics = Metrics::new();
+        metrics.cache_stale();
+        metrics.health_check(true);
+        metrics.health_check(false);
+        let text = metrics.render();
+        assert!(line(
+            &text,
+            "elira_cache_requests_total{result=\"stale\"} 1"
+        ));
+        assert!(line(&text, "elira_health_checks_total{result=\"ok\"} 1"));
+        assert!(line(
+            &text,
+            "elira_health_checks_total{result=\"failed\"} 1"
+        ));
     }
 }
