@@ -532,6 +532,7 @@ async fn supervise(config: PathBuf, workers: usize) -> anyhow::Result<()> {
         run_ocsp_hook(hook).await;
     }
     let (exit_tx, mut exit_rx) = mpsc::channel::<(usize, std::process::ExitStatus)>(64);
+    let (admin_tx, mut admin_rx) = mpsc::channel::<server::AdminCommand>(8);
     let mut slots = Vec::with_capacity(workers);
 
     // Workers send their counters here; the supervisor owns the public
@@ -562,7 +563,7 @@ async fn supervise(config: PathBuf, workers: usize) -> anyhow::Result<()> {
             Some(path) => Some(Arc::new(elira_auth::BasicAuth::from_file(path)?)),
             None => None,
         };
-        server::spawn_metrics_aggregate(listener, aggregate, statuses, auth);
+        server::spawn_metrics_aggregate(listener, aggregate, statuses, auth, admin_tx.clone());
         metrics_socket = Some(path);
     }
     if let Some(path) = &metrics_socket {
@@ -618,6 +619,15 @@ async fn supervise(config: PathBuf, workers: usize) -> anyhow::Result<()> {
         tokio::select! {
             _ = sigterm.recv() => break,
             _ = sigint.recv() => break,
+            Some(command) = admin_rx.recv() => match command {
+                server::AdminCommand::Drain => break,
+                server::AdminCommand::Reload => {
+                    for slot in &slots {
+                        kill(slot.pid, libc::SIGHUP);
+                    }
+                    tracing::info!("admin reload sent SIGHUP to every worker");
+                }
+            },
             _ = sighup.recv() => {
                 for slot in &slots {
                     kill(slot.pid, libc::SIGHUP);

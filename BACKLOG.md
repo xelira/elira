@@ -17,10 +17,8 @@ Living list for the self-improvement loop. One item per session.
 
 - [x] OCSP hook when `workers > 1`: run it in the supervisor and SIGHUP workers.
 - [x] DNS-01 cleanup hook: remove the TXT record after validation.
-- [ ] Worker exit during a streaming app response: document that an incomplete
-  chunked body is the only observable outcome, or move the client socket into
-  the supervisor.
-- [ ] Admin `/drain` in worker mode: parent stops workers in order.
+
+- [x] Admin `/drain` and `/reload` in worker mode.
 
 ## A — security and operations
 
@@ -41,6 +39,10 @@ Living list for the self-improvement loop. One item per session.
 - [x] Expand parser fuzz targets.
 
 ## C — large projects
+
+- [ ] Worker exit during a streaming app response: document that an incomplete
+  chunked body is the only observable outcome, or move the client socket into
+  the supervisor.
 
 - [ ] WASM module runtime beside the native `.so` ABI.
 - [ ] Upstream HTTP/3.

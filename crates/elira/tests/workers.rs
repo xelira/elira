@@ -190,3 +190,74 @@ root = "{root}"
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn admin_drain_stops_the_supervisor() {
+    let dir = std::env::temp_dir().join(format!("elira-drain-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let config = dir.join("elira.toml");
+    let port = free_port();
+    let metrics_port = free_port();
+    std::fs::write(dir.join("index.html"), "drain").expect("index");
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+listen = "127.0.0.1:{port}"
+reuse_port = true
+workers = 2
+
+[metrics]
+listen = "127.0.0.1:{metrics_port}"
+
+[[routes]]
+host = "*"
+root = "{root}"
+"#,
+            root = dir.display()
+        ),
+    )
+    .expect("config");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_elira"))
+        .args(["run", "--config"])
+        .arg(&config)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn supervisor");
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        if get(port)
+            .map(|response| response.contains("200 OK"))
+            .unwrap_or(false)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let mut stream = TcpStream::connect(("127.0.0.1", metrics_port)).expect("metrics");
+    stream
+        .write_all(b"POST /drain HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .expect("post");
+    let mut response = Vec::new();
+    let mut chunk = [0u8; 512];
+    while let Ok(read) = stream.read(&mut chunk) {
+        if read == 0 {
+            break;
+        }
+        response.extend_from_slice(&chunk[..read]);
+    }
+    let response = String::from_utf8_lossy(&response);
+    assert!(response.contains("202"), "{response}");
+
+    let stopped = (0..100).any(|_| {
+        std::thread::sleep(Duration::from_millis(100));
+        matches!(child.try_wait(), Ok(Some(_)))
+    });
+    assert!(stopped, "admin drain did not stop the supervisor");
+    let _ = std::fs::remove_dir_all(&dir);
+}

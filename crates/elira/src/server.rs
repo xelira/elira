@@ -707,12 +707,20 @@ pub fn spawn_http01(
     });
 }
 
+/// Commands accepted by the supervisor's admin listener.
+#[derive(Debug, Clone, Copy)]
+pub enum AdminCommand {
+    Reload,
+    Drain,
+}
+
 /// Aggregate metrics and status reported by worker processes.
 pub fn spawn_metrics_aggregate(
     listener: TcpListener,
     metrics: Arc<Metrics>,
     statuses: Arc<std::sync::Mutex<std::collections::HashMap<usize, String>>>,
     auth: Option<Arc<elira_auth::BasicAuth>>,
+    control: tokio::sync::mpsc::Sender<AdminCommand>,
 ) {
     tokio::spawn(async move {
         loop {
@@ -722,11 +730,13 @@ pub fn spawn_metrics_aggregate(
             let metrics = metrics.clone();
             let statuses = statuses.clone();
             let auth = auth.clone();
+            let control = control.clone();
             tokio::spawn(async move {
                 let service = service_fn(move |req: hyper::Request<Incoming>| {
                     let metrics = metrics.clone();
                     let statuses = statuses.clone();
                     let auth = auth.clone();
+                    let control = control.clone();
                     async move {
                         if let Some(auth) = &auth {
                             let header = req
@@ -754,6 +764,14 @@ pub fn spawn_metrics_aggregate(
                                 "text/plain; version=0.0.4; charset=utf-8",
                                 metrics.render(),
                             ),
+                            (&hyper::Method::POST, "/reload") => {
+                                let _ = control.try_send(AdminCommand::Reload);
+                                json(hyper::StatusCode::ACCEPTED, "{\"reload\":\"queued\"}")
+                            }
+                            (&hyper::Method::POST, "/drain") => {
+                                let _ = control.try_send(AdminCommand::Drain);
+                                json(hyper::StatusCode::ACCEPTED, "{\"drain\":\"started\"}")
+                            }
                             (&hyper::Method::GET, "/status") => {
                                 let statuses = statuses
                                     .lock()
