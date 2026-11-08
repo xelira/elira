@@ -32,6 +32,7 @@ pub struct Config {
     pub client_auth: elira_tls::ClientAuth,
     pub certificates: Vec<elira_tls::NamedCert>,
     pub proxy_protocol: bool,
+    pub idle_timeout_secs: u64,
 }
 
 pub async fn serve(
@@ -50,7 +51,13 @@ pub async fn serve(
         cfg.client_auth,
     )?;
     let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls)?;
-    let server = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_idle_timeout(Some(
+        quinn::IdleTimeout::try_from(std::time::Duration::from_secs(cfg.idle_timeout_secs))
+            .map_err(|_| anyhow::anyhow!("invalid QUIC idle timeout"))?,
+    ));
+    let mut server = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+    server.transport_config(Arc::new(transport));
 
     let (endpoint, clients) = bind(cfg.listen, server, cfg.reuse_port, cfg.proxy_protocol).await?;
     tracing::info!(listen = %cfg.listen, "http/3 listening");

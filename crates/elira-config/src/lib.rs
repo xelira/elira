@@ -320,6 +320,15 @@ pub struct Http3 {
     /// Extra certificates selected by SNI on the QUIC listener.
     #[serde(default)]
     pub certificates: Vec<ServerCert>,
+    /// QUIC idle timeout in seconds.
+    #[serde(default = "Http3::default_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
+}
+
+impl Http3 {
+    fn default_idle_timeout_secs() -> u64 {
+        30
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1091,6 +1100,9 @@ impl Config {
             if http3.key.as_os_str().is_empty() {
                 return Err(Error::Http3MissingKey);
             }
+            if http3.idle_timeout_secs == 0 {
+                return Err(Error::Http3IdleTimeoutZero);
+            }
             if http3.client_auth != ClientAuthMode::Off {
                 match &http3.client_ca {
                     Some(path) if !path.as_os_str().is_empty() => {}
@@ -1562,6 +1574,9 @@ pub enum Error {
 
     #[error("health.timeout_secs must be greater than zero")]
     BadHealthTimeout,
+
+    #[error("http3.idle_timeout_secs must be greater than zero")]
+    Http3IdleTimeoutZero,
 
     #[error("http3.cert must not be empty")]
     Http3MissingCert,
@@ -2919,6 +2934,28 @@ cache_ttl_secs = 30
         assert!(matches!(
             Config::parse(&zero),
             Err(Error::BadRouteCacheTtl { .. })
+        ));
+    }
+
+    #[test]
+    fn http3_idle_timeout_is_positive() {
+        let text = r#"
+listen = "127.0.0.1:8080"
+[http3]
+listen = "[::]:443"
+cert = "/tmp/cert.pem"
+key = "/tmp/key.pem"
+idle_timeout_secs = 45
+[[routes]]
+host = "*"
+root = "/srv/www"
+"#;
+        let cfg = Config::parse(text).expect("valid");
+        assert_eq!(cfg.http3.expect("http3").idle_timeout_secs, 45);
+        let zero = text.replace("idle_timeout_secs = 45", "idle_timeout_secs = 0");
+        assert!(matches!(
+            Config::parse(&zero),
+            Err(Error::Http3IdleTimeoutZero)
         ));
     }
 }

@@ -28,13 +28,14 @@ Living list for the self-improvement loop. One item per session.
 - [x] Per-route FastCGI pool size.
 - [x] Purge tests through the admin listener in both single and worker mode.
 - [x] Per-route cache enable/TTL overrides.
-- [ ] Configurable FastCGI pool size per upstream instead of a global limit.
+- [x] Configurable FastCGI pool size per route.
 - [x] `/status` per-worker snapshots instead of the last worker's snapshot.
 - [x] Wire prefix cache purge into the admin API and per-worker broadcast.
 
 ## B — performance and compatibility
 
-- [ ] QUIC idle timeout and 0-RTT configuration.
+- [x] QUIC idle timeout configuration.
+- [ ] QUIC 0-RTT if quinn exposes a server-side switch.
 - [ ] Shared cache or consistent-hash routing so worker caches do not produce
   avoidable misses.
 - [ ] Per-route FastCGI pool size.

@@ -424,6 +424,7 @@ fn spawn_h3(
                     key: entry.key.clone(),
                 })
                 .collect(),
+            idle_timeout_secs: http3.idle_timeout_secs,
             proxy_protocol,
         };
         if let Err(err) = elira_h3::serve(cfg, proxy, metrics, body_timeout, log, stop).await {
