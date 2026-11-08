@@ -85,6 +85,8 @@
   HIT-ответы.
 - SNI-сертификаты и mTLS на QUIC-листенере.
 - `include` с масками и рекурсивным слиянием, подстановка `${ENV}` в конфиге.
+- `elira migrate` переносит `try_files`, `add_header`, `allow`/`deny`,
+  `auth_basic_user_file`, `client_max_body_size`, `gzip`, TLS и regex-location.
 - FastCGI-бэкенды по TCP и unix-сокетам, CGI-скрипты и нативные
   динамические модули (`.so`).
 - Режим `workers > 1` с супервизором, SO_REUSEPORT, перезапуском упавших

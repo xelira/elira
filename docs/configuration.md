@@ -19,11 +19,13 @@ elira migrate --output elira.toml nginx.conf
 ```
 
 Поддержаны `upstream` с `server` и `least_conn`, `server`/`listen`/`server_name`,
-`location` с `proxy_pass`, `root` + `index` и `return`. Всё остальное —
-`ssl_certificate`, `gzip`, `add_header`, `try_files`, `if`, `rewrite`, регулярные
-`location` — не переносится, а печатается предупреждением в stderr; вход при этом
-не теряется, но результат надо прочитать глазами. Несколько `server` в одном
-файле дают предупреждение: у Elira один `listen`.
+`location` с `proxy_pass`, `root` + `index`, `return`, `try_files`, `add_header`,
+`auth_basic_user_file`, `allow`/`deny`, `client_max_body_size`, `gzip`,
+`ssl_certificate`/`ssl_certificate_key`, `access_log` и регулярные `location`.
+`if`, `rewrite`, переменные и вложенные `location` не переносятся, а печатаются
+предупреждением в stderr; вход не теряется, но результат надо прочитать
+глазами. Несколько `server` в одном файле дают предупреждение: у Elira один
+`listen`.
 
 Конфиг можно разбить на файлы:
 

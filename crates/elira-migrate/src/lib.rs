@@ -325,6 +325,11 @@ struct Converter {
     routes: Vec<Route>,
     route_keys: HashSet<(String, String)>,
     listen: Option<String>,
+    gzip: bool,
+    max_body: Option<usize>,
+    tls_cert: Option<String>,
+    tls_key: Option<String>,
+    log_file: Option<String>,
 }
 
 #[derive(Debug)]
@@ -335,15 +340,22 @@ struct Upstream {
     tls: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct Route {
     host: String,
     path: Option<String>,
+    path_regex: Option<String>,
     upstream: Option<String>,
     root: Option<String>,
     index: Option<Vec<String>>,
     redirect: Option<(String, u16)>,
     strip_prefix: bool,
+    try_files: Vec<String>,
+    add_headers: Vec<String>,
+    auth_file: Option<String>,
+    ip_allow: Vec<String>,
+    ip_deny: Vec<String>,
+    max_body: Option<usize>,
 }
 
 impl Converter {
@@ -527,6 +539,27 @@ impl Converter {
                     }
                 }
                 "return" => default_return = self.parse_return(child),
+                "gzip" => match child.args.first().map(String::as_str) {
+                    Some("on") => self.gzip = true,
+                    Some("off") => self.gzip = false,
+                    _ => self.warn(child.line, "`gzip` needs on or off, ignored"),
+                },
+                "client_max_body_size" => match child.args.first().and_then(|v| parse_size(v)) {
+                    Some(size) => self.max_body = Some(size),
+                    None => self.warn(child.line, "`client_max_body_size` is not a size, ignored"),
+                },
+                "ssl_certificate" => match child.args.first() {
+                    Some(path) => self.tls_cert = Some(path.clone()),
+                    None => self.warn(child.line, "`ssl_certificate` without a path, ignored"),
+                },
+                "ssl_certificate_key" => match child.args.first() {
+                    Some(path) => self.tls_key = Some(path.clone()),
+                    None => self.warn(child.line, "`ssl_certificate_key` without a path, ignored"),
+                },
+                "access_log" => match child.args.first().map(String::as_str) {
+                    Some("off") | None => {}
+                    Some(path) => self.log_file = Some(path.to_owned()),
+                },
                 "location" => {
                     if child.children.is_some() {
                         locations.push(child);
@@ -572,6 +605,7 @@ impl Converter {
                         index: None,
                         redirect: Some((to.clone(), status)),
                         strip_prefix: false,
+                        ..Route::default()
                     },
                     node.line,
                 );
@@ -592,6 +626,7 @@ impl Converter {
                                 index: default_index.clone(),
                                 redirect: None,
                                 strip_prefix: false,
+                                ..Route::default()
                             },
                             node.line,
                         );
@@ -623,14 +658,24 @@ impl Converter {
         default_root: Option<&str>,
         default_index: Option<&[String]>,
     ) -> Result<(), Error> {
-        let Some(path) = location_path(&node.args, node.line, &mut self.warnings) else {
+        let Some(location) = location_path(&node.args, node.line, &mut self.warnings) else {
             return Ok(());
+        };
+        let (path, path_regex) = match location {
+            LocationPath::Prefix(path) => (path, None),
+            LocationPath::Regex(regex) => (None, Some(regex)),
         };
 
         let mut proxy: Option<String> = None;
         let mut root: Option<String> = None;
         let mut index: Option<Vec<String>> = None;
         let mut redirect: Option<(u16, String)> = None;
+        let mut try_files: Vec<String> = Vec::new();
+        let mut add_headers: Vec<String> = Vec::new();
+        let mut auth_file: Option<String> = None;
+        let mut ip_allow: Vec<String> = Vec::new();
+        let mut ip_deny: Vec<String> = Vec::new();
+        let mut max_body: Option<usize> = None;
 
         for child in node.children.as_deref().unwrap_or(&[]) {
             match child.name.as_str() {
@@ -658,6 +703,51 @@ impl Converter {
                         redirect = Some(parsed);
                     }
                 }
+                "try_files" => {
+                    if child.args.is_empty() {
+                        self.warn(child.line, "`try_files` without candidates, ignored");
+                    } else {
+                        try_files = child.args.clone();
+                    }
+                }
+                "add_header" => {
+                    if child.args.len() >= 2 {
+                        add_headers.push(format!(
+                            "{}: {}",
+                            child.args[0],
+                            child.args[1..].join(" ")
+                        ));
+                    } else {
+                        self.warn(child.line, "`add_header` needs a name and a value");
+                    }
+                }
+                "auth_basic_user_file" => match child.args.first() {
+                    Some(path) => auth_file = Some(path.clone()),
+                    None => self.warn(child.line, "`auth_basic_user_file` without a path"),
+                },
+                "allow" => match child.args.first().map(String::as_str) {
+                    Some("all") => ip_allow.clear(),
+                    Some(value) => match acl_value(value) {
+                        Some(value) => ip_allow.push(value),
+                        None => self.warn(child.line, format!("`allow {value}` is not an address")),
+                    },
+                    None => self.warn(child.line, "`allow` without an address"),
+                },
+                "deny" => match child.args.first().map(String::as_str) {
+                    Some("all") => {
+                        ip_deny.push("0.0.0.0/0".to_owned());
+                        ip_deny.push("::/0".to_owned());
+                    }
+                    Some(value) => match acl_value(value) {
+                        Some(value) => ip_deny.push(value),
+                        None => self.warn(child.line, format!("`deny {value}` is not an address")),
+                    },
+                    None => self.warn(child.line, "`deny` without an address"),
+                },
+                "client_max_body_size" => match child.args.first().and_then(|v| parse_size(v)) {
+                    Some(size) => max_body = Some(size),
+                    None => self.warn(child.line, "`client_max_body_size` is not a size, ignored"),
+                },
                 "location" => self.warn(
                     child.line,
                     "nested `location` blocks are not supported, skipped",
@@ -683,6 +773,7 @@ impl Converter {
                         index: None,
                         redirect: Some((to.clone(), status)),
                         strip_prefix: false,
+                        ..Route::default()
                     },
                     node.line,
                 );
@@ -703,11 +794,18 @@ impl Converter {
                         Route {
                             host: host.clone(),
                             path: path.clone(),
+                            path_regex: path_regex.clone(),
                             upstream: Some(upstream.clone()),
                             root: None,
                             index: None,
                             redirect: None,
                             strip_prefix,
+                            try_files: try_files.clone(),
+                            add_headers: add_headers.clone(),
+                            auth_file: auth_file.clone(),
+                            ip_allow: ip_allow.clone(),
+                            ip_deny: ip_deny.clone(),
+                            max_body,
                         },
                         node.line,
                     );
@@ -727,11 +825,18 @@ impl Converter {
                         Route {
                             host: host.clone(),
                             path: path.clone(),
+                            path_regex: path_regex.clone(),
                             upstream: None,
                             root: Some(root.to_owned()),
                             index: effective_index.clone(),
                             redirect: None,
                             strip_prefix: false,
+                            try_files: try_files.clone(),
+                            add_headers: add_headers.clone(),
+                            auth_file: auth_file.clone(),
+                            ip_allow: ip_allow.clone(),
+                            ip_deny: ip_deny.clone(),
+                            max_body,
                         },
                         node.line,
                     );
@@ -941,7 +1046,11 @@ impl Converter {
     fn push_route(&mut self, route: Route, line: usize) {
         let key = (
             route.host.to_ascii_lowercase(),
-            route.path.clone().unwrap_or_default(),
+            route
+                .path
+                .clone()
+                .or_else(|| route.path_regex.clone())
+                .unwrap_or_default(),
         );
         if !self.route_keys.insert(key) {
             self.warn(
@@ -962,6 +1071,23 @@ impl Converter {
         out.push_str("# Generated by elira-migrate from an nginx configuration.\n");
         let listen = self.listen.as_deref().unwrap_or("0.0.0.0:80");
         out.push_str(&format!("listen = {}\n", toml_string(listen)));
+
+        if self.gzip {
+            out.push_str("\n[compression]\nenabled = true\n");
+        }
+        if let Some(max_body) = self.max_body {
+            out.push_str(&format!("\n[limits]\nmax_body_bytes = {max_body}\n"));
+        }
+        if let Some(path) = &self.log_file {
+            out.push_str(&format!("\n[log]\nfile = {}\n", toml_string(path)));
+        }
+        if let (Some(cert), Some(key)) = (&self.tls_cert, &self.tls_key) {
+            out.push_str(&format!(
+                "\n[tls]\ncert = {}\nkey = {}\n",
+                toml_string(cert),
+                toml_string(key)
+            ));
+        }
 
         for upstream in &self.upstreams {
             out.push_str("\n[[upstreams]]\n");
@@ -987,6 +1113,9 @@ impl Converter {
             if let Some(path) = &route.path {
                 out.push_str(&format!("path = {}\n", toml_string(path)));
             }
+            if let Some(regex) = &route.path_regex {
+                out.push_str(&format!("path_regex = {}\n", toml_string(regex)));
+            }
             if let Some(upstream) = &route.upstream {
                 out.push_str(&format!("upstream = {}\n", toml_string(upstream)));
             }
@@ -1010,6 +1139,45 @@ impl Converter {
             if route.strip_prefix {
                 out.push_str("strip_prefix = true\n");
             }
+            if !route.try_files.is_empty() {
+                out.push_str(&format!(
+                    "try_files = [{}]\n",
+                    route
+                        .try_files
+                        .iter()
+                        .map(|value| toml_string(value))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            if !route.add_headers.is_empty() {
+                out.push_str(&format!(
+                    "add_headers = [{}]\n",
+                    route
+                        .add_headers
+                        .iter()
+                        .map(|value| toml_string(value))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            if let Some(auth) = &route.auth_file {
+                out.push_str(&format!("auth_file = {}\n", toml_string(auth)));
+            }
+            for (name, list) in [("ip_allow", &route.ip_allow), ("ip_deny", &route.ip_deny)] {
+                if !list.is_empty() {
+                    out.push_str(&format!(
+                        "{name} = [{}]\n",
+                        list.iter()
+                            .map(|value| toml_string(value))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+            }
+            if let Some(max_body) = route.max_body {
+                out.push_str(&format!("max_body_bytes = {max_body}\n"));
+            }
         }
 
         out
@@ -1019,6 +1187,29 @@ impl Converter {
 // ---------------------------------------------------------------------------
 // Directive helpers
 // ---------------------------------------------------------------------------
+
+fn parse_size(raw: &str) -> Option<usize> {
+    let raw = raw.trim().to_ascii_lowercase();
+    let (number, multiplier) = match raw.chars().last()? {
+        'k' => (&raw[..raw.len() - 1], 1024usize),
+        'm' => (&raw[..raw.len() - 1], 1024 * 1024),
+        'g' => (&raw[..raw.len() - 1], 1024 * 1024 * 1024),
+        _ => (raw.as_str(), 1),
+    };
+    let value: usize = number.parse().ok()?;
+    value.checked_mul(multiplier)
+}
+
+fn acl_value(raw: &str) -> Option<String> {
+    if raw.contains('/') {
+        return raw.parse::<ipnet::IpNet>().ok().map(|_| raw.to_owned());
+    }
+    match raw.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => Some(format!("{ip}/32")),
+        Ok(std::net::IpAddr::V6(ip)) => Some(format!("{ip}/128")),
+        Err(_) => None,
+    }
+}
 
 fn dedup(values: Vec<String>) -> Vec<String> {
     let mut seen = HashSet::new();
@@ -1105,11 +1296,12 @@ fn listen_address(raw: &str) -> Result<String, String> {
     }
 }
 
-fn location_path(
-    args: &[String],
-    line: usize,
-    warnings: &mut Vec<String>,
-) -> Option<Option<String>> {
+enum LocationPath {
+    Prefix(Option<String>),
+    Regex(String),
+}
+
+fn location_path(args: &[String], line: usize, warnings: &mut Vec<String>) -> Option<LocationPath> {
     let mut args = args;
     let mut exact = false;
 
@@ -1121,11 +1313,11 @@ fn location_path(
             }
             "^~" => args = &args[1..],
             "~" | "~*" => {
-                warnings.push(format!(
-                    "line {line}: regex location `{}` is not supported, skipped",
-                    args.get(1).map(String::as_str).unwrap_or("")
-                ));
-                return None;
+                let Some(pattern) = args.get(1).filter(|value| !value.is_empty()) else {
+                    warnings.push(format!("line {line}: regex location without a pattern"));
+                    return None;
+                };
+                return Some(LocationPath::Regex(pattern.to_string()));
             }
             _ => {}
         }
@@ -1156,9 +1348,9 @@ fn location_path(
     }
 
     if path == "/" {
-        Some(None)
+        Some(LocationPath::Prefix(None))
     } else {
-        Some(Some(path.clone()))
+        Some(LocationPath::Prefix(Some(path.clone())))
     }
 }
 
@@ -1404,16 +1596,15 @@ server {
         let config = parse(&migration);
 
         assert_eq!(config.routes.len(), 1);
+        assert!(config.compression.enabled);
+        assert_eq!(
+            config.routes[0].try_files,
+            vec!["$uri", "$uri/", "/index.html"]
+        );
+        assert_eq!(config.routes[0].add_headers, vec!["X-Frame-Options: DENY"]);
+
         let warnings = migration.warnings.join("\n");
-        for needle in [
-            "ssl_certificate",
-            "gzip",
-            "add_header",
-            "try_files",
-            "if",
-            "rewrite",
-            "404",
-        ] {
+        for needle in ["if", "rewrite", "404"] {
             assert!(
                 warnings.contains(needle),
                 "missing `{needle}` in:\n{warnings}"
@@ -1458,5 +1649,38 @@ http {
     fn unterminated_block_is_a_syntax_error() {
         let input = "server { listen 80; ";
         assert!(matches!(migrate(input), Err(Error::Syntax { .. })));
+    }
+
+    #[test]
+    fn migrates_security_tls_and_regex_locations() {
+        let input = r#"
+server {
+    listen 80;
+    server_name secure.example;
+    client_max_body_size 2m;
+    ssl_certificate /etc/ssl/site.pem;
+    ssl_certificate_key /etc/ssl/site.key;
+
+    location ~ ^/api/[0-9]+ {
+        proxy_pass http://127.0.0.1:3000;
+        auth_basic_user_file /etc/nginx/htpasswd;
+        allow 10.0.0.0/8;
+        allow 192.0.2.7;
+        deny all;
+        add_header X-Content-Type-Options nosniff;
+    }
+}
+"#;
+        let migration = convert(input);
+        let config = parse(&migration);
+
+        assert_eq!(config.limits.max_body_bytes, 2 * 1024 * 1024);
+        assert!(config.tls.is_some());
+        let route = &config.routes[0];
+        assert_eq!(route.path_regex.as_deref(), Some("^/api/[0-9]+"));
+        assert!(route.auth_file.is_some());
+        assert_eq!(route.ip_allow, vec!["10.0.0.0/8", "192.0.2.7/32"]);
+        assert_eq!(route.ip_deny.len(), 2);
+        assert_eq!(route.add_headers, vec!["X-Content-Type-Options: nosniff"]);
     }
 }
