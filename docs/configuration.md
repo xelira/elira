@@ -482,6 +482,7 @@ advisory-lock `.elira-cache.lock`, а `max_bytes` считается по все
 | `http2` | bool | `[upstream_tls] http2` | предлагать `h2` |
 | `dns_ttl_secs` | целое > 0 | `30` | предел жизни соединения в пуле; имя резолвится заново при новом соединении |
 | `h2_pool` | bool | `false` | собственный HTTP/2-пул Elira; на plain TCP — h2c prior knowledge |
+| `h3_pool` | bool | `false` | собственный HTTP/3-пул; требует `tls = true` |
 
 - `name` не может быть пустым или повторяться.
 - `servers` не может быть пустым; каждый элемент — `host:port` с портом
@@ -499,6 +500,8 @@ advisory-lock `.elira-cache.lock`, а `max_bytes` считается по все
   мог уже начать обработку.
 - Все серверы помечены мёртвыми — трафик всё равно идёт (fail-open), иначе
   сломанная проверка превратилась бы в простой.
+- `h3_pool = true` использует QUIC/h3-пул (SNI, ALPN h3, до 4 соединений);
+  статистика connections/active/total видна в `/status`.
 - `h2_pool = true` заменяет legacy-клиент на собственный HTTP/2-пул: до
   четырёх соединений на origin, least-busy выбор, реальные счётчики
   connections/active/total/queued в `/status`. Для `http://` используется h2c

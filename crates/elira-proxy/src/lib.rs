@@ -261,6 +261,7 @@ struct Pool {
     tls: TlsOptions,
     health_path: Option<String>,
     h2: Option<elira_h2::Pool>,
+    h3: Option<elira_h3upstream::Pool>,
 }
 
 struct ActiveGuard<'a> {
@@ -385,6 +386,14 @@ impl Proxy {
                             "queued_streams": stats.queued_streams,
                         })
                     }),
+                    "http3": pool.h3.as_ref().map(|h3| {
+                        let stats = h3.stats();
+                        serde_json::json!({
+                            "connections": stats.connections,
+                            "active_requests": stats.active_requests,
+                            "total_connections": stats.total_connections,
+                        })
+                    }),
                     "servers": servers,
                 })
             })
@@ -445,6 +454,13 @@ impl Proxy {
                     client,
                     tls: tls.clone(),
                     health_path: up.health_path.clone(),
+                    h3: up.h3_pool.then(|| {
+                        elira_h3upstream::Pool::new(elira_h3upstream::PoolConfig {
+                            max_connections: 4,
+                            connect_timeout: Duration::from_secs(5),
+                            tls: tls.clone(),
+                        })
+                    }),
                     h2: up.h2_pool.then(|| {
                         elira_h2::Pool::new(elira_h2::PoolConfig::new(
                             4,
@@ -2854,6 +2870,15 @@ async fn send_request(
     timeout: Duration,
 ) -> Result<Response<Body>, SendError> {
     let Some(path) = server.unix() else {
+        if let Some(h3) = &pool.h3 {
+            let uri = request.uri().clone();
+            let result = tokio::time::timeout(timeout, h3.request(uri, request)).await;
+            return match result {
+                Ok(Ok(response)) => Ok(response),
+                Ok(Err(err)) => Err(SendError::Failed(err.to_string())),
+                Err(_) => Err(SendError::Timeout),
+            };
+        }
         if let Some(h2) = &pool.h2 {
             let uri = request.uri().clone();
             let result = tokio::time::timeout(timeout, h2.request(uri, request)).await;
@@ -3241,6 +3266,7 @@ mod tests {
             tls,
             health_path: None,
             h2: None,
+            h3: None,
         };
 
         assert_eq!(pool.pick(), 0);

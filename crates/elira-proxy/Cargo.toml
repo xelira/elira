@@ -13,6 +13,7 @@ elira-cgi = { path = "../elira-cgi" }
 elira-config = { path = "../elira-config" }
 elira-fastcgi = { path = "../elira-fastcgi" }
 elira-h2 = { path = "../elira-h2" }
+elira-h3upstream = { path = "../elira-h3upstream" }
 elira-module = { path = "../elira-module" }
 elira-upstream = { path = "../elira-upstream" }
 elira-wasm = { path = "../elira-wasm" }

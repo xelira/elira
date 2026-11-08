@@ -792,6 +792,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "elira-h3upstream"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "elira-config",
+ "elira-h3",
+ "elira-metrics",
+ "elira-proxy",
+ "elira-tls",
+ "elira-upstream",
+ "futures-util",
+ "h3",
+ "h3-quinn",
+ "http",
+ "http-body",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "quinn",
+ "rustls",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+]
+
+[[package]]
 name = "elira-limit"
 version = "0.1.0"
 
@@ -836,6 +863,7 @@ dependencies = [
  "elira-config",
  "elira-fastcgi",
  "elira-h2",
+ "elira-h3upstream",
  "elira-limit",
  "elira-module",
  "elira-upstream",

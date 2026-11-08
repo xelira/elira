@@ -67,7 +67,7 @@ Living list for the self-improvement loop. One item per session.
   SIGTERM and in-flight connections are not transferred.
 
 - [x] WASM module runtime beside the native `.so` ABI, including a fuel budget.
-- [ ] Upstream HTTP/3.
+- [x] Upstream HTTP/3 pool (`h3_pool`).
 - [ ] DNS-01 against a real production CA: blocked on an externally managed
   zone for TXT records.
 - [ ] Fuzz the FastCGI/CGI streaming state machines with a scripted peer.

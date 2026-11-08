@@ -397,6 +397,10 @@ pub struct Upstream {
     #[serde(default)]
     pub h2_pool: bool,
 
+    /// Use Elira's HTTP/3 upstream pool. Requires TLS.
+    #[serde(default)]
+    pub h3_pool: bool,
+
     /// Cap the lifetime of pooled connections so a DNS change is picked up
     /// within this many seconds. Defaults to 30.
     #[serde(default)]
@@ -1313,6 +1317,16 @@ impl Config {
                     retries: up.retries,
                 });
             }
+            if up.h3_pool && !up.tls {
+                return Err(Error::H3PoolNeedsTls {
+                    name: up.name.clone(),
+                });
+            }
+            if up.h3_pool && up.h2_pool {
+                return Err(Error::H3AndH2Pool {
+                    name: up.name.clone(),
+                });
+            }
             if up.dns_ttl_secs == Some(0) {
                 return Err(Error::BadDnsTtl {
                     name: up.name.clone(),
@@ -1716,6 +1730,12 @@ pub enum Error {
 
     #[error("upstream \"{name}\" has no servers")]
     EmptyUpstream { name: String },
+
+    #[error("upstream \"{name}\": h3_pool requires tls = true")]
+    H3PoolNeedsTls { name: String },
+
+    #[error("upstream \"{name}\": h3_pool and h2_pool are mutually exclusive")]
+    H3AndH2Pool { name: String },
 
     #[error("upstream \"{name}\": dns_ttl_secs must be greater than zero")]
     BadDnsTtl { name: String },
@@ -3142,5 +3162,27 @@ upstream = "app"
 "#;
         let cfg = Config::parse(text).expect("valid");
         assert!(cfg.upstreams[0].h2_pool);
+    }
+
+    #[test]
+    fn h3_pool_needs_tls_and_excludes_h2_pool() {
+        let base = r#"
+listen = "127.0.0.1:8080"
+[[upstreams]]
+name = "app"
+servers = ["127.0.0.1:3000"]
+h3_pool = true
+[[routes]]
+host = "*"
+upstream = "app"
+"#;
+        assert!(matches!(
+            Config::parse(base),
+            Err(Error::H3PoolNeedsTls { .. })
+        ));
+        let tls = base.replace("servers = ["127.0.0.1:3000"]", "servers = ["127.0.0.1:3000"]\ntls = true");
+        assert!(Config::parse(&tls).is_ok());
+        let both = tls.replace("h3_pool = true", "h3_pool = true\nh2_pool = true");
+        assert!(matches!(Config::parse(&both), Err(Error::H3AndH2Pool { .. })));
     }
 }

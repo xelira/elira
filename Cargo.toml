@@ -19,6 +19,7 @@ members = [
     "crates/elira-module",
     "crates/elira-wasm",
     "crates/elira-h2",
+    "crates/elira-h3upstream",
 ]
 
 [workspace.package]
