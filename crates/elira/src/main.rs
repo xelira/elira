@@ -40,8 +40,7 @@ enum Command {
     },
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     // rustls refuses to guess when more than one crypto backend is compiled
     // in, and quinn pulls in its own feature set. Pick one, once.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -77,14 +76,29 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Run { config } => {
-            tracing_subscriber::fmt()
-                .with_env_filter(
-                    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-                )
-                .init();
-            run(config).await
+            init_tracing();
+            let cfg = Config::load(&config)?;
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("cannot build the tokio runtime")?;
+
+            // A child of the supervisor must never supervise again.
+            if cfg.workers > 1 && std::env::var_os("ELIRA_WORKER").is_none() {
+                runtime.block_on(supervise(config, cfg.workers))
+            } else {
+                runtime.block_on(run(config))
+            }
         }
     }
+}
+
+fn init_tracing() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
 }
 
 async fn run(path: PathBuf) -> anyhow::Result<()> {
@@ -400,6 +414,189 @@ async fn reload(
     tracing::info!("config reloaded");
 }
 
+struct WorkerSlot {
+    pid: u32,
+    ready: PathBuf,
+}
+
+/// Supervisor for `workers > 1`. Children share the sockets via SO_REUSEPORT;
+/// the parent only starts, watches, reloads and restarts them.
+async fn supervise(config: PathBuf, workers: usize) -> anyhow::Result<()> {
+    use tokio::signal::unix::{signal, SignalKind};
+    use tokio::sync::mpsc;
+
+    let (exit_tx, mut exit_rx) = mpsc::channel::<(usize, std::process::ExitStatus)>(64);
+    let mut slots = Vec::with_capacity(workers);
+
+    for index in 0..workers {
+        let slot = spawn_worker(index, &config)?;
+        watch_worker(index, &slot, exit_tx.clone());
+        slots.push(slot);
+    }
+
+    for slot in &slots {
+        wait_worker_ready(slot)
+            .await
+            .with_context(|| format!("worker {} did not become ready", slot.pid))?;
+    }
+    notify_ready();
+    tracing::info!(workers, "supervisor is ready");
+
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sighup = signal(SignalKind::hangup())?;
+    let mut sigusr2 = signal(SignalKind::user_defined2())?;
+
+    loop {
+        tokio::select! {
+            _ = sigterm.recv() => break,
+            _ = sigint.recv() => break,
+            _ = sighup.recv() => {
+                for slot in &slots {
+                    kill(slot.pid, libc::SIGHUP);
+                }
+                tracing::info!("sent SIGHUP to every worker");
+            }
+            _ = sigusr2.recv() => {
+                tracing::info!("rolling restart of all workers");
+                for index in 0..slots.len() {
+                    kill(slots[index].pid, libc::SIGTERM);
+                    wait_for_exit(&mut exit_rx, index, &mut slots, &config, &exit_tx).await?;
+                }
+            }
+            Some((index, status)) = exit_rx.recv() => {
+                if !status.success() {
+                    tracing::error!(worker = index, %status, "worker exited, restarting it");
+                } else {
+                    tracing::warn!(worker = index, %status, "worker exited, restarting it");
+                }
+                let slot = spawn_worker(index, &config)?;
+                watch_worker(index, &slot, exit_tx.clone());
+                slots[index] = slot;
+                wait_worker_ready(&slots[index]).await?;
+            }
+        }
+    }
+
+    tracing::info!("stopping workers");
+    for slot in &slots {
+        kill(slot.pid, libc::SIGTERM);
+    }
+    let drain = async {
+        for _ in 0..slots.len() {
+            if exit_rx.recv().await.is_none() {
+                break;
+            }
+        }
+    };
+    if tokio::time::timeout(Duration::from_secs(15), drain)
+        .await
+        .is_err()
+    {
+        for slot in &slots {
+            kill(slot.pid, libc::SIGKILL);
+        }
+    }
+
+    Ok(())
+}
+
+fn spawn_worker(index: usize, config: &Path) -> anyhow::Result<WorkerSlot> {
+    let exe = std::env::current_exe().context("cannot find the executable")?;
+    let ready = std::env::temp_dir().join(format!(
+        "elira-worker-{}-{index}-{}.ready",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|delta| delta.as_nanos())
+            .unwrap_or(0)
+    ));
+
+    let child = tokio::process::Command::new(exe)
+        .args(["run", "--config"])
+        .arg(config)
+        .env("ELIRA_WORKER", "1")
+        .env("ELIRA_READY_FILE", &ready)
+        .spawn()
+        .with_context(|| format!("cannot start worker {index}"))?;
+
+    Ok(WorkerSlot {
+        pid: child.id().context("worker has no pid")?,
+        ready,
+    })
+}
+
+fn watch_worker(
+    index: usize,
+    slot: &WorkerSlot,
+    exit: tokio::sync::mpsc::Sender<(usize, std::process::ExitStatus)>,
+) {
+    // Reap the child in a task. The pid is still valid for signals until then.
+    let pid = slot.pid as libc::pid_t;
+    tokio::spawn(async move {
+        let status = wait_pid(pid).await;
+        let _ = exit.send((index, status)).await;
+    });
+}
+
+async fn wait_pid(pid: libc::pid_t) -> std::process::ExitStatus {
+    use std::os::unix::process::ExitStatusExt;
+    loop {
+        let mut status = 0;
+        let result = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if result == pid {
+            return std::process::ExitStatus::from_raw(status);
+        }
+        if result < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return std::process::ExitStatus::from_raw(0);
+        }
+    }
+}
+
+async fn wait_worker_ready(slot: &WorkerSlot) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if slot.ready.exists() {
+            let _ = std::fs::remove_file(&slot.ready);
+            return Ok(());
+        }
+        if unsafe { libc::kill(slot.pid as libc::pid_t, 0) } != 0 {
+            anyhow::bail!("worker {} exited before becoming ready", slot.pid);
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("worker {} readiness timed out", slot.pid);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_for_exit(
+    exits: &mut tokio::sync::mpsc::Receiver<(usize, std::process::ExitStatus)>,
+    wanted: usize,
+    slots: &mut [WorkerSlot],
+    config: &Path,
+    exit_tx: &tokio::sync::mpsc::Sender<(usize, std::process::ExitStatus)>,
+) -> anyhow::Result<()> {
+    loop {
+        let Some((index, _)) = exits.recv().await else {
+            return Ok(());
+        };
+        let slot = spawn_worker(index, config)?;
+        watch_worker(index, &slot, exit_tx.clone());
+        slots[index] = slot;
+        wait_worker_ready(&slots[index]).await?;
+        if index == wanted {
+            return Ok(());
+        }
+    }
+}
+
+fn kill(pid: u32, signal: libc::c_int) {
+    unsafe {
+        libc::kill(pid as libc::pid_t, signal);
+    }
+}
+
 /// Start a new process and wait until it says its listeners are bound. The old
 /// process must not drain before that: if the replacement fails to bind, the
 /// service would simply stop.
@@ -473,6 +670,11 @@ fn notify_ready() {
 
     if let Ok(path) = std::env::var("ELIRA_READY_FILE") {
         let _ = std::fs::write(path, pid.to_string());
+    }
+
+    // A worker is not the main PID; the supervisor owns the systemd socket.
+    if std::env::var_os("ELIRA_WORKER").is_some() {
+        return;
     }
 
     let Ok(socket) = std::env::var("NOTIFY_SOCKET") else {

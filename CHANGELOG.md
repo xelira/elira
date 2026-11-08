@@ -80,6 +80,11 @@
 - sendfile обслуживает одиночные range, conditionals, auth/ACL и per-route
   заголовки; TLS, HTTP/2, сжатие и multi-range остаются в hyper.
 - Маршруты по регулярному выражению пути (`path_regex`) после префиксных.
+- FastCGI-бэкенды по TCP и unix-сокетам, CGI-скрипты и нативные
+  динамические модули (`.so`).
+- Режим `workers > 1` с супервизором, SO_REUSEPORT, перезапуском упавших
+  воркеров и rolling restart по SIGUSR2.
+- HTTP/2 prior knowledge (h2c) на plain TCP.
 - Fuzz-цели для конфига, мигратора, заголовков и PROXY protocol; CI-джобы
   MSRV, `cargo-audit`, `cargo-deny`, musl и Docker; e2e-тесты mTLS и
   неудачного hot restart.

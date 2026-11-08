@@ -19,6 +19,15 @@ pub struct Config {
     /// Optional HTTP/1.1 listener on a unix socket. TLS is not applied here.
     #[serde(default)]
     pub listen_unix: Option<PathBuf>,
+
+    /// Accept HTTP/2 with prior knowledge on plain TCP (h2c).
+    #[serde(default)]
+    pub h2c: bool,
+
+    /// Worker processes sharing the listener via SO_REUSEPORT. One process is
+    /// the default; more needs `reuse_port = true`.
+    #[serde(default = "Config::default_workers")]
+    pub workers: usize,
     #[serde(default)]
     pub limits: Limits,
     /// Send our `Server: elira` header and keep the upstream one.
@@ -410,6 +419,26 @@ pub struct Route {
     #[serde(default)]
     pub redirect: Option<Redirect>,
 
+    /// FastCGI target: `host:port` or `unix:/path`.
+    #[serde(default)]
+    pub fastcgi_pass: Option<String>,
+
+    /// Document root used to build `SCRIPT_FILENAME`.
+    #[serde(default)]
+    pub fastcgi_root: Option<PathBuf>,
+
+    /// Script appended when the request path ends with `/`.
+    #[serde(default = "Route::default_fastcgi_index")]
+    pub fastcgi_index: String,
+
+    /// CGI script to execute for this route.
+    #[serde(default)]
+    pub cgi_pass: Option<PathBuf>,
+
+    /// Native dynamic module (`.so`) handling this route.
+    #[serde(default)]
+    pub module: Option<PathBuf>,
+
     /// Files tried for a directory request, in order.
     #[serde(default = "Route::default_index")]
     pub index: Vec<String>,
@@ -479,6 +508,10 @@ pub struct Route {
 impl Route {
     fn default_index() -> Vec<String> {
         vec!["index.html".to_owned()]
+    }
+
+    fn default_fastcgi_index() -> String {
+        "index.php".to_owned()
     }
 }
 
@@ -674,6 +707,10 @@ fn is_plain_name(name: &str) -> bool {
 }
 
 impl Config {
+    fn default_workers() -> usize {
+        1
+    }
+
     fn default_server_header() -> bool {
         true
     }
@@ -710,6 +747,12 @@ impl Config {
         }
         if self.limits.max_connections == 0 {
             return Err(Error::MaxConnectionsZero);
+        }
+        if self.workers == 0 || self.workers > 64 {
+            return Err(Error::BadWorkers);
+        }
+        if self.workers > 1 && !self.reuse_port {
+            return Err(Error::WorkersNeedReusePort);
         }
 
         if self.health.enabled {
@@ -919,12 +962,41 @@ impl Config {
 
             let targets = usize::from(route.upstream.is_some())
                 + usize::from(route.root.is_some())
-                + usize::from(route.redirect.is_some());
+                + usize::from(route.redirect.is_some())
+                + usize::from(route.fastcgi_pass.is_some())
+                + usize::from(route.cgi_pass.is_some())
+                + usize::from(route.module.is_some());
             if targets == 0 {
                 return Err(Error::RouteNeedsTarget { index });
             }
             if targets > 1 {
                 return Err(Error::RouteHasTwoTargets { index });
+            }
+
+            if let Some(target) = &route.fastcgi_pass {
+                if target.trim().is_empty() {
+                    return Err(Error::EmptyFastCgiTarget { index });
+                }
+                if route
+                    .fastcgi_root
+                    .as_ref()
+                    .is_none_or(|root| root.as_os_str().is_empty())
+                {
+                    return Err(Error::FastCgiNeedRoot { index });
+                }
+            }
+            if route.fastcgi_index.contains('/') || route.fastcgi_index.contains("..") {
+                return Err(Error::BadFastCgiIndex { index });
+            }
+            if let Some(script) = &route.cgi_pass {
+                if script.as_os_str().is_empty() || !script.is_absolute() {
+                    return Err(Error::BadCgiScript { index });
+                }
+            }
+            if let Some(module) = &route.module {
+                if module.as_os_str().is_empty() || !module.is_absolute() {
+                    return Err(Error::BadModulePath { index });
+                }
             }
 
             if let Some(path) = &route.path {
@@ -1135,6 +1207,12 @@ pub enum Error {
     #[error("limits.max_connections must be greater than zero")]
     MaxConnectionsZero,
 
+    #[error("workers must be between 1 and 64")]
+    BadWorkers,
+
+    #[error("workers > 1 requires reuse_port = true")]
+    WorkersNeedReusePort,
+
     #[error("health.path must start with '/' and contain no spaces or control characters")]
     BadHealthPath,
 
@@ -1245,6 +1323,21 @@ pub enum Error {
 
     #[error("route {index}: `strip_prefix` needs an upstream")]
     StripWithoutUpstream { index: usize },
+
+    #[error("route {index}: fastcgi_pass must not be empty")]
+    EmptyFastCgiTarget { index: usize },
+
+    #[error("route {index}: fastcgi_pass needs fastcgi_root")]
+    FastCgiNeedRoot { index: usize },
+
+    #[error("route {index}: fastcgi_index must be a file name")]
+    BadFastCgiIndex { index: usize },
+
+    #[error("route {index}: cgi_pass must be an absolute script path")]
+    BadCgiScript { index: usize },
+
+    #[error("route {index}: module must be an absolute path")]
+    BadModulePath { index: usize },
 
     #[error("route {index}: `autoindex` needs a root")]
     AutoindexWithoutRoot { index: usize },
@@ -2179,5 +2272,87 @@ path_regex = "^(/[a-z]+)/"
             Config::parse(&both),
             Err(Error::PathAndRegex { .. })
         ));
+    }
+
+    #[test]
+    fn parses_fastcgi_cgi_and_module_targets() {
+        let text = r#"
+listen = "127.0.0.1:8080"
+
+[[routes]]
+host = "php.example"
+fastcgi_pass = "unix:/run/php.sock"
+fastcgi_root = "/srv/www"
+fastcgi_index = "index.php"
+
+[[routes]]
+host = "cgi.example"
+path = "/cgi"
+cgi_pass = "/srv/cgi/hello"
+
+[[routes]]
+host = "module.example"
+module = "/etc/elira/hello.so"
+"#;
+        let cfg = Config::parse(text).expect("valid targets");
+        assert_eq!(cfg.routes.len(), 3);
+        assert_eq!(cfg.routes[0].fastcgi_index, "index.php");
+    }
+
+    #[test]
+    fn rejects_bad_fastcgi_and_module_targets() {
+        let missing_root = r#"
+listen = "127.0.0.1:8080"
+
+[[routes]]
+host = "*"
+fastcgi_pass = "127.0.0.1:9000"
+"#;
+        assert!(matches!(
+            Config::parse(missing_root),
+            Err(Error::FastCgiNeedRoot { .. })
+        ));
+
+        let relative = r#"
+listen = "127.0.0.1:8080"
+
+[[routes]]
+host = "*"
+module = "hello.so"
+"#;
+        assert!(matches!(
+            Config::parse(relative),
+            Err(Error::BadModulePath { .. })
+        ));
+    }
+
+    #[test]
+    fn workers_need_reuse_port() {
+        let text = r#"
+listen = "127.0.0.1:8080"
+workers = 2
+
+[[routes]]
+host = "*"
+root = "/srv/www"
+"#;
+        assert!(matches!(
+            Config::parse(text),
+            Err(Error::WorkersNeedReusePort)
+        ));
+    }
+
+    #[test]
+    fn h2c_is_opt_in() {
+        let text = r#"
+listen = "127.0.0.1:8080"
+h2c = true
+
+[[routes]]
+host = "*"
+root = "/srv/www"
+"#;
+        let cfg = Config::parse(text).expect("valid config");
+        assert!(cfg.h2c);
     }
 }

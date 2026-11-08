@@ -51,6 +51,8 @@ protocol и `sendfile` на нём не применяются; peer для ло
 | --- | --- | --- | --- |
 | `listen` | `IP:порт` | нет, обязательно | TCP-адрес основного HTTP-листенера |
 | `listen_unix` | путь | нет | дополнительный HTTP/1.1 на unix-сокете |
+| `h2c` | bool | `false` | HTTP/2 prior knowledge без TLS |
+| `workers` | 1..64 | `1` | процессы-воркеры с SO_REUSEPORT; нужен `reuse_port = true` |
 | `proxy_protocol` | bool | `false` | ждать PROXY protocol (v1/v2) на каждом соединении |
 | `reuse_port` | bool | `false` | SO_REUSEPORT; нужен для hot restart по SIGUSR2 |
 | `sendfile` | bool | `true` | zero-copy статика на Linux через `sendfile(2)` |
@@ -465,6 +467,11 @@ HTTP/3 живёт на отдельном UDP-порту и не делит со
 | `host` | строка | нет, обязателен | `example.com`, `*.example.com` или `*` |
 | `path` | строка | `/` | префикс пути; побеждает самый длинный |
 | `path_regex` | строка | нет | regex по пути; проверяется после префиксов |
+| `fastcgi_pass` | строка | нет | `host:port` или `unix:/path` |
+| `fastcgi_root` | путь | нет | корень для `SCRIPT_FILENAME` |
+| `fastcgi_index` | строка | `index.php` | файл для пути с `/` на конце |
+| `cgi_pass` | путь | нет | абсолютный путь к CGI-скрипту |
+| `module` | путь | нет | абсолютный путь к `.so`-модулю |
 | `upstream` | строка | нет | имя upstream'а для проксирования |
 | `root` | путь | нет | каталог со статикой |
 | `redirect` | таблица | нет | `{ to, status }`; вместо upstream и root |
@@ -487,8 +494,16 @@ HTTP/3 живёт на отдельном UDP-порту и не делит со
 
 Правила:
 
-- Нужна ровно одна цель: `upstream`, `root` или `redirect`. Две сразу — ошибка
-  `route N has both`, ни одной — `route N needs exactly one`.
+- Нужна ровно одна цель: `upstream`, `root`, `redirect`, `fastcgi_pass`,
+  `cgi_pass` или `module`. Две сразу — ошибка, ни одной — `route N needs
+  exactly one`.
+- `fastcgi_pass` требует `fastcgi_root`; `SCRIPT_FILENAME` собирается из
+  корня, пути запроса и `fastcgi_index` для каталога. `cgi_pass` и `module`
+  должны быть абсолютными путями. Модуль загружается при старте и работает
+  в процессе сервера.
+- `workers > 1` запускает супервизор и N процессов; каждый слушает тот же
+  порт через `SO_REUSEPORT`. SIGUSR2 перезапускает воркеры по одному,
+  SIGHUP рассылается всем.
 - `host` сравнивается без учёта регистра, без порта и без завершающей точки.
   `Example.COM:8080` попадёт в маршрут `example.com`. Host с userinfo
   (`admin:80@example.com`) и некорректным портом отклоняется с `400`.

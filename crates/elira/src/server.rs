@@ -155,6 +155,7 @@ pub struct Options {
     pub idle_timeout: Duration,
     pub proxy_protocol: bool,
     pub sendfile: bool,
+    pub h2c: bool,
     pub body_timeout: Option<Duration>,
     pub acme: Option<Arc<elira_acme::Acme>>,
 }
@@ -168,6 +169,7 @@ impl Options {
             idle_timeout: Duration::from_secs(cfg.limits.idle_timeout_secs),
             proxy_protocol: cfg.proxy_protocol,
             sendfile: cfg.sendfile,
+            h2c: cfg.h2c,
             body_timeout: match cfg.limits.request_body_timeout_secs {
                 0 => None,
                 secs => Some(Duration::from_secs(secs)),
@@ -424,6 +426,23 @@ async fn serve_stream(
 
     let tls = runtime.load().tls.clone();
     let secure = tls.is_some();
+
+    // HTTP/2 with prior knowledge arrives before any TLS or HTTP/1.1 parsing.
+    // Peeking leaves the bytes in place for hyper.
+    if options.h2c && tls.is_none() {
+        let mut preface = [0u8; 24];
+        if let Ok(read) = stream.peek(&mut preface).await {
+            if read == preface.len() && preface == *b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" {
+                let conn = ConnOptions {
+                    h2: true,
+                    secure: false,
+                    ..conn
+                };
+                serve_conn(stream, peer, runtime, conn, metrics, stop, None).await;
+                return;
+            }
+        }
+    }
 
     // Plain HTTP/1.1 only: TLS and HTTP/2 have their own write paths, and the
     // fast path would duplicate them.

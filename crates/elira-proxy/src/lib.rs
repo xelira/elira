@@ -101,6 +101,15 @@ enum Target {
         status: StatusCode,
         location: HeaderValue,
     },
+    FastCgi {
+        target: elira_fastcgi::Target,
+        root: PathBuf,
+        index: String,
+    },
+    Cgi {
+        script: PathBuf,
+    },
+    Module(Arc<elira_module::Module>),
 }
 
 struct RouteEntry {
@@ -427,6 +436,35 @@ impl Proxy {
                     cfg.compression.enabled,
                     cfg.compression.min_bytes,
                 )))
+            } else if let Some(pass) = &route.fastcgi_pass {
+                let target =
+                    elira_fastcgi::Target::parse(pass).map_err(|err| Error::RouteConfig {
+                        host: route.host.clone(),
+                        reason: err.to_string(),
+                    })?;
+                let root = route
+                    .fastcgi_root
+                    .clone()
+                    .ok_or_else(|| Error::RouteConfig {
+                        host: route.host.clone(),
+                        reason: "fastcgi_pass needs fastcgi_root".to_owned(),
+                    })?;
+                Target::FastCgi {
+                    target,
+                    root,
+                    index: route.fastcgi_index.clone(),
+                }
+            } else if let Some(script) = &route.cgi_pass {
+                Target::Cgi {
+                    script: script.clone(),
+                }
+            } else if let Some(path) = &route.module {
+                let module =
+                    elira_module::Module::load(path).map_err(|err| Error::RouteConfig {
+                        host: route.host.clone(),
+                        reason: err.to_string(),
+                    })?;
+                Target::Module(Arc::new(module))
             } else if let Some(redirect) = &route.redirect {
                 let status =
                     StatusCode::from_u16(redirect.status).map_err(|_| Error::BadRedirect {
@@ -1013,6 +1051,16 @@ impl Proxy {
                 self.apply_route(&mut response, entry, &request_id);
                 return Ok(response);
             }
+            Target::FastCgi { .. } | Target::Cgi { .. } | Target::Module(_) => {
+                let mut response = self.serve_app(req, entry, peer, scheme).await;
+                response.extensions_mut().insert(Labels {
+                    route: entry.label.clone(),
+                    upstream: None,
+                });
+                self.apply_error_page(&mut response, entry, peer).await;
+                self.apply_route(&mut response, entry, &request_id);
+                return Ok(response);
+            }
         };
         let path = req
             .uri()
@@ -1422,6 +1470,171 @@ impl Proxy {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .remove(&key);
         });
+    }
+
+    /// Run a FastCGI, CGI or dynamic-module route. These targets cannot be
+    /// streamed into and out of hyper without buffering, so the body is
+    /// bounded by the same limit as a normal request.
+    async fn serve_app(
+        &self,
+        req: Request<Body>,
+        entry: &RouteEntry,
+        peer: SocketAddr,
+        scheme: &'static str,
+    ) -> Response<Body> {
+        let (parts, body) = req.into_parts();
+        let limit = entry.body_limit.unwrap_or(self.inner.max_body_bytes);
+        let body = match BodyExt::collect(body).await {
+            Ok(collected) => collected.to_bytes(),
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to read the application body");
+                return text(StatusCode::BAD_GATEWAY, "bad request body");
+            }
+        };
+        if limit > 0 && body.len() > limit {
+            return text(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
+        }
+
+        let method = parts.method.as_str();
+        let path = parts.uri.path();
+        let query = parts.uri.query().unwrap_or_default();
+        let host_header = parts
+            .headers
+            .get(HOST)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        let (server_name, port) = match canonical_host(host_header) {
+            Some((host, forwarded)) => {
+                let port = forwarded
+                    .rsplit_once(':')
+                    .and_then(|(_, port)| port.parse::<u16>().ok())
+                    .unwrap_or(if scheme == "https" { 443 } else { 80 });
+                (host, port)
+            }
+            None => (String::new(), if scheme == "https" { 443 } else { 80 }),
+        };
+
+        let mut params = vec![
+            ("GATEWAY_INTERFACE".to_owned(), "CGI/1.1".to_owned()),
+            ("SERVER_SOFTWARE".to_owned(), "elira".to_owned()),
+            ("SERVER_PROTOCOL".to_owned(), format!("{:?}", parts.version)),
+            ("REQUEST_METHOD".to_owned(), method.to_owned()),
+            ("REQUEST_URI".to_owned(), parts.uri.to_string()),
+            ("QUERY_STRING".to_owned(), query.to_owned()),
+            ("SERVER_NAME".to_owned(), server_name),
+            ("SERVER_PORT".to_owned(), port.to_string()),
+            ("REMOTE_ADDR".to_owned(), peer.ip().to_string()),
+            ("REMOTE_PORT".to_owned(), peer.port().to_string()),
+        ];
+        if let Some(value) = parts
+            .headers
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+        {
+            params.push(("CONTENT_TYPE".to_owned(), value.to_owned()));
+        }
+        params.push(("CONTENT_LENGTH".to_owned(), body.len().to_string()));
+        for (name, value) in parts.headers.iter() {
+            if is_hop_by_hop(name) || *name == CONTENT_TYPE || *name == CONTENT_LENGTH {
+                continue;
+            }
+            if let Ok(value) = value.to_str() {
+                params.push((
+                    format!(
+                        "HTTP_{}",
+                        name.as_str().to_ascii_uppercase().replace('-', "_")
+                    ),
+                    value.to_owned(),
+                ));
+            }
+        }
+
+        let timeout = entry.timeout.unwrap_or(self.inner.timeout);
+        let result = match &entry.target {
+            Target::FastCgi {
+                target,
+                root,
+                index,
+            } => {
+                let mut script = match application_script(root, path, index) {
+                    Some(script) => script,
+                    None => return text(StatusCode::BAD_REQUEST, "bad script path"),
+                };
+                let _ = &mut script;
+                params.push(("SCRIPT_FILENAME".to_owned(), script.display().to_string()));
+                params.push(("SCRIPT_NAME".to_owned(), path.to_owned()));
+                params.push(("DOCUMENT_ROOT".to_owned(), root.display().to_string()));
+                match elira_fastcgi::execute(
+                    target,
+                    &elira_fastcgi::Request {
+                        params,
+                        body: body.to_vec(),
+                    },
+                    timeout,
+                )
+                .await
+                {
+                    Ok(response) => app_result(response.status, response.headers, response.body),
+                    Err(err) => {
+                        tracing::warn!(error = %err, "FastCGI request failed");
+                        Err(StatusCode::BAD_GATEWAY)
+                    }
+                }
+            }
+            Target::Cgi { script } => {
+                params.push(("SCRIPT_FILENAME".to_owned(), script.display().to_string()));
+                params.push(("SCRIPT_NAME".to_owned(), script.display().to_string()));
+                params.push(("PATH_INFO".to_owned(), path.to_owned()));
+                match elira_cgi::execute(&elira_cgi::Request {
+                    script: script.clone(),
+                    params,
+                    body: body.to_vec(),
+                    timeout,
+                })
+                .await
+                {
+                    Ok(response) => app_result(response.status, response.headers, response.body),
+                    Err(err) => {
+                        tracing::warn!(error = %err, "CGI request failed");
+                        Err(StatusCode::BAD_GATEWAY)
+                    }
+                }
+            }
+            Target::Module(module) => {
+                let headers = parts
+                    .headers
+                    .iter()
+                    .filter_map(|(name, value)| {
+                        value
+                            .to_str()
+                            .ok()
+                            .map(|value| (name.as_str().to_owned(), value.to_owned()))
+                    })
+                    .collect();
+                let request = elira_module::Request {
+                    method: method.to_owned(),
+                    path: path.to_owned(),
+                    query: query.to_owned(),
+                    host: host_header.to_owned(),
+                    headers,
+                    body: body.to_vec(),
+                    remote_addr: peer.to_string(),
+                };
+                match module.call(&request) {
+                    Ok(response) => app_result(response.status, response.headers, response.body),
+                    Err(err) => {
+                        tracing::warn!(error = %err, "module request failed");
+                        Err(StatusCode::BAD_GATEWAY)
+                    }
+                }
+            }
+            _ => Err(StatusCode::INTERNAL_SERVER_ERROR),
+        };
+
+        match result {
+            Ok(response) => response,
+            Err(status) => text(status, "application request failed"),
+        }
     }
 
     /// Replace a configured error response with a file from the route root.
@@ -2168,6 +2381,60 @@ async fn send_request(
         Ok(Err(err)) => Err(SendError::Failed(err.to_string())),
         Err(_) => Err(SendError::Timeout),
     }
+}
+
+fn application_script(root: &Path, path: &str, index: &str) -> Option<PathBuf> {
+    let decoded = percent_encoding::percent_decode_str(path)
+        .decode_utf8()
+        .ok()?;
+    let mut relative = PathBuf::new();
+    for segment in decoded.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => return None,
+            segment if segment.contains('\0') || segment.contains('\\') => return None,
+            segment => relative.push(segment),
+        }
+    }
+    if decoded.ends_with('/') || relative.as_os_str().is_empty() {
+        relative.push(index);
+    }
+    Some(root.join(relative))
+}
+
+fn app_result(
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+) -> Result<Response<Body>, StatusCode> {
+    let mut builder = Response::builder()
+        .status(StatusCode::from_u16(status).map_err(|_| StatusCode::BAD_GATEWAY)?);
+    {
+        let target = builder
+            .headers_mut()
+            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+        for (name, value) in headers {
+            let Ok(name) = HeaderName::from_bytes(name.as_bytes()) else {
+                continue;
+            };
+            if is_hop_by_hop(&name)
+                || name == CONTENT_LENGTH
+                || name == http::header::TRANSFER_ENCODING
+            {
+                continue;
+            }
+            if let Ok(value) = HeaderValue::from_str(&value) {
+                target.append(name, value);
+            }
+        }
+        target.insert(SERVER, HeaderValue::from_static("elira"));
+    }
+    let body = Full::new(Bytes::from(body))
+        .map_err(|never| match never {})
+        .boxed();
+    builder
+        .body(body)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 /// A body that fails when it makes no progress for `idle`. Used for both

@@ -2053,3 +2053,149 @@ upstream = "app"
     .await;
     assert_eq!(status(&missing), "HTTP/1.1 404 Not Found");
 }
+
+#[tokio::test]
+async fn cgi_route_runs_a_script() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = temp_root("cgi");
+    let script = root.join("hello");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nread body\nprintf 'Content-Type: text/plain\\r\\n\\r\\ncgi:%s\\n' \"$QUERY_STRING\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[routes]]
+host = "*"
+path = "/cgi"
+cgi_pass = "{}"
+"#,
+        script.display()
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let response = roundtrip(
+        addr,
+        "GET /cgi?name=elira HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&response), "HTTP/1.1 200 OK");
+    assert!(response.ends_with("cgi:name=elira\n"), "{response}");
+}
+
+/// A tiny FastCGI responder: it ignores params and answers every STDIN
+/// terminator with a fixed response.
+async fn fastcgi_upstream() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind fcgi");
+    let addr = listener.local_addr().expect("fcgi addr");
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                loop {
+                    let mut header = [0u8; 8];
+                    if stream.read_exact(&mut header).await.is_err() {
+                        return;
+                    }
+                    let kind = header[1];
+                    let len = u16::from_be_bytes([header[4], header[5]]) as usize;
+                    let pad = header[6] as usize;
+                    let mut content = vec![0u8; len + pad];
+                    if stream.read_exact(&mut content).await.is_err() {
+                        return;
+                    }
+                    // STDIN with no content terminates the request.
+                    if kind == 5 && len == 0 {
+                        let body = "Content-Type: text/plain\r\n\r\nfastcgi";
+                        let mut record = vec![1, 6, 0, 1];
+                        record.extend_from_slice(&(body.len() as u16).to_be_bytes());
+                        record.extend_from_slice(&[0, 0]);
+                        record.extend_from_slice(body.as_bytes());
+                        let _ = stream.write_all(&record).await;
+                        let mut end = vec![1, 3, 0, 1, 0, 8, 0, 0];
+                        end.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
+                        let _ = stream.write_all(&end).await;
+                        return;
+                    }
+                }
+            });
+        }
+    });
+
+    addr
+}
+
+#[tokio::test]
+async fn fastcgi_route_talks_the_protocol() {
+    let upstream = fastcgi_upstream().await;
+    let root = temp_root("fastcgi");
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[routes]]
+host = "*"
+fastcgi_pass = "{upstream}"
+fastcgi_root = "{root}"
+"#,
+        root = root.display()
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let response = roundtrip(
+        addr,
+        "GET /index.php HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&response), "HTTP/1.1 200 OK");
+    assert!(response.ends_with("fastcgi"), "{response}");
+}
+
+#[tokio::test]
+async fn cleartext_http2_is_available_with_prior_knowledge() {
+    use http_body_util::Empty;
+    use hyper::body::Bytes;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+
+    let upstream = upstream().await;
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+h2c = true
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "*"
+upstream = "app"
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let tcp = TcpStream::connect(addr).await.expect("connect");
+    let (mut sender, connection) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tcp))
+            .await
+            .expect("h2 handshake");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let request = hyper::Request::builder()
+        .uri("http://example.com/")
+        .body(Empty::<Bytes>::new())
+        .expect("request");
+    let response = sender.send_request(request).await.expect("h2 request");
+    assert_eq!(response.status(), http::StatusCode::OK);
+}

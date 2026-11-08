@@ -31,6 +31,8 @@ running. This needs `reuse_port = true`. The same readiness moment sends
 ```toml
 listen = "0.0.0.0:8080"
 listen_unix = "/run/elira.sock"   # optional plain HTTP/1.1 listener
+# h2c = true                      # HTTP/2 with prior knowledge on plain TCP
+# workers = 4                     # needs reuse_port = true
 
 [limits]
 max_headers = 64
@@ -146,6 +148,22 @@ error_root = "/srv/errors"
 host = "old.example.com"
 redirect = { to = "https://new.example.com/", status = 301 }
 
+# Application targets: FastCGI, CGI and native modules.
+[[routes]]
+host = "php.example.com"
+fastcgi_pass = "unix:/run/php.sock"
+fastcgi_root = "/srv/www"
+fastcgi_index = "index.php"
+
+[[routes]]
+host = "cgi.example.com"
+path = "/cgi"
+cgi_pass = "/srv/cgi/hello"
+
+[[routes]]
+host = "module.example.com"
+module = "/etc/elira/hello.so"
+
 # A static route uses root instead of upstream.
 [[routes]]
 host = "static.example.com"
@@ -179,6 +197,7 @@ Upstreams:
 
 - round robin and least connections, active health checks, retries for bodyless
   idempotent requests
+- FastCGI over TCP or unix sockets, CGI scripts, and native `.so` modules
 - TCP and unix sockets in the same pool
 - TLS with a custom CA, explicit `insecure`, per-upstream SNI and HTTP/2
 - WebSocket and other `Upgrade` tunnelling, `CONNECT` with an explicit allowlist
@@ -193,7 +212,7 @@ TLS:
 
 HTTP:
 
-- HTTP/1.1, HTTP/2, HTTP/3 over QUIC on a separate UDP listener
+- HTTP/1.1, HTTP/2 (TLS or h2c with prior knowledge), HTTP/3 over QUIC
 - body progress timeouts, websocket/CONNECT idle timeout
 - optional buffering of small upstream responses
 - gzip/brotli, `Alt-Svc`, `Server` hiding, `X-Request-Id`
@@ -224,6 +243,8 @@ Ops:
 - ACME via TLS-ALPN-01 or HTTP-01, verified against Let's Encrypt staging and
   production
 - `elira migrate` for a subset of nginx configuration
+- `workers > 1`: supervised worker processes sharing the port via SO_REUSEPORT,
+  with rolling restart on SIGUSR2
 
 ## Admin listener
 
@@ -249,8 +270,11 @@ The listener has no TLS. Put it on loopback or set `auth_file`.
   the endpoint and resets live QUIC connections.
 - ACME via TLS-ALPN-01 needs port 443; HTTP-01 needs a listener on port 80 or
   `acme.http01_listen`.
-- No FastCGI, CGI, dynamic modules or multi-process workers. Regex locations
-  are supported through `path_regex`.
+- Dynamic modules are native shared libraries and run in-process with full
+  privileges. FastCGI and CGI buffer the request body; they do not stream very
+  large uploads.
+- `workers` and listener changes need a restart. SIGHUP reloads routes in every
+  worker; SIGUSR2 rolls the workers one by one.
 - DNS resolution uses the system resolver. `dns_ttl_secs` bounds how long a
   pooled connection may outlive a DNS change.
 

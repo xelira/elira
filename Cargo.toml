@@ -14,6 +14,9 @@ members = [
     "crates/elira-upstream",
     "crates/elira-auth",
     "crates/elira-migrate",
+    "crates/elira-fastcgi",
+    "crates/elira-cgi",
+    "crates/elira-module",
 ]
 
 [workspace.package]
@@ -23,7 +26,7 @@ license = "MIT"
 repository = "https://github.com/xelira/elira"
 
 [workspace.dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal", "time", "sync", "io-util", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal", "time", "sync", "io-util", "fs", "process"] }
 hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1", "server-auto"] }
 http = "1"

@@ -10,7 +10,10 @@ description = "HTTP server and reverse proxy"
 elira-accesslog = { path = "../elira-accesslog" }
 elira-auth = { path = "../elira-auth" }
 elira-acme = { path = "../elira-acme" }
+elira-cgi = { path = "../elira-cgi" }
 elira-config = { path = "../elira-config" }
+elira-fastcgi = { path = "../elira-fastcgi" }
+elira-module = { path = "../elira-module" }
 elira-h3 = { path = "../elira-h3" }
 elira-metrics = { path = "../elira-metrics" }
 elira-migrate = { path = "../elira-migrate" }
