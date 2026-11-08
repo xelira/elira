@@ -481,6 +481,7 @@ advisory-lock `.elira-cache.lock`, а `max_bytes` считается по все
 | `tls_ca` | путь | `[upstream_tls] ca` | свой PEM-корень |
 | `http2` | bool | `[upstream_tls] http2` | предлагать `h2` |
 | `dns_ttl_secs` | целое > 0 | `30` | предел жизни соединения в пуле; имя резолвится заново при новом соединении |
+| `h2_pool` | bool | `false` | собственный HTTP/2-пул Elira; на plain TCP — h2c prior knowledge |
 
 - `name` не может быть пустым или повторяться.
 - `servers` не может быть пустым; каждый элемент — `host:port` с портом
@@ -498,6 +499,10 @@ advisory-lock `.elira-cache.lock`, а `max_bytes` считается по все
   мог уже начать обработку.
 - Все серверы помечены мёртвыми — трафик всё равно идёт (fail-open), иначе
   сломанная проверка превратилась бы в простой.
+- `h2_pool = true` заменяет legacy-клиент на собственный HTTP/2-пул: до
+  четырёх соединений на origin, least-busy выбор, реальные счётчики
+  connections/active/total/queued в `/status`. Для `http://` используется h2c
+  prior knowledge, для `https://` обязателен ALPN h2.
 - Hyper резолвит имя при каждом новом соединении. `dns_ttl_secs` ограничивает
   время жизни соединения в пуле, поэтому смена DNS видна не позже этого
   значения (по умолчанию 30 секунд).
@@ -526,6 +531,7 @@ advisory-lock `.elira-cache.lock`, а `max_bytes` считается по все
 | `cgi_pass` | путь | нет | абсолютный путь к CGI-скрипту |
 | `module` | путь | нет | абсолютный путь к `.so`-модулю |
 | `module_sandbox` | bool | `false` | запускать модуль в дочернем процессе |
+| `wasm` | путь | нет | WebAssembly-модуль как цель маршрута |
 | `upstream` | строка | нет | имя upstream'а для проксирования |
 | `root` | путь | нет | каталог со статикой |
 | `redirect` | таблица | нет | `{ to, status }`; вместо upstream и root |

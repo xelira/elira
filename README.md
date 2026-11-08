@@ -200,10 +200,12 @@ Upstreams:
   idempotent requests
 - streaming FastCGI over TCP (including DNS names) or unix sockets with an
   idle connection pool, streaming CGI scripts, and native `.so` modules
-  (in-process or in a child runner)
+  (in-process or in a child runner) and sandboxed WebAssembly modules
 - TCP and unix sockets in the same pool
 - TLS with a custom CA, explicit `insecure`, per-upstream SNI and HTTP/2
 - WebSocket and other `Upgrade` tunnelling, `CONNECT` with an explicit allowlist
+- a custom HTTP/2 upstream pool with connection/stream stats, selectable per
+  upstream
 - RFC 7239 `Forwarded` plus `X-Forwarded-For/Proto/Host/Port`, with the
   client-supplied copies dropped and the chain extended only for
   `trusted_proxies`

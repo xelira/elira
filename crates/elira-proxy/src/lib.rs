@@ -115,6 +115,7 @@ enum Target {
         script: PathBuf,
     },
     Module(ModuleTarget),
+    Wasm(Arc<elira_wasm::WasmModule>),
 }
 
 enum ModuleTarget {
@@ -259,6 +260,7 @@ struct Pool {
     client: Client<HttpsConnector<HttpConnector>, Body>,
     tls: TlsOptions,
     health_path: Option<String>,
+    h2: Option<elira_h2::Pool>,
 }
 
 struct ActiveGuard<'a> {
@@ -374,6 +376,15 @@ impl Proxy {
                         Balance::LeastConn => "least_conn",
                     },
                     "retries": pool.retries,
+                    "http2": pool.h2.as_ref().map(|h2| {
+                        let stats = h2.stats();
+                        serde_json::json!({
+                            "connections": stats.connections,
+                            "active_streams": stats.active_streams,
+                            "total_connections": stats.total_connections,
+                            "queued_streams": stats.queued_streams,
+                        })
+                    }),
                     "servers": servers,
                 })
             })
@@ -432,8 +443,15 @@ impl Proxy {
                     retries: up.retries,
                     scheme: if up.tls { "https" } else { "http" },
                     client,
-                    tls,
+                    tls: tls.clone(),
                     health_path: up.health_path.clone(),
+                    h2: up.h2_pool.then(|| {
+                        elira_h2::Pool::new(elira_h2::PoolConfig::new(
+                            4,
+                            Duration::from_secs(5),
+                            tls.clone(),
+                        ))
+                    }),
                 }),
             );
         }
@@ -482,6 +500,13 @@ impl Proxy {
                 Target::Cgi {
                     script: script.clone(),
                 }
+            } else if let Some(path) = &route.wasm {
+                let module =
+                    elira_wasm::WasmModule::load(path).map_err(|err| Error::RouteConfig {
+                        host: route.host.clone(),
+                        reason: err.to_string(),
+                    })?;
+                Target::Wasm(Arc::new(module))
             } else if let Some(path) = &route.module {
                 // A world-writable module is a privilege escalation waiting
                 // to happen: any local user could replace the code.
@@ -1190,7 +1215,7 @@ impl Proxy {
                 self.apply_route(&mut response, entry, &request_id);
                 return Ok(response);
             }
-            Target::Module(_) => {
+            Target::Module(_) | Target::Wasm(_) => {
                 let mut response = self.serve_app(req, entry, peer, scheme).await;
                 response.extensions_mut().insert(Labels {
                     route: entry.label.clone(),
@@ -2069,25 +2094,7 @@ impl Proxy {
             }
             Target::Cgi { .. } => Err(StatusCode::INTERNAL_SERVER_ERROR),
             Target::Module(module) => {
-                let headers = parts
-                    .headers
-                    .iter()
-                    .filter_map(|(name, value)| {
-                        value
-                            .to_str()
-                            .ok()
-                            .map(|value| (name.as_str().to_owned(), value.to_owned()))
-                    })
-                    .collect();
-                let request = elira_module::Request {
-                    method: method.to_owned(),
-                    path: path.to_owned(),
-                    query: query.to_owned(),
-                    host: host_header.to_owned(),
-                    headers,
-                    body: body.to_vec(),
-                    remote_addr: peer.to_string(),
-                };
+                let request = module_request(&parts, method, path, query, host_header, &body, peer);
                 let result = match module {
                     ModuleTarget::InProcess(module) => module.call(&request),
                     ModuleTarget::Sandbox(module) => module.call(&request),
@@ -2096,6 +2103,16 @@ impl Proxy {
                     Ok(response) => app_result(response.status, response.headers, response.body),
                     Err(err) => {
                         tracing::warn!(error = %err, "module request failed");
+                        Err(StatusCode::BAD_GATEWAY)
+                    }
+                }
+            }
+            Target::Wasm(module) => {
+                let request = module_request(&parts, method, path, query, host_header, &body, peer);
+                match module.call(&request) {
+                    Ok(response) => app_result(response.status, response.headers, response.body),
+                    Err(err) => {
+                        tracing::warn!(error = %err, "wasm module request failed");
                         Err(StatusCode::BAD_GATEWAY)
                     }
                 }
@@ -2828,6 +2845,15 @@ async fn send_request(
     timeout: Duration,
 ) -> Result<Response<Body>, SendError> {
     let Some(path) = server.unix() else {
+        if let Some(h2) = &pool.h2 {
+            let uri = request.uri().clone();
+            let result = tokio::time::timeout(timeout, h2.request(uri, request)).await;
+            return match result {
+                Ok(Ok(response)) => Ok(response),
+                Ok(Err(err)) => Err(SendError::Failed(err.to_string())),
+                Err(_) => Err(SendError::Timeout),
+            };
+        }
         return match tokio::time::timeout(timeout, pool.client.request(request)).await {
             Ok(Ok(response)) => Ok(response
                 .map(|body| BodyExt::map_err(body, |err| -> BoxError { Box::new(err) }).boxed())),
@@ -2874,6 +2900,36 @@ fn validators_from_entry(entry: &elira_cache::Entry) -> HeaderMap {
         }
     }
     validators
+}
+
+fn module_request(
+    parts: &http::request::Parts,
+    method: &str,
+    path: &str,
+    query: &str,
+    host: &str,
+    body: &[u8],
+    peer: SocketAddr,
+) -> elira_module::Request {
+    let headers = parts
+        .headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_owned(), value.to_owned()))
+        })
+        .collect();
+    elira_module::Request {
+        method: method.to_owned(),
+        path: path.to_owned(),
+        query: query.to_owned(),
+        host: host.to_owned(),
+        headers,
+        body: body.to_vec(),
+        remote_addr: peer.to_string(),
+    }
 }
 
 fn application_script(root: &Path, path: &str, index: &str) -> Option<PathBuf> {
@@ -3175,6 +3231,7 @@ mod tests {
             client,
             tls,
             health_path: None,
+            h2: None,
         };
 
         assert_eq!(pool.pick(), 0);

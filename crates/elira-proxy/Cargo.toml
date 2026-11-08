@@ -12,8 +12,10 @@ elira-cache = { path = "../elira-cache" }
 elira-cgi = { path = "../elira-cgi" }
 elira-config = { path = "../elira-config" }
 elira-fastcgi = { path = "../elira-fastcgi" }
+elira-h2 = { path = "../elira-h2" }
 elira-module = { path = "../elira-module" }
 elira-upstream = { path = "../elira-upstream" }
+elira-wasm = { path = "../elira-wasm" }
 elira-limit = { path = "../elira-limit" }
 futures-util = { workspace = true }
 httpdate = { workspace = true }

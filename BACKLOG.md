@@ -56,9 +56,8 @@ Living list for the self-improvement loop. One item per session.
 - [x] Cache-Control must-revalidate. Disk format bumped to ELIRA2.
 - [x] Expires/Date TTL fallback.
 - [x] Request Cache-Control/Pragma no-cache bypass.
-- [ ] Custom HTTP/2 upstream client with pool stats (connections, active
-  streams, total). Slices: crate API + h2c/TLS handshake, retry, proxy route
-  opt-in, metrics wiring.
+- [x] Custom HTTP/2 upstream client with pool stats.
+- [ ] Prometheus gauges for the custom HTTP/2 pool (currently in `/status`).
 
 - [x] Shared disk cache read-through (`cache.shared`).
 - [x] Global eviction and locking for the shared cache.
@@ -67,7 +66,7 @@ Living list for the self-improvement loop. One item per session.
 - [x] Worker socket handoff: not implemented by design; a worker drains on
   SIGTERM and in-flight connections are not transferred.
 
-- [ ] WASM module runtime beside the native `.so` ABI. Slices: crate ABI,
+- [x] WASM module runtime beside the native `.so` ABI. Slices: crate ABI,
   route integration, example module, docs.
 - [ ] Upstream HTTP/3.
 - [ ] DNS-01 against a real production CA: blocked on an externally managed

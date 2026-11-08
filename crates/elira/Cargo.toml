@@ -43,4 +43,5 @@ bcrypt = "0.17"
 base64 = "0.22"
 quinn = { workspace = true }
 elira-upstream = { path = "../elira-upstream" }
+elira-wasm = { path = "../elira-wasm" }
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }

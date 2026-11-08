@@ -392,6 +392,11 @@ pub struct Upstream {
     #[serde(default)]
     pub http2: Option<bool>,
 
+    /// Use Elira's own HTTP/2 pool instead of the HTTP/1.1/h2 legacy client.
+    /// Clear-text upstreams speak h2c with prior knowledge.
+    #[serde(default)]
+    pub h2_pool: bool,
+
     /// Cap the lifetime of pooled connections so a DNS change is picked up
     /// within this many seconds. Defaults to 30.
     #[serde(default)]
@@ -525,6 +530,10 @@ pub struct Route {
     /// Run the module in a child process instead of in the server process.
     #[serde(default)]
     pub module_sandbox: bool,
+
+    /// WebAssembly module handling this route.
+    #[serde(default)]
+    pub wasm: Option<PathBuf>,
 
     /// Concurrent FastCGI/CGI/module requests allowed for this route. Defaults
     /// to 16 for application targets and is ignored for static/proxy routes.
@@ -1354,7 +1363,8 @@ impl Config {
                 + usize::from(route.redirect.is_some())
                 + usize::from(route.fastcgi_pass.is_some())
                 + usize::from(route.cgi_pass.is_some())
-                + usize::from(route.module.is_some());
+                + usize::from(route.module.is_some())
+                + usize::from(route.wasm.is_some());
             if targets == 0 {
                 return Err(Error::RouteNeedsTarget { index });
             }
@@ -1389,6 +1399,11 @@ impl Config {
             if let Some(module) = &route.module {
                 if module.as_os_str().is_empty() || !module.is_absolute() {
                     return Err(Error::BadModulePath { index });
+                }
+            }
+            if let Some(wasm) = &route.wasm {
+                if wasm.as_os_str().is_empty() || !wasm.is_absolute() {
+                    return Err(Error::BadWasmPath { index });
                 }
             }
             if route.module_sandbox && route.module.is_none() {
@@ -1770,6 +1785,9 @@ pub enum Error {
 
     #[error("route {index}: module must be an absolute path")]
     BadModulePath { index: usize },
+
+    #[error("route {index}: wasm must be an absolute path")]
+    BadWasmPath { index: usize },
 
     #[error("route {index}: module_sandbox needs module")]
     SandboxWithoutModule { index: usize },
@@ -3091,5 +3109,38 @@ root = "/srv/www"
 
         let zero = text.replace("connection_drain_secs = 3", "connection_drain_secs = 0");
         assert!(matches!(Config::parse(&zero), Err(Error::DrainTimeoutZero)));
+    }
+
+    #[test]
+    fn wasm_routes_need_an_absolute_path() {
+        let ok = r#"
+listen = "127.0.0.1:8080"
+[[routes]]
+host = "*"
+wasm = "/etc/elira/echo.wasm"
+"#;
+        assert!(Config::parse(ok).is_ok());
+
+        let relative = ok.replace("/etc/elira/echo.wasm", "echo.wasm");
+        assert!(matches!(
+            Config::parse(&relative),
+            Err(Error::BadWasmPath { .. })
+        ));
+    }
+
+    #[test]
+    fn upstream_can_use_the_custom_h2_pool() {
+        let text = r#"
+listen = "127.0.0.1:8080"
+[[upstreams]]
+name = "app"
+servers = ["127.0.0.1:3000"]
+h2_pool = true
+[[routes]]
+host = "*"
+upstream = "app"
+"#;
+        let cfg = Config::parse(text).expect("valid");
+        assert!(cfg.upstreams[0].h2_pool);
     }
 }

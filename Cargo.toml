@@ -17,6 +17,8 @@ members = [
     "crates/elira-fastcgi",
     "crates/elira-cgi",
     "crates/elira-module",
+    "crates/elira-wasm",
+    "crates/elira-h2",
 ]
 
 [workspace.package]

@@ -104,6 +104,9 @@
 - `limits.connection_drain_secs` и `limits.shutdown_timeout_secs`.
 - Gauge `elira_tls_certificate_expires_seconds` для TCP/QUIC сертификатов.
 - Per-route `access_log = false`.
+- WASM-модули как цель маршрута (`wasm = "/path/echo.wasm"`).
+- Собственный HTTP/2-пул upstream (`h2_pool`), h2c prior knowledge и
+  connections/active/total/queued в `/status`.
 - `Cache-Control: must-revalidate` запрещает stale-выдачу; `Expires`/`Date`
   задают TTL, если `max-age` нет. Запросы с `no-cache`/`no-store` обходят кэш.
 - Заголовки `Forwarded` и `X-Forwarded-Port` к upstream.
