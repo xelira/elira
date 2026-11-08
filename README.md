@@ -30,6 +30,7 @@ running. This needs `reuse_port = true`. The same readiness moment sends
 
 ```toml
 listen = "0.0.0.0:8080"
+# include = ["/etc/elira/conf.d/*.toml"]   # ${ENV} is substituted in values
 listen_unix = "/run/elira.sock"   # optional plain HTTP/1.1 listener
 # h2c = true                      # HTTP/2 with prior knowledge on plain TCP
 # workers = 4                     # needs reuse_port = true

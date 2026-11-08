@@ -699,6 +699,180 @@ impl<'de> Deserialize<'de> for LogFormat {
     }
 }
 
+/// Read one config file, expand `${ENV}` and merge every `include`.
+fn load_value(path: &Path, depth: usize) -> Result<toml::Value, Error> {
+    if depth > 16 {
+        return Err(Error::IncludeDepth {
+            path: path.display().to_string(),
+        });
+    }
+
+    let text = std::fs::read_to_string(path).map_err(|source| Error::Read {
+        path: path.display().to_string(),
+        source,
+    })?;
+    let text = substitute_env(&text)?;
+    let mut value: toml::Value = toml::from_str(&text).map_err(|source| Error::Parse {
+        path: path.display().to_string(),
+        source,
+    })?;
+
+    let includes = take_includes(&mut value, path)?;
+    let base = path.parent().unwrap_or_else(|| Path::new("."));
+    for pattern in includes {
+        let pattern_path = if Path::new(&pattern).is_absolute() {
+            PathBuf::from(&pattern)
+        } else {
+            base.join(&pattern)
+        };
+        for included in expand_include(&pattern_path)? {
+            let extra = load_value(&included, depth + 1)?;
+            merge_values(&mut value, extra);
+        }
+    }
+
+    Ok(value)
+}
+
+fn take_includes(value: &mut toml::Value, path: &Path) -> Result<Vec<String>, Error> {
+    let Some(table) = value.as_table_mut() else {
+        return Ok(Vec::new());
+    };
+    let Some(entry) = table.remove("include") else {
+        return Ok(Vec::new());
+    };
+
+    let bad = || Error::BadInclude {
+        path: path.display().to_string(),
+        reason: "include must be a string or an array of strings".to_owned(),
+    };
+
+    match entry {
+        toml::Value::String(value) => Ok(vec![value]),
+        toml::Value::Array(values) => values
+            .into_iter()
+            .map(|value| value.as_str().map(str::to_owned).ok_or_else(bad))
+            .collect(),
+        _ => Err(bad()),
+    }
+}
+
+/// Expand a single `*` in the file name. Directories are not globbed; nested
+/// wildcards are an error, because silently doing something surprising with
+/// include paths is worse than refusing.
+fn expand_include(pattern: &Path) -> Result<Vec<PathBuf>, Error> {
+    let name = pattern
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| Error::BadInclude {
+            path: pattern.display().to_string(),
+            reason: "include path has no file name".to_owned(),
+        })?;
+    if !name.contains('*') {
+        return Ok(vec![pattern.to_path_buf()]);
+    }
+    if name.matches('*').count() != 1 {
+        return Err(Error::BadInclude {
+            path: pattern.display().to_string(),
+            reason: "only one * is allowed in a file name".to_owned(),
+        });
+    }
+
+    let (prefix, suffix) = name.split_once('*').unwrap_or((name, ""));
+    let dir = pattern.parent().unwrap_or_else(|| Path::new("."));
+    let entries = std::fs::read_dir(dir).map_err(|source| Error::BadInclude {
+        path: pattern.display().to_string(),
+        reason: format!("cannot read {}: {source}", dir.display()),
+    })?;
+    let mut matches = Vec::new();
+    for entry in entries.flatten() {
+        let candidate = entry.file_name();
+        let Some(candidate) = candidate.to_str() else {
+            continue;
+        };
+        if candidate.starts_with(prefix) && candidate.ends_with(suffix) {
+            matches.push(entry.path());
+        }
+    }
+    matches.sort();
+    if matches.is_empty() {
+        return Err(Error::BadInclude {
+            path: pattern.display().to_string(),
+            reason: "no files matched".to_owned(),
+        });
+    }
+    Ok(matches)
+}
+
+fn merge_values(base: &mut toml::Value, extra: toml::Value) {
+    match (base, extra) {
+        (toml::Value::Table(base), toml::Value::Table(extra)) => {
+            for (key, value) in extra {
+                match base.get_mut(&key) {
+                    Some(existing) => merge_values(existing, value),
+                    None => {
+                        base.insert(key, value);
+                    }
+                }
+            }
+        }
+        (toml::Value::Array(base), toml::Value::Array(mut extra)) => base.append(&mut extra),
+        (base, extra) => *base = extra,
+    }
+}
+
+/// Replace `${NAME}` and `${NAME:-fallback}`. `$$` is a literal dollar. A
+/// missing variable without a fallback is an error, not an empty string.
+fn substitute_env(text: &str) -> Result<String, Error> {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+
+    while let Some(index) = rest.find('$') {
+        out.push_str(&rest[..index]);
+        rest = &rest[index..];
+
+        if let Some(after) = rest.strip_prefix("$$") {
+            out.push('$');
+            rest = after;
+            continue;
+        }
+        let Some(body) = rest.strip_prefix("${") else {
+            out.push('$');
+            rest = &rest[1..];
+            continue;
+        };
+        let Some(end) = body.find('}') else {
+            out.push('$');
+            rest = &rest[1..];
+            continue;
+        };
+        let expression = &body[..end];
+        let (name, default) = match expression.split_once(":-") {
+            Some((name, default)) => (name, Some(default)),
+            None => (expression, None),
+        };
+        if name.is_empty() {
+            return Err(Error::EnvMissing {
+                name: expression.to_owned(),
+            });
+        }
+        match std::env::var(name) {
+            Ok(value) => out.push_str(&value),
+            Err(_) => match default {
+                Some(value) => out.push_str(value),
+                None => {
+                    return Err(Error::EnvMissing {
+                        name: name.to_owned(),
+                    })
+                }
+            },
+        }
+        rest = &body[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
 /// Host name without wildcards: letters, digits, dots, hyphens, underscores.
 fn is_plain_name(name: &str) -> bool {
     !name.is_empty()
@@ -723,13 +897,14 @@ impl Config {
     }
 
     pub fn load(path: &Path) -> Result<Self, Error> {
-        let text = std::fs::read_to_string(path).map_err(|source| Error::Read {
-            path: path.display().to_string(),
-            source,
-        })?;
-        Self::parse(&text).map_err(|e| e.into_parse(path.display().to_string()))
+        let value = load_value(path, 0)?;
+        let cfg: Config = value.try_into().map_err(Error::Toml)?;
+        cfg.validate()?;
+        Ok(cfg)
     }
 
+    /// Parse a self-contained config without includes or environment
+    /// substitution. `load` is the operator-facing path.
     pub fn parse(text: &str) -> Result<Self, Error> {
         let cfg: Config = toml::from_str(text).map_err(Error::Toml)?;
         cfg.validate()?;
@@ -1214,6 +1389,15 @@ pub enum Error {
     #[error("{0}")]
     Toml(#[source] toml::de::Error),
 
+    #[error("environment variable {name} is not set")]
+    EnvMissing { name: String },
+
+    #[error("include depth exceeded at {path}")]
+    IncludeDepth { path: String },
+
+    #[error("include {path}: {reason}")]
+    BadInclude { path: String, reason: String },
+
     #[error("no routes configured")]
     NoRoutes,
 
@@ -1420,15 +1604,6 @@ pub enum Error {
 
     #[error("route {index}: host wildcard must look like `*.example.com`")]
     BadWildcardHost { index: usize },
-}
-
-impl Error {
-    fn into_parse(self, path: String) -> Self {
-        match self {
-            Error::Toml(source) => Error::Parse { path, source },
-            other => other,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -2376,5 +2551,83 @@ root = "/srv/www"
 "#;
         let cfg = Config::parse(text).expect("valid config");
         assert!(cfg.h2c);
+    }
+
+    #[test]
+    fn loads_includes_and_substitutes_the_environment() {
+        let dir = std::env::temp_dir().join(format!("elira-config-inc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("routes")).expect("dir");
+
+        std::env::set_var("ELIRA_TEST_PORT", "18081");
+        std::fs::write(
+            dir.join("elira.toml"),
+            r#"
+listen = "127.0.0.1:${ELIRA_TEST_PORT}"
+include = ["routes/*.toml"]
+
+[limits]
+max_body_bytes = ${ELIRA_TEST_BODY:-4096}
+"#,
+        )
+        .expect("main");
+        std::fs::write(
+            dir.join("routes/app.toml"),
+            r#"
+[[upstreams]]
+name = "app"
+servers = ["127.0.0.1:3000"]
+
+[[routes]]
+host = "*"
+upstream = "app"
+"#,
+        )
+        .expect("fragment");
+
+        let cfg = Config::load(&dir.join("elira.toml")).expect("load");
+        assert_eq!(cfg.listen.port(), 18081);
+        assert_eq!(cfg.limits.max_body_bytes, 4096);
+        assert_eq!(cfg.routes.len(), 1);
+        assert_eq!(cfg.upstreams.len(), 1);
+
+        std::env::remove_var("ELIRA_TEST_PORT");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_environment_variable_is_an_error() {
+        let dir = std::env::temp_dir().join(format!("elira-config-env-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(
+            dir.join("elira.toml"),
+            "listen = \"127.0.0.1:${ELIRA_TEST_MISSING}\"\n",
+        )
+        .expect("config");
+
+        assert!(matches!(
+            Config::load(&dir.join("elira.toml")),
+            Err(Error::EnvMissing { .. })
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_include_without_matches_is_an_error() {
+        let dir = std::env::temp_dir().join(format!("elira-config-incmiss-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(
+            dir.join("elira.toml"),
+            "listen = \"127.0.0.1:8080\"\ninclude = [\"nope/*.toml\"]\n",
+        )
+        .expect("config");
+
+        assert!(matches!(
+            Config::load(&dir.join("elira.toml")),
+            Err(Error::BadInclude { .. })
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
