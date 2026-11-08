@@ -639,6 +639,8 @@ dependencies = [
  "libc",
  "rcgen",
  "rustls",
+ "serde",
+ "serde_json",
  "socket2 0.5.10",
  "tokio",
  "tokio-rustls",
@@ -688,6 +690,9 @@ dependencies = [
 name = "elira-cgi"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "futures-core",
+ "futures-util",
  "thiserror",
  "tokio",
 ]
@@ -709,6 +714,8 @@ name = "elira-fastcgi"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "futures-core",
+ "futures-util",
  "thiserror",
  "tokio",
 ]
@@ -745,6 +752,10 @@ version = "0.1.0"
 [[package]]
 name = "elira-metrics"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "elira-migrate"

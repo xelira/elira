@@ -16,7 +16,26 @@ pub(crate) fn parse(
     app_status: u32,
 ) -> Result<Response, Error> {
     let (header_block, body) = split(stdout)?;
+    let (status, headers) = parse_header_block(header_block)?;
 
+    Ok(Response {
+        status,
+        headers,
+        body: body.to_vec(),
+        stderr: attach_app_status(
+            String::from_utf8_lossy(stderr_bytes).into_owned(),
+            app_status,
+        ),
+    })
+}
+
+/// Parse a CGI header block that has already been separated from its body.
+///
+/// The returned status includes the implicit 200/302 rule: a `Location`
+/// header without an explicit `Status` is a redirect.
+pub(crate) fn parse_header_block(
+    header_block: &[u8],
+) -> Result<(u16, Vec<(String, String)>), Error> {
     let mut status = None;
     let mut saw_location = false;
     let mut headers = Vec::new();
@@ -50,39 +69,30 @@ pub(crate) fn parse(
 
     // A redirect without Status is the one implicit status CGI defines.
     let status = status.unwrap_or(if saw_location { 302 } else { 200 });
+    Ok((status, headers))
+}
 
-    Ok(Response {
-        status,
-        headers,
-        body: body.to_vec(),
-        stderr: attach_app_status(
-            String::from_utf8_lossy(stderr_bytes).into_owned(),
-            app_status,
-        ),
-    })
+/// Locate the blank line that ends the CGI header block.
+///
+/// Returns `(header_end, body_start)`: the byte index where the header block
+/// ends and the index of the first body byte after the terminator. `None`
+/// means the block is not complete yet, which is the normal state while a
+/// streaming responder is still sending its headers.
+pub(crate) fn find_header_terminator(stdout: &[u8]) -> Option<(usize, usize)> {
+    let crlf = find(stdout, b"\r\n\r\n").map(|index| (index, index + 4));
+    let lf = find(stdout, b"\n\n").map(|index| (index, index + 2));
+
+    match (crlf, lf) {
+        (Some(left), Some(right)) => Some(if left.0 <= right.0 { left } else { right }),
+        (Some(found), None) | (None, Some(found)) => Some(found),
+        (None, None) => None,
+    }
 }
 
 fn split(stdout: &[u8]) -> Result<(&[u8], &[u8]), Error> {
-    let crlf = find(stdout, b"\r\n\r\n").map(|index| (index, 4));
-    let lf = find(stdout, b"\n\n").map(|index| (index, 2));
-
-    let (index, separator_len) = match (crlf, lf) {
-        (Some(left), Some(right)) => {
-            if left.0 <= right.0 {
-                left
-            } else {
-                right
-            }
-        }
-        (Some(found), None) | (None, Some(found)) => found,
-        (None, None) => {
-            return Err(invalid(
-                "STDOUT has no blank line between the CGI headers and the body",
-            ))
-        }
-    };
-
-    Ok((&stdout[..index], &stdout[index + separator_len..]))
+    let (index, body_start) = find_header_terminator(stdout)
+        .ok_or_else(|| invalid("STDOUT has no blank line between the CGI headers and the body"))?;
+    Ok((&stdout[..index], &stdout[body_start..]))
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {

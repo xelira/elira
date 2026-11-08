@@ -55,6 +55,10 @@ pub enum Error {
     #[error("FastCGI request is invalid: {0}")]
     Request(String),
 
+    /// Reading from the caller's streaming request body failed.
+    #[error("reading the request body: {0}")]
+    RequestBody(#[source] crate::BoxError),
+
     /// The exchange did not finish before the deadline.
     #[error("FastCGI server {target} did not answer within {duration:?}")]
     Timeout {

@@ -85,6 +85,11 @@
   HIT-ответы.
 - SNI-сертификаты и mTLS на QUIC-листенере.
 - `include` с масками и рекурсивным слиянием, подстановка `${ENV}` в конфиге.
+- Агрегированные `/metrics` и `/status` супервизором при `workers > 1`.
+- `max_concurrent` для FastCGI/CGI/module-маршрутов и запрет загрузки
+  world-writable модулей.
+- Потоковые FastCGI/CGI: stdin/stdout с backpressure и лимитом ответа.
+- OCSP stapling из DER-файла, перечитываемого по SIGHUP.
 - `elira migrate` переносит `try_files`, `add_header`, `allow`/`deny`,
   `auth_basic_user_file`, `client_max_body_size`, `gzip`, TLS и regex-location.
 - FastCGI-бэкенды по TCP и unix-сокетам, CGI-скрипты и нативные

@@ -6,6 +6,11 @@
 //! distinct labels is capped so untrusted names cannot grow it without bound.
 //! [`Metrics::render`] snapshots everything into text; no state is reset by
 //! rendering.
+//!
+//! Worker processes can move their counters with [`Metrics::take_delta`] and
+//! merge them into an aggregate registry with [`Metrics::apply_delta`]. A
+//! [`Delta`] is plain serde data, so it can be sent over an IPC channel or
+//! serialised to JSON without exposing the atomics or the label maps.
 
 use std::collections::BTreeMap;
 use std::fmt::Write;
@@ -13,7 +18,14 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 const STATUS_CLASSES: [&str; 6] = ["1xx", "2xx", "3xx", "4xx", "5xx", "other"];
+
+/// Requests by status class for one label.
+type LabeledRequests = Vec<(String, [u64; STATUS_CLASSES.len()])>;
+/// Duration sums and counts for one label, as `(label, sum_nanos, count)`.
+type LabeledDuration = Vec<(String, u64, u64)>;
 
 /// Maximum number of distinct route or upstream labels kept in memory.
 pub const MAX_LABELS: usize = 200;
@@ -89,6 +101,115 @@ impl Labeled {
         self.requests[class] = self.requests[class].saturating_add(1);
         self.duration_sum_nanos = self.duration_sum_nanos.saturating_add(nanos);
         self.duration_count = self.duration_count.saturating_add(1);
+    }
+
+    fn merge(&mut self, other: &Labeled) {
+        for (target, value) in self.requests.iter_mut().zip(&other.requests) {
+            *target = target.saturating_add(*value);
+        }
+        self.duration_sum_nanos = self
+            .duration_sum_nanos
+            .saturating_add(other.duration_sum_nanos);
+        self.duration_count = self.duration_count.saturating_add(other.duration_count);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.requests.iter().all(|&value| value == 0)
+            && self.duration_sum_nanos == 0
+            && self.duration_count == 0
+    }
+}
+
+/// Counters and gauges moved between a worker and an aggregate registry.
+///
+/// A worker calls [`Metrics::take_delta`] to drain its counters into a
+/// `Delta`, serialises it, and sends it to an aggregator. The aggregator calls
+/// [`Metrics::apply_delta`] (or the split [`Metrics::apply_counters`] and
+/// [`Metrics::apply_gauges`] methods) to merge it into its own registry.
+///
+/// Every counter field is a monotonic amount since the previous
+/// `take_delta`, so applying two deltas in either order produces the same
+/// counters. The three gauge fields describe the current state at the time of
+/// the take and are never reset by it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct Delta {
+    /// Global requests by status class, indexed like `STATUS_CLASSES`.
+    pub requests: [u64; STATUS_CLASSES.len()],
+    /// Cumulative histogram bucket counts, in [`BUCKETS`] order.
+    pub duration_buckets: Vec<u64>,
+    /// Total observed request duration in nanoseconds.
+    pub duration_sum_nanos: u64,
+    /// Number of observed requests.
+    pub duration_count: u64,
+    /// Per-route requests by status class, sorted by route name.
+    pub route_requests: Vec<(String, [u64; STATUS_CLASSES.len()])>,
+    /// Per-route duration sums and counts, sorted by route name.
+    ///
+    /// Each entry is `(route, sum_nanos, count)`.
+    pub route_duration: Vec<(String, u64, u64)>,
+    /// Per-upstream requests by status class, sorted by upstream name.
+    pub upstream_requests: Vec<(String, [u64; STATUS_CLASSES.len()])>,
+    /// Per-upstream duration sums and counts, sorted by upstream name.
+    ///
+    /// Each entry is `(upstream, sum_nanos, count)`.
+    pub upstream_duration: Vec<(String, u64, u64)>,
+    /// Cache lookups that were hits.
+    pub cache_hits: u64,
+    /// Cache lookups that were misses.
+    pub cache_misses: u64,
+    /// Request body bytes read from clients.
+    pub request_bytes: u64,
+    /// Response body bytes written to clients.
+    pub response_bytes: u64,
+    /// Successful configuration reloads.
+    pub reloads_ok: u64,
+    /// Failed configuration reloads.
+    pub reloads_failed: u64,
+    /// Current connections in flight, not a delta.
+    pub connections_in_flight: u64,
+    /// Current upstreams considered healthy, not a delta.
+    pub upstreams_up: u64,
+    /// Current upstreams considered unhealthy, not a delta.
+    pub upstreams_down: u64,
+}
+
+impl Delta {
+    /// Return `true` when this delta carries no counters and all gauges are
+    /// zero.
+    ///
+    /// Useful for skipping an empty inter-process message. A delta produced by
+    /// [`Metrics::take_delta`] always has a full-length
+    /// `duration_buckets` vector, so an empty one still contains zeros.
+    pub fn is_empty(&self) -> bool {
+        self.requests.iter().all(|&value| value == 0)
+            && self.duration_buckets.iter().all(|&value| value == 0)
+            && self.duration_sum_nanos == 0
+            && self.duration_count == 0
+            && self
+                .route_requests
+                .iter()
+                .all(|(_, counts)| counts.iter().all(|&value| value == 0))
+            && self
+                .route_duration
+                .iter()
+                .all(|(_, sum, count)| *sum == 0 && *count == 0)
+            && self
+                .upstream_requests
+                .iter()
+                .all(|(_, counts)| counts.iter().all(|&value| value == 0))
+            && self
+                .upstream_duration
+                .iter()
+                .all(|(_, sum, count)| *sum == 0 && *count == 0)
+            && self.cache_hits == 0
+            && self.cache_misses == 0
+            && self.request_bytes == 0
+            && self.response_bytes == 0
+            && self.reloads_ok == 0
+            && self.reloads_failed == 0
+            && self.connections_in_flight == 0
+            && self.upstreams_up == 0
+            && self.upstreams_down == 0
     }
 }
 
@@ -228,6 +349,126 @@ impl Metrics {
     pub fn set_upstreams(&self, up: usize, down: usize) {
         self.upstreams_up.store(up, Ordering::Relaxed);
         self.upstreams_down.store(down, Ordering::Relaxed);
+    }
+
+    /// Replace the in-flight connection gauge.
+    ///
+    /// This is the gauge counterpart of [`Metrics::connection_started`] and
+    /// [`Metrics::connection_finished`]. It is mainly used by aggregators when
+    /// applying a [`Delta`], where the value is a snapshot from another
+    /// process rather than a local increment.
+    pub fn connection_set(&self, in_flight: u64) {
+        self.connections_in_flight
+            .store(in_flight, Ordering::Relaxed);
+    }
+
+    /// Drain every counter into a [`Delta`] and reset it to zero.
+    ///
+    /// Each counter is cleared with an atomic swap, so every individual
+    /// counter increment lands in exactly one delta, never in both and never
+    /// lost. A single request updates several counters and the label maps
+    /// separately, so a take racing with an observation can split that
+    /// observation's contributions across two deltas; the running totals stay
+    /// correct. Per-label maps are swapped out under their mutex and copied in
+    /// name order, which makes the result deterministic.
+    ///
+    /// Gauges are copied but deliberately not reset: they describe current
+    /// state rather than an amount since the last take.
+    pub fn take_delta(&self) -> Delta {
+        let requests = std::array::from_fn(|index| self.requests[index].swap(0, Ordering::Relaxed));
+        let duration_buckets = self
+            .duration_buckets
+            .iter()
+            .map(|counter| counter.swap(0, Ordering::Relaxed))
+            .collect();
+        let duration_sum_nanos = self.duration_sum_nanos.swap(0, Ordering::Relaxed);
+        let duration_count = self.duration_count.swap(0, Ordering::Relaxed);
+        let (route_requests, route_duration) = take_labeled(&self.routes);
+        let (upstream_requests, upstream_duration) = take_labeled(&self.upstreams);
+
+        Delta {
+            requests,
+            duration_buckets,
+            duration_sum_nanos,
+            duration_count,
+            route_requests,
+            route_duration,
+            upstream_requests,
+            upstream_duration,
+            cache_hits: self.cache_hits.swap(0, Ordering::Relaxed),
+            cache_misses: self.cache_misses.swap(0, Ordering::Relaxed),
+            request_bytes: self.request_bytes.swap(0, Ordering::Relaxed),
+            response_bytes: self.response_bytes.swap(0, Ordering::Relaxed),
+            reloads_ok: self.reloads_ok.swap(0, Ordering::Relaxed),
+            reloads_failed: self.reloads_failed.swap(0, Ordering::Relaxed),
+            connections_in_flight: self.connections_in_flight.load(Ordering::Relaxed),
+            upstreams_up: self.upstreams_up.load(Ordering::Relaxed) as u64,
+            upstreams_down: self.upstreams_down.load(Ordering::Relaxed) as u64,
+        }
+    }
+
+    /// Add every counter in `delta` to this registry.
+    ///
+    /// Global counters and gauges are independent; this method never touches
+    /// the gauges. Per-label series are merged in sorted name order so the
+    /// [`MAX_LABELS`] cap keeps a deterministic subset even when the input
+    /// vectors are not sorted. Labels that already exist keep accumulating
+    /// after the cap is reached; new labels are dropped.
+    ///
+    /// Extra or missing entries in `delta.duration_buckets` are ignored
+    /// because every registry uses the same bucket layout; matching indexes
+    /// are added together.
+    pub fn apply_counters(&self, delta: &Delta) {
+        for (target, value) in self.requests.iter().zip(&delta.requests) {
+            add_saturating(target, *value);
+        }
+        for (target, value) in self.duration_buckets.iter().zip(&delta.duration_buckets) {
+            add_saturating(target, *value);
+        }
+        add_saturating(&self.duration_sum_nanos, delta.duration_sum_nanos);
+        add_saturating(&self.duration_count, delta.duration_count);
+
+        {
+            let mut routes = lock(&self.routes);
+            apply_labeled(&mut routes, &delta.route_requests, &delta.route_duration);
+        }
+        {
+            let mut upstreams = lock(&self.upstreams);
+            apply_labeled(
+                &mut upstreams,
+                &delta.upstream_requests,
+                &delta.upstream_duration,
+            );
+        }
+
+        add_saturating(&self.cache_hits, delta.cache_hits);
+        add_saturating(&self.cache_misses, delta.cache_misses);
+        add_saturating(&self.request_bytes, delta.request_bytes);
+        add_saturating(&self.response_bytes, delta.response_bytes);
+        add_saturating(&self.reloads_ok, delta.reloads_ok);
+        add_saturating(&self.reloads_failed, delta.reloads_failed);
+    }
+
+    /// Overwrite this registry's gauges with the values in `delta`.
+    ///
+    /// This uses [`Metrics::connection_set`] and [`Metrics::set_upstreams`]
+    /// semantics: a gauge is a current value, not something that can simply be
+    /// summed across workers. Callers that want different aggregation (for
+    /// example summing connections over workers) should call
+    /// [`Metrics::apply_counters`] and set the gauges themselves.
+    pub fn apply_gauges(&self, delta: &Delta) {
+        self.connection_set(delta.connections_in_flight);
+        self.set_upstreams(usize_of(delta.upstreams_up), usize_of(delta.upstreams_down));
+    }
+
+    /// Apply a [`Delta`] by adding its counters and overwriting the gauges.
+    ///
+    /// This is exactly [`Metrics::apply_counters`] followed by
+    /// [`Metrics::apply_gauges`]. It is the convenient entry point when the
+    /// aggregate should mirror the latest worker snapshot.
+    pub fn apply_delta(&self, delta: &Delta) {
+        self.apply_counters(delta);
+        self.apply_gauges(delta);
     }
 
     /// Render every metric in the Prometheus text exposition format.
@@ -393,6 +634,64 @@ fn nanos_of(duration: Duration) -> u64 {
 /// updating metrics. Metrics are not allowed to take the process down.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Remove all labelled series, returning requests and durations in name order.
+fn take_labeled(mutex: &Mutex<BTreeMap<String, Labeled>>) -> (LabeledRequests, LabeledDuration) {
+    let map = std::mem::take(&mut *lock(mutex));
+    let mut requests = Vec::with_capacity(map.len());
+    let mut duration = Vec::with_capacity(map.len());
+    for (label, stats) in map {
+        duration.push((
+            label.clone(),
+            stats.duration_sum_nanos,
+            stats.duration_count,
+        ));
+        requests.push((label, stats.requests));
+    }
+    (requests, duration)
+}
+
+/// Merge the request and duration halves of a delta into one label map.
+///
+/// The incoming entries are first combined per label in a sorted map. That
+/// makes cap enforcement independent of the order of the input vectors and
+/// guarantees that a label present in both halves is only counted once.
+fn apply_labeled(
+    map: &mut BTreeMap<String, Labeled>,
+    requests: &[(String, [u64; STATUS_CLASSES.len()])],
+    duration: &[(String, u64, u64)],
+) {
+    let mut incoming: BTreeMap<&str, Labeled> = BTreeMap::new();
+    for (label, counters) in requests {
+        let stats = incoming.entry(label.as_str()).or_default();
+        for (target, value) in stats.requests.iter_mut().zip(counters) {
+            *target = target.saturating_add(*value);
+        }
+    }
+    for (label, sum, count) in duration {
+        let stats = incoming.entry(label.as_str()).or_default();
+        stats.duration_sum_nanos = stats.duration_sum_nanos.saturating_add(*sum);
+        stats.duration_count = stats.duration_count.saturating_add(*count);
+    }
+
+    for (label, stats) in incoming {
+        if stats.is_empty() {
+            continue;
+        }
+        if let Some(existing) = map.get_mut(label) {
+            existing.merge(&stats);
+            continue;
+        }
+        if map.len() >= MAX_LABELS {
+            continue;
+        }
+        map.insert(label.to_owned(), stats);
+    }
+}
+
+fn usize_of(value: u64) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
 }
 
 fn record_labeled(map: &mut BTreeMap<String, Labeled>, label: &str, status: u16, nanos: u64) {
@@ -866,6 +1165,399 @@ mod tests {
         let text = metrics.render();
         assert_valid_exposition(&text);
         assert!(text.ends_with('\n'));
+    }
+
+    fn class(status: u16) -> usize {
+        status_class(status)
+    }
+
+    #[test]
+    fn take_delta_resets_counters() {
+        let metrics = Metrics::new();
+        metrics.observe(200, Duration::from_millis(2));
+        metrics.record_route("api", 404, Duration::from_millis(1));
+        metrics.record_upstream("backend", 503, Duration::from_millis(3));
+        metrics.cache_hit();
+        metrics.cache_miss();
+        metrics.request_bytes(10);
+        metrics.response_bytes(20);
+        metrics.reload_ok();
+        metrics.reload_failed();
+
+        let delta = metrics.take_delta();
+        assert_eq!(delta.requests[class(200)], 1);
+        assert_eq!(delta.duration_count, 1);
+        assert_eq!(delta.duration_sum_nanos, 2_000_000);
+        assert_eq!(delta.route_requests.len(), 1);
+        assert_eq!(delta.upstream_requests.len(), 1);
+        assert_eq!(delta.cache_hits, 1);
+        assert_eq!(delta.cache_misses, 1);
+        assert_eq!(delta.request_bytes, 10);
+        assert_eq!(delta.response_bytes, 20);
+        assert_eq!(delta.reloads_ok, 1);
+        assert_eq!(delta.reloads_failed, 1);
+        assert!(!delta.is_empty());
+
+        let again = metrics.take_delta();
+        assert_eq!(again.requests, [0; STATUS_CLASSES.len()]);
+        assert!(again.duration_buckets.iter().all(|&value| value == 0));
+        assert_eq!(again.duration_sum_nanos, 0);
+        assert_eq!(again.duration_count, 0);
+        assert!(again.route_requests.is_empty());
+        assert!(again.route_duration.is_empty());
+        assert!(again.upstream_requests.is_empty());
+        assert!(again.upstream_duration.is_empty());
+        assert_eq!(again.cache_hits, 0);
+        assert_eq!(again.cache_misses, 0);
+        assert_eq!(again.request_bytes, 0);
+        assert_eq!(again.response_bytes, 0);
+        assert_eq!(again.reloads_ok, 0);
+        assert_eq!(again.reloads_failed, 0);
+    }
+
+    #[test]
+    fn take_delta_copies_labels_in_sorted_order() {
+        let metrics = Metrics::new();
+        metrics.record_route("zeta", 500, Duration::from_millis(3));
+        metrics.record_route("alpha", 200, Duration::from_millis(1));
+        metrics.record_upstream("up-b", 200, Duration::from_millis(4));
+        metrics.record_upstream("up-a", 503, Duration::from_millis(2));
+
+        let delta = metrics.take_delta();
+        let labels = |entries: &[(String, [u64; STATUS_CLASSES.len()])]| {
+            entries
+                .iter()
+                .map(|(label, _)| label.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(labels(&delta.route_requests), ["alpha", "zeta"]);
+        assert_eq!(labels(&delta.upstream_requests), ["up-a", "up-b"]);
+
+        assert_eq!(delta.route_duration[0].0, "alpha");
+        assert_eq!(delta.route_duration[0].1, 1_000_000);
+        assert_eq!(delta.route_duration[0].2, 1);
+        assert_eq!(delta.route_requests[1].1[class(500)], 1);
+        assert_eq!(delta.upstream_requests[0].1[class(503)], 1);
+        assert_eq!(delta.upstream_duration[0].0, "up-a");
+    }
+
+    #[test]
+    fn two_deltas_sum_when_applied() {
+        let worker = Metrics::new();
+        let aggregate = Metrics::new();
+
+        worker.observe(200, Duration::from_millis(1));
+        worker.record_route("api", 200, Duration::from_millis(1));
+        worker.cache_hit();
+        aggregate.apply_delta(&worker.take_delta());
+
+        worker.observe(500, Duration::from_millis(2));
+        worker.record_route("api", 500, Duration::from_millis(2));
+        worker.cache_miss();
+        aggregate.apply_delta(&worker.take_delta());
+
+        let delta = aggregate.take_delta();
+        assert_eq!(delta.requests[class(200)], 1);
+        assert_eq!(delta.requests[class(500)], 1);
+        assert_eq!(delta.duration_count, 2);
+        assert_eq!(delta.duration_sum_nanos, 3_000_000);
+        assert_eq!(delta.route_requests.len(), 1);
+        assert_eq!(delta.route_requests[0].1[class(200)], 1);
+        assert_eq!(delta.route_requests[0].1[class(500)], 1);
+        assert_eq!(delta.route_duration[0].1, 3_000_000);
+        assert_eq!(delta.route_duration[0].2, 2);
+        assert_eq!(delta.cache_hits, 1);
+        assert_eq!(delta.cache_misses, 1);
+    }
+
+    #[test]
+    fn gauges_are_copied_not_reset() {
+        let metrics = Metrics::new();
+        metrics.connection_started();
+        metrics.connection_started();
+        metrics.set_upstreams(4, 2);
+
+        let delta = metrics.take_delta();
+        assert_eq!(delta.connections_in_flight, 2);
+        assert_eq!(delta.upstreams_up, 4);
+        assert_eq!(delta.upstreams_down, 2);
+
+        // Taking a delta must leave the live gauges in place.
+        let text = metrics.render();
+        assert_eq!(series_value(&text, "elira_connections_in_flight"), "2");
+        assert_eq!(series_value(&text, "elira_upstreams{state=\"up\"}"), "4");
+        assert_eq!(series_value(&text, "elira_upstreams{state=\"down\"}"), "2");
+
+        let again = metrics.take_delta();
+        assert_eq!(again.connections_in_flight, 2);
+        assert_eq!(again.upstreams_up, 4);
+        assert_eq!(again.upstreams_down, 2);
+    }
+
+    #[test]
+    fn delta_json_round_trips() {
+        let metrics = Metrics::new();
+        metrics.observe(201, Duration::from_millis(7));
+        metrics.observe(404, Duration::from_millis(1));
+        metrics.record_route("api", 201, Duration::from_millis(7));
+        metrics.record_upstream("backend", 404, Duration::from_millis(1));
+        metrics.cache_hit();
+        metrics.cache_miss();
+        metrics.request_bytes(1234);
+        metrics.response_bytes(5678);
+        metrics.reload_ok();
+        metrics.reload_failed();
+        metrics.connection_started();
+        metrics.set_upstreams(2, 1);
+
+        let delta = metrics.take_delta();
+        let json = serde_json::to_string(&delta).expect("serialise delta");
+        let restored: Delta = serde_json::from_str(&json).expect("deserialise delta");
+        assert_eq!(restored, delta);
+        assert!(json.contains("\"route_requests\""));
+        assert!(json.contains("\"duration_buckets\""));
+    }
+
+    #[test]
+    fn applying_delta_reproduces_the_original_render() {
+        let worker = Metrics::new();
+        worker.observe(200, Duration::from_millis(1));
+        worker.observe(500, Duration::from_millis(30));
+        worker.record_route("api", 200, Duration::from_millis(1));
+        worker.record_route("api", 500, Duration::from_millis(30));
+        worker.record_route("static", 404, Duration::ZERO);
+        worker.record_upstream("backend", 200, Duration::from_millis(2));
+        worker.record_upstream("backend", 502, Duration::from_millis(20));
+        worker.cache_hit();
+        worker.cache_miss();
+        worker.request_bytes(11);
+        worker.response_bytes(22);
+        worker.reload_ok();
+        worker.reload_failed();
+        worker.connection_started();
+        worker.set_upstreams(3, 1);
+
+        let original = worker.render();
+        let delta = worker.take_delta();
+        let aggregate = Metrics::new();
+        aggregate.apply_delta(&delta);
+        assert_eq!(aggregate.render(), original);
+    }
+
+    #[test]
+    fn apply_counters_leaves_gauges_alone() {
+        let metrics = Metrics::new();
+        metrics.connection_set(7);
+        metrics.set_upstreams(1, 2);
+
+        let delta = Delta {
+            cache_hits: 3,
+            connections_in_flight: 99,
+            upstreams_up: 8,
+            upstreams_down: 9,
+            ..Delta::default()
+        };
+
+        metrics.apply_counters(&delta);
+        let text = metrics.render();
+        assert!(line(&text, "elira_cache_requests_total{result=\"hit\"} 3"));
+        assert_eq!(series_value(&text, "elira_connections_in_flight"), "7");
+        assert_eq!(series_value(&text, "elira_upstreams{state=\"up\"}"), "1");
+        assert_eq!(series_value(&text, "elira_upstreams{state=\"down\"}"), "2");
+
+        metrics.apply_gauges(&delta);
+        let text = metrics.render();
+        assert_eq!(series_value(&text, "elira_connections_in_flight"), "99");
+        assert_eq!(series_value(&text, "elira_upstreams{state=\"up\"}"), "8");
+        assert_eq!(series_value(&text, "elira_upstreams{state=\"down\"}"), "9");
+    }
+
+    #[test]
+    fn applying_deltas_preserves_label_cap() {
+        let aggregate = Metrics::new();
+        let mut delta = Delta::default();
+        for index in 0..MAX_LABELS + 50 {
+            let mut requests = [0; STATUS_CLASSES.len()];
+            requests[class(200)] = 1;
+            delta
+                .route_requests
+                .push((format!("route-{index:04}"), requests));
+            delta
+                .route_duration
+                .push((format!("route-{index:04}"), 1_000_000, 1));
+        }
+
+        // Deliberately unsorted input: the cap must pick the same sorted
+        // subset a fresh registry would, not whichever entries come first.
+        delta.route_requests.reverse();
+        delta.route_duration.reverse();
+
+        aggregate.apply_delta(&delta);
+        let text = aggregate.render();
+        let routes = text
+            .lines()
+            .filter(|line| line.starts_with("elira_route_duration_seconds_count{"))
+            .count();
+        assert_eq!(routes, MAX_LABELS);
+        assert!(text.contains("route=\"route-0000\""));
+        assert!(text.contains(&format!("route=\"route-{:04}\"", MAX_LABELS - 1)));
+        assert!(!text.contains(&format!("route=\"route-{:04}\"", MAX_LABELS)));
+
+        // Labels already present keep accumulating even when the cap is full.
+        let mut extra = Delta::default();
+        let mut requests = [0; STATUS_CLASSES.len()];
+        requests[class(500)] = 1;
+        extra
+            .route_requests
+            .push(("route-0000".to_owned(), requests));
+        extra
+            .route_duration
+            .push(("route-0000".to_owned(), 2_000_000, 1));
+        extra
+            .route_requests
+            .push(("route-new".to_owned(), requests));
+        aggregate.apply_delta(&extra);
+
+        let text = aggregate.render();
+        assert!(line(
+            &text,
+            "elira_route_requests_total{route=\"route-0000\",class=\"5xx\"} 1"
+        ));
+        assert_eq!(
+            series_value(
+                &text,
+                "elira_route_duration_seconds_count{route=\"route-0000\"}"
+            ),
+            "2"
+        );
+        assert!(!text.contains("route=\"route-new\""));
+        assert_valid_exposition(&text);
+    }
+
+    #[test]
+    fn apply_delta_overwrites_gauges_with_the_latest_snapshot() {
+        let aggregate = Metrics::new();
+
+        let first = Delta {
+            connections_in_flight: 2,
+            upstreams_up: 5,
+            upstreams_down: 1,
+            ..Delta::default()
+        };
+        aggregate.apply_delta(&first);
+        assert_eq!(
+            series_value(&aggregate.render(), "elira_connections_in_flight"),
+            "2"
+        );
+
+        let second = Delta {
+            connections_in_flight: 4,
+            upstreams_up: 3,
+            upstreams_down: 2,
+            ..Delta::default()
+        };
+        aggregate.apply_delta(&second);
+        let text = aggregate.render();
+        assert_eq!(series_value(&text, "elira_connections_in_flight"), "4");
+        assert_eq!(series_value(&text, "elira_upstreams{state=\"up\"}"), "3");
+        assert_eq!(series_value(&text, "elira_upstreams{state=\"down\"}"), "2");
+    }
+
+    #[test]
+    fn default_delta_only_overwrites_gauges_when_applied_fully() {
+        let metrics = Metrics::new();
+        metrics.observe(200, Duration::from_millis(1));
+        metrics.connection_set(5);
+        let before = metrics.render();
+
+        // Counters are additive, so an empty delta changes nothing.
+        metrics.apply_counters(&Delta::default());
+        assert_eq!(metrics.render(), before);
+
+        // Gauges are snapshots, so an empty delta resets them to zero.
+        metrics.apply_gauges(&Delta::default());
+        let text = metrics.render();
+        assert_eq!(series_value(&text, "elira_connections_in_flight"), "0");
+        assert_eq!(series_value(&text, "elira_upstreams{state=\"up\"}"), "0");
+        assert_eq!(series_value(&text, "elira_upstreams{state=\"down\"}"), "0");
+    }
+
+    #[test]
+    fn applying_short_bucket_vectors_only_updates_matching_indexes() {
+        let metrics = Metrics::new();
+        let delta = Delta {
+            duration_buckets: vec![3, 4],
+            duration_sum_nanos: 10,
+            duration_count: 2,
+            ..Delta::default()
+        };
+        metrics.apply_counters(&delta);
+
+        let text = metrics.render();
+        assert_eq!(
+            series_value(&text, "elira_request_duration_seconds_bucket{le=\"0.001\"}"),
+            "3"
+        );
+        assert_eq!(
+            series_value(&text, "elira_request_duration_seconds_bucket{le=\"0.005\"}"),
+            "4"
+        );
+        assert_eq!(
+            series_value(&text, "elira_request_duration_seconds_bucket{le=\"0.01\"}"),
+            "0"
+        );
+        assert_eq!(
+            series_value(&text, "elira_request_duration_seconds_count"),
+            "2"
+        );
+    }
+
+    #[test]
+    fn take_and_apply_round_trip_through_json_between_registries() {
+        let worker = Metrics::new();
+        for _ in 0..3 {
+            worker.observe(200, Duration::from_millis(4));
+            worker.record_route("api", 200, Duration::from_millis(4));
+            worker.record_upstream("backend", 200, Duration::from_millis(4));
+            worker.cache_hit();
+            worker.request_bytes(8);
+            worker.response_bytes(16);
+            worker.reload_ok();
+        }
+        worker.set_upstreams(2, 0);
+
+        let json = serde_json::to_string(&worker.take_delta()).expect("serialise delta");
+        let aggregate = Metrics::new();
+        for _ in 0..2 {
+            let delta: Delta = serde_json::from_str(&json).expect("deserialise delta");
+            aggregate.apply_counters(&delta);
+        }
+        aggregate.apply_gauges(&serde_json::from_str(&json).expect("deserialise delta"));
+
+        let text = aggregate.render();
+        assert!(line(&text, "elira_requests_total{class=\"2xx\"} 6"));
+        assert_eq!(
+            series_value(&text, "elira_request_duration_seconds_count"),
+            "6"
+        );
+        assert_eq!(
+            series_value(&text, "elira_route_duration_seconds_count{route=\"api\"}"),
+            "6"
+        );
+        assert_eq!(
+            series_value(
+                &text,
+                "elira_upstream_duration_seconds_count{upstream=\"backend\"}"
+            ),
+            "6"
+        );
+        assert!(line(&text, "elira_cache_requests_total{result=\"hit\"} 6"));
+        assert_eq!(series_value(&text, "elira_request_bytes_total"), "48");
+        assert_eq!(series_value(&text, "elira_response_bytes_total"), "96");
+        assert!(line(&text, "elira_reloads_total{result=\"ok\"} 6"));
+        assert_eq!(series_value(&text, "elira_connections_in_flight"), "0");
+        assert_eq!(series_value(&text, "elira_upstreams{state=\"up\"}"), "2");
+        assert_valid_exposition(&text);
     }
 
     fn assert_valid_exposition(text: &str) {

@@ -67,6 +67,7 @@ impl Runtime {
                     client_ca: tls.client_ca.as_deref(),
                     client_auth: mode,
                     tls13_only: tls.min_version == TlsVersion::Tls13,
+                    ocsp: tls.ocsp.as_deref(),
                 })?;
                 Some(Arc::new(config))
             }
@@ -702,6 +703,86 @@ pub fn spawn_http01(
                     });
                 }
             }
+        }
+    });
+}
+
+/// Aggregate metrics and status reported by worker processes.
+pub fn spawn_metrics_aggregate(
+    listener: TcpListener,
+    metrics: Arc<Metrics>,
+    statuses: Arc<std::sync::Mutex<std::collections::HashMap<usize, String>>>,
+    auth: Option<Arc<elira_auth::BasicAuth>>,
+) {
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                continue;
+            };
+            let metrics = metrics.clone();
+            let statuses = statuses.clone();
+            let auth = auth.clone();
+            tokio::spawn(async move {
+                let service = service_fn(move |req: hyper::Request<Incoming>| {
+                    let metrics = metrics.clone();
+                    let statuses = statuses.clone();
+                    let auth = auth.clone();
+                    async move {
+                        if let Some(auth) = &auth {
+                            let header = req
+                                .headers()
+                                .get(hyper::header::AUTHORIZATION)
+                                .and_then(|value| value.to_str().ok());
+                            if !auth.check(header) {
+                                let mut response = json(
+                                    hyper::StatusCode::UNAUTHORIZED,
+                                    "{\"error\":\"authentication required\"}",
+                                );
+                                response.headers_mut().insert(
+                                    hyper::header::WWW_AUTHENTICATE,
+                                    hyper::header::HeaderValue::from_static(
+                                        "Basic realm=\"elira\"",
+                                    ),
+                                );
+                                return Ok::<_, std::convert::Infallible>(response);
+                            }
+                        }
+
+                        let response = match (req.method(), req.uri().path()) {
+                            (&hyper::Method::GET, "/metrics") => text_response(
+                                hyper::StatusCode::OK,
+                                "text/plain; version=0.0.4; charset=utf-8",
+                                metrics.render(),
+                            ),
+                            (&hyper::Method::GET, "/status") => {
+                                let statuses = statuses
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                let last = statuses
+                                    .values()
+                                    .next()
+                                    .cloned()
+                                    .unwrap_or_else(|| "null".to_owned());
+                                let body = format!(
+                                    "{{\"workers\":{},\"snapshot\":{last}}}",
+                                    statuses.len()
+                                );
+                                text_response(hyper::StatusCode::OK, "application/json", body)
+                            }
+                            _ => text_response(
+                                hyper::StatusCode::NOT_FOUND,
+                                "text/plain; charset=utf-8",
+                                "not found".to_owned(),
+                            ),
+                        };
+                        Ok::<_, std::convert::Infallible>(response)
+                    }
+                });
+
+                let _ = http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
         }
     });
 }

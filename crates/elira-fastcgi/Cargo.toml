@@ -7,5 +7,7 @@ repository.workspace = true
 
 [dependencies]
 bytes = { workspace = true }
+futures-core = "0.3"
+futures-util = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["net", "io-util", "time", "process"] }
+tokio = { workspace = true, features = ["net", "io-util", "time", "process", "sync"] }

@@ -29,12 +29,17 @@
 mod error;
 mod protocol;
 mod response;
+mod stream;
 mod target;
 
 use std::time::Duration;
 
 pub use error::Error;
+pub use stream::{execute_stream, BodyStream, StreamResponse};
 pub use target::Target;
+
+/// Boxed error type carried by streaming request and response bodies.
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 use bytes::BytesMut;
 use protocol::RecordType;
@@ -175,7 +180,7 @@ where
     write_record(stream, record_type, &[]).await
 }
 
-async fn write_record<S>(
+pub(crate) async fn write_record<S>(
     stream: &mut S,
     record_type: RecordType,
     content: &[u8],
@@ -249,7 +254,7 @@ where
     }
 }
 
-fn decode_end_request(content: &[u8]) -> Result<(u32, u8), Error> {
+pub(crate) fn decode_end_request(content: &[u8]) -> Result<(u32, u8), Error> {
     if content.len() != 8 {
         return Err(Error::Protocol(format!(
             "END_REQUEST body is {} bytes; expected 8",
@@ -262,7 +267,7 @@ fn decode_end_request(content: &[u8]) -> Result<(u32, u8), Error> {
     Ok((u32::from_be_bytes(app), content[4]))
 }
 
-fn protocol_status_name(status: u8) -> &'static str {
+pub(crate) fn protocol_status_name(status: u8) -> &'static str {
     match status {
         1 => "multiplexing not supported",
         2 => "server overloaded",
@@ -271,7 +276,7 @@ fn protocol_status_name(status: u8) -> &'static str {
     }
 }
 
-fn write_error(source: std::io::Error) -> Error {
+pub(crate) fn write_error(source: std::io::Error) -> Error {
     Error::Io {
         context: "writing FastCGI request",
         source,

@@ -32,6 +32,8 @@ pub struct ServerOptions<'a> {
     pub client_ca: Option<&'a Path>,
     pub client_auth: ClientAuth,
     pub tls13_only: bool,
+    /// DER OCSP response for the default certificate.
+    pub ocsp: Option<&'a Path>,
 }
 
 /// ALPN order matters: clients that accept both get the first shared protocol.
@@ -121,6 +123,7 @@ pub fn server_config(cert: &Path, key: &Path) -> Result<ServerConfig, Error> {
         client_ca: None,
         client_auth: ClientAuth::Off,
         tls13_only: false,
+        ocsp: None,
     })
 }
 
@@ -148,6 +151,7 @@ pub fn server_config_with_client_auth(
         client_ca,
         client_auth: mode,
         tls13_only: false,
+        ocsp: None,
     })
 }
 
@@ -182,6 +186,7 @@ pub fn quic_server_config_full(
             client_ca,
             client_auth: mode,
             tls13_only: true,
+            ocsp: None,
         },
         &[b"h3"],
     )
@@ -207,16 +212,24 @@ fn build(options: &ServerOptions<'_>, alpn: &[&[u8]]) -> Result<ServerConfig, Er
         None => builder.with_no_client_auth(),
     };
 
+    let ocsp = match options.ocsp {
+        Some(path) => Some(fs::read(path).map_err(|source| Error::Read {
+            path: path.to_path_buf(),
+            source,
+        })?),
+        None => None,
+    };
+
     let mut named = Vec::with_capacity(options.named.len());
     for entry in options.named {
         named.push((
             entry.names.clone(),
-            Arc::new(certified(&entry.cert, &entry.key)?),
+            Arc::new(certified(&entry.cert, &entry.key, None)?),
         ));
     }
 
     let default = match options.default {
-        Some((cert, key)) => Some(Arc::new(certified(cert, key)?)),
+        Some((cert, key)) => Some(Arc::new(certified(cert, key, ocsp)?)),
         None => None,
     };
 
@@ -232,7 +245,7 @@ fn build(options: &ServerOptions<'_>, alpn: &[&[u8]]) -> Result<ServerConfig, Er
     Ok(config)
 }
 
-fn certified(cert: &Path, key: &Path) -> Result<CertifiedKey, Error> {
+fn certified(cert: &Path, key: &Path, ocsp: Option<Vec<u8>>) -> Result<CertifiedKey, Error> {
     let chain = load_chain(cert)?;
     let key_der = load_key(key)?;
     let signing = rustls::crypto::aws_lc_rs::sign::any_supported_type(&key_der).map_err(|_| {
@@ -240,7 +253,9 @@ fn certified(cert: &Path, key: &Path) -> Result<CertifiedKey, Error> {
             path: key.to_path_buf(),
         }
     })?;
-    Ok(CertifiedKey::new(chain, signing))
+    let mut certified = CertifiedKey::new(chain, signing);
+    certified.ocsp = ocsp;
+    Ok(certified)
 }
 
 /// SNI dispatcher. Exact names win; `*.example.com` matches exactly one label.
@@ -621,7 +636,7 @@ mod tests {
     fn sni_matching_is_exact_and_wildcard_shallow() {
         let fixtures = fixtures();
         let key = Arc::new(
-            certified(&fixtures.join("cert.pem"), &fixtures.join("key.pem"))
+            certified(&fixtures.join("cert.pem"), &fixtures.join("key.pem"), None)
                 .expect("fixture certificate"),
         );
         let resolver = NamedResolver {

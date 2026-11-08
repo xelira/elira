@@ -132,6 +132,17 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
         options.acme = Some(Arc::new(started));
     }
     let metrics = Arc::new(Metrics::new());
+    if let (Ok(path), Ok(index)) = (
+        std::env::var("ELIRA_METRICS_SOCKET"),
+        std::env::var("ELIRA_WORKER_INDEX"),
+    ) {
+        spawn_metrics_sender(
+            metrics.clone(),
+            runtime.clone(),
+            PathBuf::from(path),
+            index.parse().unwrap_or(0),
+        );
+    }
     let (stop_tx, stop_rx) = watch::channel(false);
     let (reload_tx, mut reload_rx) = watch::channel(0u64);
     let (restart_tx, mut restart_rx) = watch::channel(0u64);
@@ -150,21 +161,25 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
     }
 
     if let Some(metrics_cfg) = &cfg.metrics {
-        let metrics_listener = server::bind_tcp(metrics_cfg.listen, cfg.reuse_port)
-            .with_context(|| format!("cannot bind metrics on {}", metrics_cfg.listen))?;
-        let admin_auth = match &metrics_cfg.auth_file {
-            Some(path) => Some(Arc::new(elira_auth::BasicAuth::from_file(path)?)),
-            None => None,
-        };
-        server::spawn_metrics(
-            metrics_listener,
-            runtime.clone(),
-            metrics.clone(),
-            admin_auth,
-            reload_tx.clone(),
-            stop_tx.clone(),
-            stop_rx.clone(),
-        );
+        if std::env::var_os("ELIRA_METRICS_SOCKET").is_some() {
+            // The supervisor owns the metrics listener in worker mode.
+        } else {
+            let metrics_listener = server::bind_tcp(metrics_cfg.listen, cfg.reuse_port)
+                .with_context(|| format!("cannot bind metrics on {}", metrics_cfg.listen))?;
+            let admin_auth = match &metrics_cfg.auth_file {
+                Some(path) => Some(Arc::new(elira_auth::BasicAuth::from_file(path)?)),
+                None => None,
+            };
+            server::spawn_metrics(
+                metrics_listener,
+                runtime.clone(),
+                metrics.clone(),
+                admin_auth,
+                reload_tx.clone(),
+                stop_tx.clone(),
+                stop_rx.clone(),
+            );
+        }
     }
 
     let mut h3_task = spawn_h3(
@@ -428,14 +443,51 @@ struct WorkerSlot {
     ready: PathBuf,
 }
 
+type StatusMap = Arc<std::sync::Mutex<std::collections::HashMap<usize, String>>>;
+type WorkerGauges = Arc<std::sync::Mutex<std::collections::HashMap<usize, (u64, u64, u64)>>>;
+
 /// Supervisor for `workers > 1`. Children share the sockets via SO_REUSEPORT;
 /// the parent only starts, watches, reloads and restarts them.
 async fn supervise(config: PathBuf, workers: usize) -> anyhow::Result<()> {
     use tokio::signal::unix::{signal, SignalKind};
     use tokio::sync::mpsc;
 
+    let cfg = Config::load(&config)?;
     let (exit_tx, mut exit_rx) = mpsc::channel::<(usize, std::process::ExitStatus)>(64);
     let mut slots = Vec::with_capacity(workers);
+
+    // Workers send their counters here; the supervisor owns the public
+    // metrics listener in multi-process mode.
+    let mut metrics_socket = None;
+    if let Some(metrics_cfg) = cfg.metrics.as_ref() {
+        let listener = server::bind_tcp(metrics_cfg.listen, cfg.reuse_port)
+            .with_context(|| format!("cannot bind metrics on {}", metrics_cfg.listen))?;
+        let path = std::env::temp_dir().join(format!(
+            "elira-metrics-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|delta| delta.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_file(&path);
+        let socket = tokio::net::UnixDatagram::bind(&path)
+            .with_context(|| format!("cannot bind {}", path.display()))?;
+        let aggregate = Arc::new(Metrics::new());
+        let statuses: StatusMap = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let gauges: WorkerGauges =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        spawn_metrics_receiver(socket, aggregate.clone(), statuses.clone(), gauges);
+        let auth = match &metrics_cfg.auth_file {
+            Some(path) => Some(Arc::new(elira_auth::BasicAuth::from_file(path)?)),
+            None => None,
+        };
+        server::spawn_metrics_aggregate(listener, aggregate, statuses, auth);
+        metrics_socket = Some(path);
+    }
+    if let Some(path) = &metrics_socket {
+        std::env::set_var("ELIRA_METRICS_SOCKET", path);
+    }
 
     for index in 0..workers {
         let slot = spawn_worker(index, &config)?;
@@ -487,6 +539,11 @@ async fn supervise(config: PathBuf, workers: usize) -> anyhow::Result<()> {
         }
     }
 
+    if let Some(path) = &metrics_socket {
+        std::env::remove_var("ELIRA_METRICS_SOCKET");
+        let _ = std::fs::remove_file(path);
+    }
+
     tracing::info!("stopping workers");
     for slot in &slots {
         kill(slot.pid, libc::SIGTERM);
@@ -510,6 +567,92 @@ async fn supervise(config: PathBuf, workers: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn spawn_metrics_sender(
+    metrics: Arc<Metrics>,
+    runtime: Arc<ArcSwap<Runtime>>,
+    path: PathBuf,
+    worker: usize,
+) {
+    tokio::spawn(async move {
+        let socket = match tokio::net::UnixDatagram::unbound() {
+            Ok(socket) => socket,
+            Err(error) => {
+                tracing::warn!(%error, "cannot create the metrics socket");
+                return;
+            }
+        };
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let delta = metrics.take_delta();
+            let status = runtime.load().proxy().status();
+            let message = serde_json::json!({
+                "worker": worker,
+                "delta": delta,
+                "status": status,
+            });
+            if socket
+                .send_to(message.to_string().as_bytes(), &path)
+                .await
+                .is_err()
+            {
+                tracing::debug!("metrics supervisor is not reachable");
+            }
+        }
+    });
+}
+
+fn spawn_metrics_receiver(
+    socket: tokio::net::UnixDatagram,
+    aggregate: Arc<Metrics>,
+    statuses: StatusMap,
+    gauges: WorkerGauges,
+) {
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 256 * 1024];
+        loop {
+            let Ok(read) = socket.recv(&mut buf).await else {
+                break;
+            };
+            let Ok(value) = serde_json::from_slice::<serde_json::Value>(&buf[..read]) else {
+                continue;
+            };
+            let worker = value
+                .get("worker")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0) as usize;
+            if let Some(delta) = value.get("delta") {
+                if let Ok(delta) = serde_json::from_value::<elira_metrics::Delta>(delta.clone()) {
+                    aggregate.apply_counters(&delta);
+                    let mut gauges = gauges
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    gauges.insert(
+                        worker,
+                        (
+                            delta.connections_in_flight,
+                            delta.upstreams_up,
+                            delta.upstreams_down,
+                        ),
+                    );
+                    let mut total = elira_metrics::Delta::default();
+                    for (connections, up, down) in gauges.values() {
+                        total.connections_in_flight += connections;
+                        total.upstreams_up += up;
+                        total.upstreams_down += down;
+                    }
+                    aggregate.apply_gauges(&total);
+                }
+            }
+            if let Some(status) = value.get("status") {
+                let mut statuses = statuses
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                statuses.insert(worker, status.to_string());
+            }
+        }
+    });
+}
+
 fn spawn_worker(index: usize, config: &Path) -> anyhow::Result<WorkerSlot> {
     let exe = std::env::current_exe().context("cannot find the executable")?;
     let ready = std::env::temp_dir().join(format!(
@@ -525,6 +668,7 @@ fn spawn_worker(index: usize, config: &Path) -> anyhow::Result<WorkerSlot> {
         .args(["run", "--config"])
         .arg(config)
         .env("ELIRA_WORKER", "1")
+        .env("ELIRA_WORKER_INDEX", index.to_string())
         .env("ELIRA_READY_FILE", &ready)
         .spawn()
         .with_context(|| format!("cannot start worker {index}"))?;

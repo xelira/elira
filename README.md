@@ -198,8 +198,8 @@ Upstreams:
 
 - round robin and least connections, active health checks, retries for bodyless
   idempotent requests
-- FastCGI over TCP (including DNS names) or unix sockets, CGI scripts, and
-  native `.so` modules
+- streaming FastCGI over TCP (including DNS names) or unix sockets, streaming
+  CGI scripts, and native `.so` modules
 - TCP and unix sockets in the same pool
 - TLS with a custom CA, explicit `insecure`, per-upstream SNI and HTTP/2
 - WebSocket and other `Upgrade` tunnelling, `CONNECT` with an explicit allowlist
@@ -247,7 +247,8 @@ Ops:
 - `elira migrate` for nginx `proxy_pass`/`root`, `try_files`, `add_header`,
   `allow`/`deny`, auth files, gzip, TLS and regex locations
 - `workers > 1`: supervised worker processes sharing the port via SO_REUSEPORT,
-  with rolling restart on SIGUSR2
+  with rolling restart on SIGUSR2 and an aggregated `/metrics`/`/status` in the
+  supervisor
 
 ## Admin listener
 
@@ -276,8 +277,12 @@ The listener has no TLS. Put it on loopback or set `auth_file`.
 - Dynamic modules are native shared libraries and run in-process with full
   privileges. FastCGI and CGI buffer the request body; they do not stream very
   large uploads.
+- FastCGI/CGI bodies stream with bounded channels; very large uploads are cut
+  by `max_response_bytes`/`max_body_bytes`.
 - `workers` and listener changes need a restart. SIGHUP reloads routes in every
-  worker; SIGUSR2 rolls the workers one by one.
+  worker; SIGUSR2 rolls the workers one by one. In worker mode `/metrics` and
+  `/status` are aggregated by the supervisor; `/reload`, `/drain` and
+  `/cache/purge` are not exposed there.
 - DNS resolution uses the system resolver. `dns_ttl_secs` bounds how long a
   pooled connection may outlive a DNS change.
 

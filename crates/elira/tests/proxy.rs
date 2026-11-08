@@ -2086,7 +2086,7 @@ cgi_pass = "{}"
     )
     .await;
     assert_eq!(status(&response), "HTTP/1.1 200 OK");
-    assert!(response.ends_with("cgi:name=elira\n"), "{response}");
+    assert!(response.contains("cgi:name=elira"), "{response}");
 }
 
 /// A tiny FastCGI responder: it ignores params and answers every STDIN
@@ -2157,7 +2157,7 @@ fastcgi_root = "{root}"
     )
     .await;
     assert_eq!(status(&response), "HTTP/1.1 200 OK");
-    assert!(response.ends_with("fastcgi"), "{response}");
+    assert!(response.contains("fastcgi"), "{response}");
 }
 
 #[tokio::test]

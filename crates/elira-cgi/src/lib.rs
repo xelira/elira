@@ -33,6 +33,13 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStderr, ChildStdin, Command};
 use tokio::time::timeout;
 
+mod stream;
+
+pub use stream::{execute_stream, BodyStream, StreamRequest, StreamResponse};
+
+/// Boxed error type carried by streaming request and response bodies.
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
 /// Largest stdout payload accepted from a script.
 ///
 /// CGI responses are buffered because the header block determines how the
@@ -189,12 +196,15 @@ pub async fn execute(request: &Request) -> Result<Response, Error> {
     parse_response(&stdout, status)
 }
 
-/// Validates the request and builds a command without a shell.
-fn command(request: &Request) -> Result<Command, Error> {
-    validate_script(&request.script)?;
-    validate_params(&request.params)?;
+/// Validates the script and parameters and builds the common command shape.
+///
+/// The caller adds any body-length specific environment entries because the
+/// buffered path knows the length while the streaming path does not.
+fn base_command(script: &Path, params: &[(String, String)]) -> Result<Command, Error> {
+    validate_script(script)?;
+    validate_params(params)?;
 
-    let mut command = Command::new(&request.script);
+    let mut command = Command::new(script);
     command
         .env_clear()
         .stdin(Stdio::piped())
@@ -204,13 +214,20 @@ fn command(request: &Request) -> Result<Command, Error> {
         // not leave the script running with open pipes.
         .kill_on_drop(true);
 
-    for (name, value) in &request.params {
+    for (name, value) in params {
         command.env(name, value);
     }
 
     // Written after the caller's parameters so these cannot be overridden.
     command.env("GATEWAY_INTERFACE", GATEWAY_INTERFACE);
     command.env("SERVER_SOFTWARE", SERVER_SOFTWARE);
+
+    Ok(command)
+}
+
+/// Validates the request and builds a command without a shell.
+fn command(request: &Request) -> Result<Command, Error> {
+    let mut command = base_command(&request.script, &request.params)?;
 
     // CGI scripts commonly use CONTENT_LENGTH to decide how much stdin to
     // read. Supplying it is safe because the runner wrote exactly this body;
@@ -351,7 +368,20 @@ fn parse_response(stdout: &[u8], status: ExitStatus) -> Result<Response, Error> 
 
     let (header_block, body) =
         split_headers(stdout).ok_or(Error::Malformed("missing CGI header terminator"))?;
+    let (status, headers) = parse_header_block(header_block)?;
 
+    Ok(Response {
+        status,
+        headers,
+        body: body.to_vec(),
+    })
+}
+
+/// Parse a CGI header block that has already been separated from its body.
+///
+/// Both execution paths use this so the buffered and streaming responses
+/// accept and reject exactly the same headers.
+fn parse_header_block(header_block: &[u8]) -> Result<(u16, Vec<(String, String)>), Error> {
     let mut explicit_status = None;
     let mut headers = Vec::new();
 
@@ -408,11 +438,7 @@ fn parse_response(stdout: &[u8], status: ExitStatus) -> Result<Response, Error> 
         200
     };
 
-    Ok(Response {
-        status: explicit_status.unwrap_or(inferred_status),
-        headers,
-        body: body.to_vec(),
-    })
+    Ok((explicit_status.unwrap_or(inferred_status), headers))
 }
 
 /// Finds the blank line that separates CGI headers from the body.

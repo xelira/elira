@@ -124,6 +124,10 @@ pub struct Limits {
     #[serde(default = "Limits::default_websocket_idle_secs")]
     pub websocket_idle_secs: u64,
 
+    /// Hard cap on a streamed application response body.
+    #[serde(default = "Limits::default_max_response_bytes")]
+    pub max_response_bytes: usize,
+
     /// Buffer an upstream response up to this many bytes before sending it,
     /// so a slow client does not hold the upstream connection. Zero streams
     /// straight through.
@@ -147,6 +151,7 @@ impl Default for Limits {
             upstream_body_timeout_secs: Self::default_body_timeout_secs(),
             websocket_idle_secs: Self::default_websocket_idle_secs(),
             response_buffer_bytes: 0,
+            max_response_bytes: Self::default_max_response_bytes(),
         }
     }
 }
@@ -178,6 +183,10 @@ impl Limits {
 
     fn default_websocket_idle_secs() -> u64 {
         3600
+    }
+
+    fn default_max_response_bytes() -> usize {
+        64 * 1024 * 1024
     }
 }
 
@@ -442,6 +451,11 @@ pub struct Route {
     #[serde(default)]
     pub module: Option<PathBuf>,
 
+    /// Concurrent FastCGI/CGI/module requests allowed for this route. Defaults
+    /// to 16 for application targets and is ignored for static/proxy routes.
+    #[serde(default)]
+    pub max_concurrent: Option<usize>,
+
     /// Files tried for a directory request, in order.
     #[serde(default = "Route::default_index")]
     pub index: Vec<String>,
@@ -602,6 +616,11 @@ pub struct Tls {
     /// Lowest TLS version offered to clients.
     #[serde(default)]
     pub min_version: TlsVersion,
+
+    /// DER OCSP response to staple for the default certificate. It is read
+    /// on startup and on SIGHUP, so an external renewal hook can replace it.
+    #[serde(default)]
+    pub ocsp: Option<PathBuf>,
 
     /// Additional certificates selected by SNI. The `cert`/`key` pair above
     /// stays the default when no name matches.
@@ -1065,6 +1084,14 @@ impl Config {
                 _ => {}
             }
 
+            if tls
+                .ocsp
+                .as_ref()
+                .is_some_and(|path| path.as_os_str().is_empty())
+            {
+                return Err(Error::EmptyOcspPath);
+            }
+
             let has_default = has_cert && has_key;
             if tls.certificates.is_empty() && !has_default {
                 return Err(Error::TlsMissingCert);
@@ -1194,6 +1221,9 @@ impl Config {
                 if module.as_os_str().is_empty() || !module.is_absolute() {
                     return Err(Error::BadModulePath { index });
                 }
+            }
+            if route.max_concurrent == Some(0) {
+                return Err(Error::BadConcurrency { index });
             }
 
             if let Some(path) = &route.path {
@@ -1455,6 +1485,9 @@ pub enum Error {
     #[error("tls.client_ca is required unless tls.client_auth = \"off\"")]
     TlsClientCaRequired,
 
+    #[error("tls.ocsp must not be empty")]
+    EmptyOcspPath,
+
     #[error("tls.client_ca must not be empty")]
     TlsClientCaEmpty,
 
@@ -1544,6 +1577,9 @@ pub enum Error {
 
     #[error("route {index}: module must be an absolute path")]
     BadModulePath { index: usize },
+
+    #[error("route {index}: max_concurrent must be greater than zero")]
+    BadConcurrency { index: usize },
 
     #[error("route {index}: `autoindex` needs a root")]
     AutoindexWithoutRoot { index: usize },
@@ -2629,5 +2665,25 @@ upstream = "app"
             Err(Error::BadInclude { .. })
         ));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parses_ocsp_and_app_concurrency() {
+        let text = r#"
+listen = "127.0.0.1:8443"
+
+[tls]
+cert = "/tmp/cert.pem"
+key = "/tmp/key.pem"
+ocsp = "/tmp/ocsp.der"
+
+[[routes]]
+host = "*"
+cgi_pass = "/srv/cgi/app"
+max_concurrent = 4
+"#;
+        let cfg = Config::parse(text).expect("valid config");
+        assert_eq!(cfg.routes[0].max_concurrent, Some(4));
+        assert!(cfg.tls.expect("tls").ocsp.is_some());
     }
 }

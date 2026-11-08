@@ -11,11 +11,14 @@ fn free_port() -> u16 {
 }
 
 fn get(port: u16) -> Option<String> {
+    get_path(port, "/")
+}
+
+fn get_path(port: u16, path: &str) -> Option<String> {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
-    stream
-        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-        .ok()?;
+    let request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).ok()?;
     let mut response = Vec::new();
     let mut chunk = [0u8; 1024];
     loop {
@@ -92,6 +95,7 @@ fn a_killed_worker_is_restarted() {
     std::fs::create_dir_all(&dir).expect("temp dir");
     let config = dir.join("elira.toml");
     let port = free_port();
+    let metrics_port = free_port();
     std::fs::write(dir.join("index.html"), "respawn").expect("index");
     std::fs::write(
         &config,
@@ -101,11 +105,15 @@ listen = "127.0.0.1:{port}"
 reuse_port = true
 workers = 2
 
+[metrics]
+listen = "127.0.0.1:{metrics_port}"
+
 [[routes]]
 host = "*"
 root = "{root}"
 "#,
-            root = dir.display()
+            root = dir.display(),
+            metrics_port = metrics_port
         ),
     )
     .expect("config");
@@ -165,6 +173,16 @@ root = "{root}"
         std::thread::sleep(Duration::from_millis(100));
     }
     assert!(recovered, "supervisor did not replace the dead worker");
+
+    // Give the workers one interval to report their counters.
+    std::thread::sleep(Duration::from_millis(1500));
+    let metrics = get_path(metrics_port, "/metrics").expect("aggregate metrics");
+    assert!(
+        metrics.contains("elira_requests_total"),
+        "aggregate metrics missing counters: {metrics}"
+    );
+    let status = get_path(metrics_port, "/status").expect("aggregate status");
+    assert!(status.contains("\"workers\":2"), "{status}");
 
     let _ = Command::new("kill")
         .args(["-TERM", &child.id().to_string()])
