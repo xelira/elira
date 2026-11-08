@@ -1249,10 +1249,27 @@ impl Proxy {
 
         // Everything below is set by us. A client that sent its own copies
         // had them dropped above.
+        let forwarded_port = forward_host
+            .rsplit_once(':')
+            .and_then(|(_, port)| port.parse::<u16>().ok())
+            .unwrap_or(if scheme == "https" { 443 } else { 80 });
+        let forwarded_for_value = match peer.ip() {
+            std::net::IpAddr::V6(ip) => format!("\"[{ip}]\""),
+            std::net::IpAddr::V4(ip) => ip.to_string(),
+        };
+        let forwarded = format!("for={forwarded_for_value};proto={scheme};host=\"{forward_host}\"");
         template.insert(HOST, header(&forward_host));
         template.insert("x-forwarded-for", header(&forwarded_for));
         template.insert("x-forwarded-proto", HeaderValue::from_static(scheme));
         template.insert("x-forwarded-host", header(&forward_host));
+        template.insert(
+            "x-forwarded-port",
+            HeaderValue::from_str(&forwarded_port.to_string())
+                .unwrap_or_else(|_| HeaderValue::from_static("80")),
+        );
+        if let Ok(value) = HeaderValue::from_str(&forwarded) {
+            template.insert("forwarded", value);
+        }
         template.insert("via", HeaderValue::from_static("1.1 elira"));
         if let Ok(value) = HeaderValue::from_str(&request_id) {
             template.insert("x-request-id", value);

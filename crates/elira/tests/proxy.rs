@@ -624,6 +624,11 @@ async fn trusted_proxies_extend_the_forwarded_chain() {
         response.contains("x-forwarded-for: 9.9.9.9, 127.0.0.1"),
         "{response}"
     );
+    assert!(
+        response.contains("forwarded: for=127.0.0.1;proto=http;host=\"example.com\""),
+        "{response}"
+    );
+    assert!(response.contains("x-forwarded-port: 80"), "{response}");
 }
 
 #[tokio::test]

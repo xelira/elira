@@ -204,8 +204,9 @@ Upstreams:
 - TCP and unix sockets in the same pool
 - TLS with a custom CA, explicit `insecure`, per-upstream SNI and HTTP/2
 - WebSocket and other `Upgrade` tunnelling, `CONNECT` with an explicit allowlist
-- `X-Forwarded-For` extended only for `trusted_proxies`; client-supplied
-  forwarding headers are dropped
+- RFC 7239 `Forwarded` plus `X-Forwarded-For/Proto/Host/Port`, with the
+  client-supplied copies dropped and the chain extended only for
+  `trusted_proxies`
 
 TLS:
 
