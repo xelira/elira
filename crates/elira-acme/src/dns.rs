@@ -54,6 +54,7 @@ pub async fn obtain(config: &AcmeConfig) -> anyhow::Result<(String, String)> {
         .new_order(&NewOrder::new(identifiers.as_slice()))
         .await?;
 
+    let mut records: Vec<(String, String, String, String)> = Vec::new();
     let mut authorizations = order.authorizations();
     while let Some(result) = authorizations.next().await {
         let mut authorization = result?;
@@ -70,7 +71,16 @@ pub async fn obtain(config: &AcmeConfig) -> anyhow::Result<(String, String)> {
         let base = identifier.trim_start_matches("*.");
         let txt_name = format!("_acme-challenge.{base}");
         let value = challenge.key_authorization().dns_value();
-        run_hook(config, &identifier, &txt_name, &challenge.token, &value)?;
+        run_hook(
+            config,
+            config.dns_hook.as_deref(),
+            &identifier,
+            &txt_name,
+            &challenge.token,
+            &value,
+            None,
+        )?;
+        records.push((identifier, txt_name, challenge.token.clone(), value));
         if config.dns_propagation_secs > 0 {
             tokio::time::sleep(Duration::from_secs(config.dns_propagation_secs)).await;
         }
@@ -83,33 +93,51 @@ pub async fn obtain(config: &AcmeConfig) -> anyhow::Result<(String, String)> {
     }
     let key_pem = order.finalize().await?;
     let cert_pem = order.poll_certificate(&RetryPolicy::default()).await?;
+
+    if let Some(cleanup) = &config.dns_cleanup_hook {
+        for (domain, txt_name, token, value) in &records {
+            let _ = run_hook(
+                config,
+                Some(cleanup),
+                domain,
+                txt_name,
+                token,
+                value,
+                Some("cleanup"),
+            );
+        }
+    }
+
     Ok((cert_pem, key_pem))
 }
 
 fn run_hook(
     config: &AcmeConfig,
+    hook: Option<&Path>,
     domain: &str,
     txt_name: &str,
     token: &str,
     value: &str,
+    action: Option<&str>,
 ) -> Result<(), ConfigError> {
-    let hook = config
-        .dns_hook
-        .as_ref()
-        .ok_or(ConfigError::DnsHookMissing)?;
-    let status = Command::new(hook)
+    let _ = config;
+    let hook = hook.ok_or(ConfigError::DnsHookMissing)?;
+    let mut command = Command::new(hook);
+    command
         .env("DOMAIN", domain)
         .env("TXT_NAME", txt_name)
         .env("TOKEN", token)
-        .env("VALUE", value)
-        .status()
-        .map_err(|source| ConfigError::DnsHook {
-            path: hook.clone(),
-            source,
-        })?;
+        .env("VALUE", value);
+    if let Some(action) = action {
+        command.env("ACTION", action);
+    }
+    let status = command.status().map_err(|source| ConfigError::DnsHook {
+        path: hook.to_path_buf(),
+        source,
+    })?;
     if !status.success() {
         return Err(ConfigError::DnsHookStatus {
-            path: hook.clone(),
+            path: hook.to_path_buf(),
             status: status.code(),
         });
     }
@@ -160,14 +188,17 @@ mod tests {
             production: false,
             challenge: Challenge::Dns01,
             dns_hook: Some(hook.clone()),
+            dns_cleanup_hook: None,
             dns_propagation_secs: 0,
         };
         run_hook(
             &config,
+            config.dns_hook.as_deref(),
             "*.example.com",
             "_acme-challenge.example.com",
             "token",
             "value",
+            None,
         )
         .expect("hook");
         assert_eq!(

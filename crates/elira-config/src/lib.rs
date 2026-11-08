@@ -391,6 +391,11 @@ pub struct Acme {
     #[serde(default)]
     pub dns_hook: Option<PathBuf>,
 
+    /// Optional command that removes the TXT record after validation. It gets
+    /// the same environment plus ACTION=cleanup.
+    #[serde(default)]
+    pub dns_cleanup_hook: Option<PathBuf>,
+
     /// Seconds to wait after the hook before asking the CA to validate.
     #[serde(default = "Acme::default_dns_propagation_secs")]
     pub dns_propagation_secs: u64,
@@ -1699,6 +1704,9 @@ pub enum Error {
 
     #[error("acme DNS-01 needs a non-empty acme.dns_hook")]
     DnsHookRequired,
+
+    #[error("acme.dns_cleanup_hook must not be empty")]
+    EmptyDnsCleanupHook,
 
     #[error("acme.cache_dir must not be empty")]
     AcmeNoCacheDir,

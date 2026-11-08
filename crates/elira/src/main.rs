@@ -167,6 +167,7 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
                 elira::config::AcmeChallenge::Dns01 => elira_acme::Challenge::Dns01,
             },
             dns_hook: acme.dns_hook.clone(),
+            dns_cleanup_hook: acme.dns_cleanup_hook.clone(),
             dns_propagation_secs: acme.dns_propagation_secs,
         })
         .await?;
@@ -527,6 +528,9 @@ async fn supervise(config: PathBuf, workers: usize) -> anyhow::Result<()> {
     use tokio::sync::mpsc;
 
     let cfg = Config::load(&config)?;
+    if let Some(hook) = cfg.tls.as_ref().and_then(|tls| tls.ocsp_hook.as_ref()) {
+        run_ocsp_hook(hook).await;
+    }
     let (exit_tx, mut exit_rx) = mpsc::channel::<(usize, std::process::ExitStatus)>(64);
     let mut slots = Vec::with_capacity(workers);
 
@@ -565,9 +569,35 @@ async fn supervise(config: PathBuf, workers: usize) -> anyhow::Result<()> {
         std::env::set_var("ELIRA_METRICS_SOCKET", path);
     }
 
+    let pids: Arc<std::sync::Mutex<Vec<u32>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    if let Some(tls) = &cfg.tls {
+        if let (Some(hook), Some(_)) = (&tls.ocsp_hook, &tls.ocsp) {
+            let hook = hook.clone();
+            let pids = pids.clone();
+            let interval = tls.ocsp_refresh_secs;
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(interval)).await;
+                    run_ocsp_hook(&hook).await;
+                    let pids = pids
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone();
+                    for pid in pids {
+                        kill(pid, libc::SIGHUP);
+                    }
+                    tracing::info!("ocsp hook finished, reloading workers");
+                }
+            });
+        }
+    }
+
     for index in 0..workers {
         let slot = spawn_worker(index, &config)?;
         watch_worker(index, &slot, exit_tx.clone());
+        pids.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(slot.pid);
         slots.push(slot);
     }
 
@@ -599,6 +629,10 @@ async fn supervise(config: PathBuf, workers: usize) -> anyhow::Result<()> {
                             let index = slots.len();
                             let slot = spawn_worker(index, &config)?;
                             watch_worker(index, &slot, exit_tx.clone());
+                            pids
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .push(slot.pid);
                             slots.push(slot);
                             wait_worker_ready(&slots[index]).await?;
                             tracing::info!(worker = index, "added a worker on reload");
@@ -635,6 +669,14 @@ async fn supervise(config: PathBuf, workers: usize) -> anyhow::Result<()> {
                 }
                 let slot = spawn_worker(index, &config)?;
                 watch_worker(index, &slot, exit_tx.clone());
+                {
+                    let mut pids = pids
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if let Some(entry) = pids.get_mut(index) {
+                        *entry = slot.pid;
+                    }
+                }
                 slots[index] = slot;
                 wait_worker_ready(&slots[index]).await?;
             }

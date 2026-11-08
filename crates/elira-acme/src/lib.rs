@@ -40,6 +40,7 @@ pub struct AcmeConfig {
     pub challenge: Challenge,
     /// DNS-01 hook command. Required for [`Challenge::Dns01`].
     pub dns_hook: Option<PathBuf>,
+    pub dns_cleanup_hook: Option<PathBuf>,
     /// Wait after the hook before telling the CA to validate.
     pub dns_propagation_secs: u64,
 }
@@ -370,6 +371,7 @@ mod tests {
             production: false,
             challenge: Challenge::TlsAlpn01,
             dns_hook: None,
+            dns_cleanup_hook: None,
             dns_propagation_secs: 0,
         }
     }

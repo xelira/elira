@@ -15,16 +15,18 @@ Living list for the self-improvement loop. One item per session.
 
 ## S — correctness and availability
 
-- [ ] OCSP hook when `workers > 1`: run it in the supervisor and SIGHUP workers.
-- [ ] DNS-01 cleanup hook: remove the TXT record after validation.
+- [x] OCSP hook when `workers > 1`: run it in the supervisor and SIGHUP workers.
+- [x] DNS-01 cleanup hook: remove the TXT record after validation.
 - [ ] Worker exit during a streaming app response: ensure the client gets a
   clean error instead of a truncated chunked body.
+- [ ] Admin `/drain` in worker mode: parent stops workers in order.
 
 ## A — security and operations
 
 - [ ] Reject module files owned by a user other than the server user when
   sandboxing is off.
 - [ ] Per-route `max_response_bytes`.
+- [ ] Per-route FastCGI pool size.
 - [ ] Configurable FastCGI pool size per upstream instead of a global limit.
 - [ ] `/status` per-worker snapshots instead of the last worker's snapshot.
 

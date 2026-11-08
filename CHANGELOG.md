@@ -95,6 +95,8 @@
   обновление раз в 12 часов.
 - `ocsp_hook` с периодическим обновлением OCSP-файла и reload.
 - `module_sandbox`: изоляция `.so` в дочернем процессе через JSON-протокол.
+- `dns_cleanup_hook` для удаления TXT после DNS-01 и OCSP hook в режиме
+  воркеров.
 - `elira migrate` переносит `try_files`, `add_header`, `allow`/`deny`,
   `auth_basic_user_file`, `client_max_body_size`, `gzip`, TLS и regex-location.
 - FastCGI-бэкенды по TCP и unix-сокетам, CGI-скрипты и нативные
