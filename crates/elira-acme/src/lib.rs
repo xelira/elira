@@ -15,7 +15,7 @@ use std::sync::Arc;
 use futures_util::StreamExt;
 use rustls::ServerConfig;
 use rustls_acme::caches::DirCache;
-use rustls_acme::{AcmeAcceptor, UseChallenge};
+use rustls_acme::{AcmeAcceptor, ResolvesServerCertAcme, UseChallenge};
 use thiserror::Error;
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
@@ -35,6 +35,14 @@ pub struct AcmeConfig {
     /// `false` selects the staging directory, which avoids production rate
     /// limits during development.
     pub production: bool,
+    pub challenge: Challenge,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Challenge {
+    #[default]
+    TlsAlpn01,
+    Http01,
 }
 
 #[derive(Debug, Error)]
@@ -147,6 +155,8 @@ fn is_valid_contact(contact: &str) -> bool {
 pub struct Acme {
     acceptor: AcmeAcceptor,
     server_config: Arc<ServerConfig>,
+    resolver: Arc<ResolvesServerCertAcme>,
+    http01: bool,
     renewal: JoinHandle<()>,
 }
 
@@ -154,12 +164,17 @@ impl Acme {
     pub async fn start(config: AcmeConfig) -> anyhow::Result<Self> {
         config.prepare()?;
 
+        let challenge = match config.challenge {
+            Challenge::TlsAlpn01 => UseChallenge::TlsAlpn01,
+            Challenge::Http01 => UseChallenge::Http01,
+        };
         let mut state = rustls_acme::AcmeConfig::new(config.domains.iter())
             .contact(config.contacts.iter())
             .directory_lets_encrypt(config.production)
-            .challenge_type(UseChallenge::TlsAlpn01)
+            .challenge_type(challenge)
             .cache(DirCache::new(config.cache_dir.clone()))
             .state();
+        let resolver = state.resolver();
 
         // The low-level acceptor is the only public way to drive a single
         // connection. Its constructor is crate-private and this accessor is
@@ -174,7 +189,7 @@ impl Acme {
         .with_safe_default_protocol_versions()
         .expect("aws-lc-rs provides TLS 1.2 and 1.3")
         .with_no_client_auth()
-        .with_cert_resolver(state.resolver());
+        .with_cert_resolver(resolver.clone());
         server_config.alpn_protocols = ALPN_PROTOCOLS.iter().map(|p| p.to_vec()).collect();
 
         // The stream never ends, but it must be polled continuously: that is
@@ -191,6 +206,8 @@ impl Acme {
         Ok(Self {
             acceptor,
             server_config: Arc::new(server_config),
+            resolver,
+            http01: config.challenge == Challenge::Http01,
             renewal,
         })
     }
@@ -200,6 +217,18 @@ impl Acme {
     /// A TLS-ALPN-01 validation connection completes with no application
     /// stream; it is reported as [`io::ErrorKind::ConnectionAborted`] so the
     /// caller can drop it without serving a request.
+    /// The key authorization for an HTTP-01 token, when that challenge type
+    /// is active and the token is current.
+    pub fn http01(&self, token: &str) -> Option<String> {
+        self.resolver.get_http_01_key_auth(token)
+    }
+
+    /// Whether this manager uses HTTP-01, which means the main listener is
+    /// plain HTTP rather than TLS.
+    pub fn uses_http01(&self) -> bool {
+        self.http01
+    }
+
     pub async fn accept(&self, stream: TcpStream) -> io::Result<(Box<dyn AsyncStream>, bool)> {
         let stream = stream.compat();
 
@@ -270,6 +299,7 @@ mod tests {
             contacts: vec!["mailto:admin@example.com".into()],
             cache_dir: dir.join("cache"),
             production: false,
+            challenge: Challenge::TlsAlpn01,
         }
     }
 

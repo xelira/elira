@@ -7,9 +7,9 @@
 //! everything else is left in the socket for hyper. `peek` does not consume,
 //! so falling back costs nothing.
 //!
-//! Range and conditional requests deliberately take the slow path: hyper
-//! already implements them correctly, and duplicating that here would be a
-//! second place to get them wrong.
+//! Single ranges and conditional requests are answered here too: the file is
+//! already open and the validators are cheap. Multi-range requests still take
+//! the normal path because that answer needs a multipart body.
 
 use std::io;
 use std::net::SocketAddr;
@@ -79,8 +79,8 @@ pub(crate) async fn try_serve(
         match name.as_str() {
             "host" => host = Some(value.to_owned()),
             "user-agent" => user_agent = Some(value.to_owned()),
-            // Let hyper answer the harder cases.
-            "range" | "if-none-match" | "if-modified-since" | "upgrade" => return None,
+            // Multi-range and upgrade need hyper.
+            "upgrade" => return None,
             _ => {}
         }
     }
@@ -89,7 +89,11 @@ pub(crate) async fn try_serve(
     let path_only = path.split('?').next().unwrap_or(path);
 
     let current = runtime.load_full();
-    let file = current.proxy().static_file(&host, path_only).await?;
+    let fast = current
+        .proxy()
+        .fast_static(&host, path_only, peer.ip(), &request_headers)
+        .await?;
+    let file = fast.file;
     let meta = tokio::fs::metadata(&file).await.ok()?;
     if !meta.is_file() {
         return None;
@@ -120,6 +124,39 @@ pub(crate) async fn try_serve(
         return None;
     }
 
+    let len = meta.len();
+    let modified = meta.modified().ok();
+    let etag = crate::proxy::files::etag(len, modified);
+
+    let not_modified = request_headers
+        .get(http::header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| etag_matches(value, &etag))
+        .or_else(|| {
+            request_headers
+                .get(http::header::IF_MODIFIED_SINCE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| httpdate::parse_http_date(value).ok())
+                .map(|since| modified.map(|modified| modified <= since).unwrap_or(false))
+        })
+        .unwrap_or(false);
+
+    let range = if not_modified {
+        None
+    } else {
+        match request_headers
+            .get(http::header::RANGE)
+            .and_then(|value| value.to_str().ok())
+        {
+            Some(value) => match parse_range(value, len) {
+                Some(range) => Some(range),
+                // Multiple ranges need a multipart body; let hyper do it.
+                None => return None,
+            },
+            None => None,
+        }
+    };
+
     // From here on the connection is ours: consume the header and answer.
     metrics.connection_started();
     let mut discard = vec![0u8; end];
@@ -127,19 +164,72 @@ pub(crate) async fn try_serve(
         return Some(());
     }
 
-    let len = meta.len();
-    let modified = meta.modified().ok();
-    let etag = crate::proxy::files::etag(len, modified);
+    let id = request_id();
+    let status = if not_modified {
+        http::StatusCode::NOT_MODIFIED
+    } else if range.is_some() {
+        http::StatusCode::PARTIAL_CONTENT
+    } else {
+        http::StatusCode::OK
+    };
+    let (offset, body_len) = match range {
+        Some((start, end)) => (start, end - start + 1),
+        None => (0, len),
+    };
+
+    let mut headers: Vec<(String, String)> = vec![
+        ("content-type".to_owned(), content_type.to_owned()),
+        ("accept-ranges".to_owned(), "bytes".to_owned()),
+        ("etag".to_owned(), etag),
+        ("x-content-type-options".to_owned(), "nosniff".to_owned()),
+        ("x-request-id".to_owned(), id.clone()),
+    ];
+    if not_modified || range.is_some() {
+        // A 304 has no body; a 206 still states the selected length.
+    }
+    if !not_modified {
+        headers.push(("content-length".to_owned(), body_len.to_string()));
+    }
+    if let Some((start, end)) = range {
+        headers.push((
+            "content-range".to_owned(),
+            format!("bytes {start}-{end}/{len}"),
+        ));
+    }
+    if let Some(modified) = modified {
+        headers.push((
+            "last-modified".to_owned(),
+            httpdate::fmt_http_date(modified),
+        ));
+    }
+    if fast.server_header {
+        headers.push(("server".to_owned(), "elira".to_owned()));
+    }
+    if let Some(alt) = &fast.alt_svc {
+        if let Ok(value) = alt.to_str() {
+            headers.push(("alt-svc".to_owned(), value.to_owned()));
+        }
+    }
+    for name in &fast.remove_headers {
+        headers.retain(|(known, _)| known != name.as_str());
+    }
+    for (name, value) in &fast.add_headers {
+        if let Ok(value) = value.to_str() {
+            headers.retain(|(known, _)| known != name.as_str());
+            headers.push((name.as_str().to_owned(), value.to_owned()));
+        }
+    }
 
     let mut response = format!(
-        "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {len}\r\n\
-         etag: {etag}\r\n"
+        "HTTP/1.1 {} {}\r\n",
+        status.as_u16(),
+        status.canonical_reason().unwrap_or("")
     );
-    if let Some(modified) = modified {
-        response.push_str(&format!(
-            "last-modified: {}\r\n",
-            httpdate::fmt_http_date(modified)
-        ));
+    for (name, value) in &headers {
+        response.push_str(name);
+        response.push_str(": ");
+        response.push_str(value);
+        response.push_str("\r\n");
     }
     response.push_str("connection: close\r\n\r\n");
 
@@ -147,12 +237,12 @@ pub(crate) async fn try_serve(
         return Some(());
     }
 
-    if method == "GET" && len > 0 {
+    if method == "GET" && !not_modified && body_len > 0 {
         let file = match std::fs::File::open(&file) {
             Ok(file) => file,
             Err(_) => return Some(()),
         };
-        let _ = send_file(stream, file, len).await;
+        let _ = send_file(stream, file, offset, body_len).await;
     }
 
     let entry = Entry {
@@ -161,14 +251,18 @@ pub(crate) async fn try_serve(
         version: http::Version::HTTP_11,
         host,
         path: path.to_owned(),
-        status: http::StatusCode::OK,
-        bytes: if method == "HEAD" { 0 } else { len },
+        status,
+        bytes: if method == "HEAD" || not_modified {
+            0
+        } else {
+            body_len
+        },
         duration: started.elapsed(),
         user_agent,
-        request_id: request_id(),
+        request_id: id,
     };
 
-    metrics.observe(http::StatusCode::OK.as_u16(), started.elapsed());
+    metrics.observe(status.as_u16(), started.elapsed());
     metrics.connection_finished();
 
     current.write_log(&entry);
@@ -176,8 +270,54 @@ pub(crate) async fn try_serve(
     Some(())
 }
 
+fn etag_matches(header: &str, etag: &str) -> bool {
+    header.split(',').any(|candidate| {
+        let candidate = candidate.trim();
+        candidate == "*"
+            || candidate == etag
+            || candidate
+                .strip_prefix("W/")
+                .map(|value| value == etag)
+                .unwrap_or(false)
+    })
+}
+
+/// One satisfiable byte range. `None` covers multiple ranges and malformed
+/// values, which the normal path answers correctly.
+fn parse_range(value: &str, len: u64) -> Option<(u64, u64)> {
+    let value = value.strip_prefix("bytes=")?;
+    if value.contains(',') {
+        return None;
+    }
+    let (start, end) = value.split_once('-')?;
+    let (start, end) = if start.is_empty() {
+        let suffix: u64 = end.parse().ok()?;
+        if suffix == 0 {
+            return None;
+        }
+        (len.checked_sub(suffix)?, len.checked_sub(1)?)
+    } else {
+        let start: u64 = start.parse().ok()?;
+        let end = if end.is_empty() {
+            len.checked_sub(1)?
+        } else {
+            end.parse().ok()?
+        };
+        (start, end)
+    };
+    if start > end || end >= len {
+        return None;
+    }
+    Some((start, end))
+}
+
 #[cfg(target_os = "linux")]
-async fn send_file(stream: &TcpStream, file: std::fs::File, len: u64) -> io::Result<()> {
+async fn send_file(
+    stream: &TcpStream,
+    file: std::fs::File,
+    offset: u64,
+    len: u64,
+) -> io::Result<()> {
     let input = file.as_raw_fd();
     // `AsyncFd` wants to own the descriptor. Duplicate it so the socket is
     // closed once, by the original `TcpStream`.
@@ -191,7 +331,7 @@ async fn send_file(stream: &TcpStream, file: std::fs::File, len: u64) -> io::Res
     let async_fd = unsafe { tokio::io::unix::AsyncFd::register(OwnedFd(duplicate)) }
         .map_err(|err| io::Error::other(err.to_string()))?;
 
-    let mut offset: i64 = 0;
+    let mut offset: i64 = offset as i64;
     let mut remaining = len;
 
     while remaining > 0 {
@@ -240,6 +380,11 @@ impl Drop for OwnedFd {
 }
 
 #[cfg(not(target_os = "linux"))]
-async fn send_file(_stream: &TcpStream, _file: std::fs::File, _len: u64) -> io::Result<()> {
+async fn send_file(
+    _stream: &TcpStream,
+    _file: std::fs::File,
+    _offset: u64,
+    _len: u64,
+) -> io::Result<()> {
     Err(io::Error::other("sendfile is only implemented on Linux"))
 }

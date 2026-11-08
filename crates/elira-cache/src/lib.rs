@@ -15,11 +15,12 @@
 //! released.
 
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use http::header::{
     AUTHORIZATION, CACHE_CONTROL, CONNECTION, CONTENT_LENGTH, COOKIE, SET_COOKIE, VARY,
@@ -76,7 +77,11 @@ impl Entry {
 /// memory budget reflects what is really resident.
 enum Location {
     Memory,
-    Disk(PathBuf),
+    Disk {
+        path: PathBuf,
+        offset: u64,
+        len: usize,
+    },
 }
 
 struct Record {
@@ -91,7 +96,7 @@ struct Record {
 
 impl Record {
     fn drop_body(&self) {
-        if let Location::Disk(path) = &self.location {
+        if let Location::Disk { path, .. } = &self.location {
             let _ = fs::remove_file(path);
         }
     }
@@ -177,20 +182,49 @@ impl Cache {
         disk: Option<PathBuf>,
         stale: Duration,
     ) -> Self {
-        if let Some(dir) = &disk {
-            clean_dir(dir);
-        }
-        Self {
+        let (entries, total_bytes, next_seq) = match &disk {
+            Some(dir) => load_dir(dir, stale),
+            None => (HashMap::new(), 0, 0),
+        };
+        let cache = Self {
             max_bytes,
             default_ttl,
             stale,
             disk,
             files: AtomicU64::new(0),
             store: Mutex::new(Store {
-                entries: HashMap::new(),
-                total_bytes: 0,
-                next_seq: 0,
+                entries,
+                total_bytes,
+                next_seq,
             }),
+        };
+        cache.trim_to_budget();
+        cache
+    }
+
+    fn trim_to_budget(&self) {
+        if self.max_bytes == 0 {
+            return;
+        }
+        let mut store = self.lock();
+        while store.total_bytes > self.max_bytes {
+            let Some((key, index)) = store.oldest() else {
+                break;
+            };
+            let victim = match store.entries.get_mut(&key) {
+                Some(records) if index < records.len() => records.remove(index),
+                _ => break,
+            };
+            victim.drop_body();
+            store.total_bytes = store.total_bytes.saturating_sub(victim.size);
+            if store
+                .entries
+                .get(&key)
+                .map(|records| records.is_empty())
+                .unwrap_or(false)
+            {
+                store.entries.remove(&key);
+            }
         }
     }
 
@@ -240,7 +274,7 @@ impl Cache {
             let mut entry = record.entry.clone();
             match &record.location {
                 Location::Memory => Some((entry, stale)),
-                Location::Disk(path) => match fs::read(path) {
+                Location::Disk { path, offset, len } => match read_at(path, *offset, *len) {
                     Ok(body) => {
                         entry.body = body;
                         Some((entry, stale))
@@ -317,12 +351,29 @@ impl Cache {
         let location = match &self.disk {
             Some(dir) => {
                 let index = self.files.fetch_add(1, Ordering::Relaxed);
-                let path = dir.join(format!("elira-cache-{}-{index}.body", std::process::id()));
-                if fs::write(&path, &entry.body).is_err() {
+                let stamp = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|delta| delta.as_nanos())
+                    .unwrap_or(0);
+                let path = dir.join(format!(
+                    "elira-cache-{}-{index}-{stamp}.entry",
+                    std::process::id()
+                ));
+                let encoded = match encode(key, &entry, &entry.body) {
+                    Some(encoded) => encoded,
+                    None => return false,
+                };
+                let offset = (encoded.len() - entry.body.len()) as u64;
+                let len = entry.body.len();
+                // Write to a temporary name first so a crash never leaves a
+                // half-written entry that looks valid.
+                let temp = path.with_extension("tmp");
+                if fs::write(&temp, &encoded).is_err() || fs::rename(&temp, &path).is_err() {
+                    let _ = fs::remove_file(&temp);
                     return false;
                 }
                 entry.body.clear();
-                Location::Disk(path)
+                Location::Disk { path, offset, len }
             }
             None => Location::Memory,
         };
@@ -344,7 +395,7 @@ impl Cache {
 
         while store.total_bytes.saturating_add(size) > self.max_bytes {
             let Some((key, index)) = store.oldest() else {
-                if let Location::Disk(path) = &location {
+                if let Location::Disk { path, .. } = &location {
                     let _ = fs::remove_file(path);
                 }
                 return false;
@@ -425,20 +476,200 @@ impl std::fmt::Debug for Cache {
     }
 }
 
-fn clean_dir(dir: &Path) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        let _ = fs::create_dir_all(dir);
-        return;
+fn load_dir(dir: &Path, stale: Duration) -> (HashMap<String, Vec<Record>>, usize, u64) {
+    let _ = fs::create_dir_all(dir);
+    let Ok(files) = fs::read_dir(dir) else {
+        return (HashMap::new(), 0, 0);
     };
-    for entry in entries.flatten() {
-        if entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with("elira-cache-")
-        {
-            let _ = fs::remove_file(entry.path());
+
+    let now_instant = Instant::now();
+    let now_system = SystemTime::now();
+    let mut entries: HashMap<String, Vec<Record>> = HashMap::new();
+    let mut total = 0;
+    let mut seq = 0;
+
+    for file in files.flatten() {
+        let path = file.path();
+        let name = file.file_name();
+        let name = name.to_string_lossy();
+        if name.ends_with(".tmp") {
+            let _ = fs::remove_file(&path);
+            continue;
+        }
+        if !name.starts_with("elira-cache-") {
+            continue;
+        }
+        if !name.ends_with(".entry") {
+            // Leftover body files from the older format or a failed write.
+            let _ = fs::remove_file(&path);
+            continue;
+        }
+
+        let Ok(data) = fs::read(&path) else {
+            continue;
+        };
+        let Some((key, mut entry, inserted_ms, body_len)) = decode(&data) else {
+            let _ = fs::remove_file(&path);
+            continue;
+        };
+
+        let inserted = UNIX_EPOCH + Duration::from_millis(inserted_ms);
+        let age = now_system.duration_since(inserted).unwrap_or_default();
+        if age >= entry.ttl + stale {
+            let _ = fs::remove_file(&path);
+            continue;
+        }
+        entry.stored_at = now_instant.checked_sub(age).unwrap_or(now_instant);
+        entry.body.clear();
+
+        let offset = (data.len() - body_len) as u64;
+        total += body_len;
+        entries.entry(key).or_default().push(Record {
+            entry,
+            location: Location::Disk {
+                path,
+                offset,
+                len: body_len,
+            },
+            size: body_len,
+            seq,
+        });
+        seq += 1;
+    }
+
+    (entries, total, seq)
+}
+
+fn encode(key: &str, entry: &Entry, body: &[u8]) -> Option<Vec<u8>> {
+    if body.len() > u32::MAX as usize {
+        return None;
+    }
+    let mut out = Vec::with_capacity(body.len() + 256);
+    out.extend_from_slice(b"ELIRA1\n");
+    put_bytes(&mut out, key.as_bytes());
+
+    put_u32(&mut out, entry.vary.len() as u32);
+    for (name, value) in &entry.vary {
+        put_bytes(&mut out, name.as_str().as_bytes());
+        match value {
+            Some(value) => {
+                out.push(1);
+                put_bytes(&mut out, value);
+            }
+            None => out.push(0),
         }
     }
+
+    put_u32(&mut out, entry.status as u32);
+    put_u32(&mut out, entry.headers.len() as u32);
+    for (name, value) in &entry.headers {
+        put_bytes(&mut out, name.as_bytes());
+        put_bytes(&mut out, value.as_bytes());
+    }
+
+    let inserted = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|delta| delta.as_millis() as u64)
+        .unwrap_or(0);
+    put_u64(&mut out, inserted);
+    put_u64(&mut out, entry.ttl.as_millis() as u64);
+    put_u32(&mut out, body.len() as u32);
+    out.extend_from_slice(body);
+    Some(out)
+}
+
+fn decode(data: &[u8]) -> Option<(String, Entry, u64, usize)> {
+    if !data.starts_with(b"ELIRA1\n") {
+        return None;
+    }
+    let mut pos = 7;
+
+    let key = String::from_utf8(take_bytes(data, &mut pos)?.to_vec()).ok()?;
+
+    let vary_count = take_u32(data, &mut pos)? as usize;
+    let mut vary = Vec::with_capacity(vary_count);
+    for _ in 0..vary_count {
+        let name = std::str::from_utf8(take_bytes(data, &mut pos)?).ok()?;
+        let name = HeaderName::from_bytes(name.as_bytes()).ok()?;
+        let present = *data.get(pos)?;
+        pos += 1;
+        let value = if present == 1 {
+            Some(take_bytes(data, &mut pos)?.to_vec())
+        } else {
+            None
+        };
+        vary.push((name, value));
+    }
+
+    let status = take_u32(data, &mut pos)? as u16;
+    let header_count = take_u32(data, &mut pos)? as usize;
+    let mut headers = Vec::with_capacity(header_count);
+    for _ in 0..header_count {
+        let name = String::from_utf8(take_bytes(data, &mut pos)?.to_vec()).ok()?;
+        let value = String::from_utf8(take_bytes(data, &mut pos)?.to_vec()).ok()?;
+        headers.push((name, value));
+    }
+
+    let inserted = take_u64(data, &mut pos)?;
+    let ttl = Duration::from_millis(take_u64(data, &mut pos)?);
+    let body_len = take_u32(data, &mut pos)? as usize;
+    if data.len() - pos != body_len {
+        return None;
+    }
+
+    Some((
+        key,
+        Entry {
+            status,
+            headers,
+            body: Vec::new(),
+            stored_at: Instant::now(),
+            ttl,
+            vary,
+        },
+        inserted,
+        body_len,
+    ))
+}
+
+fn read_at(path: &Path, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(offset))?;
+    let mut body = vec![0u8; len];
+    file.read_exact(&mut body)?;
+    Ok(body)
+}
+
+fn put_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_be_bytes());
+}
+
+fn put_u64(out: &mut Vec<u8>, value: u64) {
+    out.extend_from_slice(&value.to_be_bytes());
+}
+
+fn put_bytes(out: &mut Vec<u8>, value: &[u8]) {
+    put_u32(out, value.len() as u32);
+    out.extend_from_slice(value);
+}
+
+fn take_u32(data: &[u8], pos: &mut usize) -> Option<u32> {
+    let bytes = data.get(*pos..*pos + 4)?;
+    *pos += 4;
+    Some(u32::from_be_bytes(bytes.try_into().ok()?))
+}
+
+fn take_u64(data: &[u8], pos: &mut usize) -> Option<u64> {
+    let bytes = data.get(*pos..*pos + 8)?;
+    *pos += 8;
+    Some(u64::from_be_bytes(bytes.try_into().ok()?))
+}
+
+fn take_bytes<'a>(data: &'a [u8], pos: &mut usize) -> Option<&'a [u8]> {
+    let len = take_u32(data, pos)? as usize;
+    let bytes = data.get(*pos..*pos + len)?;
+    *pos += len;
+    Some(bytes)
 }
 
 /// Requests carrying credentials cannot share a cache entry with anyone. The
@@ -1333,5 +1564,46 @@ mod tests {
         assert!(cache
             .get_stale("example.com/", &request, after_window)
             .is_none());
+    }
+
+    #[test]
+    fn disk_entries_survive_a_restart() {
+        let dir = temp_dir("persist");
+        let request = HeaderMap::new();
+        let mut response = HeaderMap::new();
+        response.insert("vary", "accept-language".parse().unwrap());
+        let now = Instant::now();
+
+        {
+            let cache = Cache::with_disk(
+                1024,
+                Duration::from_secs(60),
+                Some(dir.clone()),
+                Duration::ZERO,
+            );
+            assert!(cache.insert(
+                "example.com/page",
+                &request,
+                &response,
+                200,
+                b"persisted".to_vec(),
+                now,
+            ));
+        }
+
+        let reopened = Cache::with_disk(
+            1024,
+            Duration::from_secs(60),
+            Some(dir.clone()),
+            Duration::ZERO,
+        );
+        assert_eq!(
+            reopened
+                .get("example.com/page", &request, Instant::now())
+                .map(|entry| entry.body),
+            Some(b"persisted".to_vec())
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -1190,6 +1190,7 @@ async fn sendfile_serves_a_plain_static_get() {
     let config = format!(
         r#"
 listen = "127.0.0.1:0"
+server_header = false
 
 [[routes]]
 host = "*"

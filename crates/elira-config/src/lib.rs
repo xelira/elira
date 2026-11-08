@@ -336,6 +336,25 @@ pub struct Acme {
     pub cache_dir: PathBuf,
     #[serde(default)]
     pub production: bool,
+
+    /// TLS-ALPN-01 is the default and needs port 443. HTTP-01 needs a plain
+    /// HTTP listener on port 80 instead.
+    #[serde(default)]
+    pub challenge: AcmeChallenge,
+
+    /// Dedicated plain HTTP listener for HTTP-01 tokens. Required when the
+    /// main listener is TLS or not on port 80.
+    #[serde(default)]
+    pub http01_listen: Option<SocketAddr>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcmeChallenge {
+    #[default]
+    TlsAlpn01,
+    #[serde(rename = "http_01")]
+    Http01,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -716,6 +735,12 @@ impl Config {
             if acme.cache_dir.as_os_str().is_empty() {
                 return Err(Error::AcmeNoCacheDir);
             }
+            if acme.challenge == AcmeChallenge::Http01
+                && acme.http01_listen.is_none()
+                && self.listen.port() != 80
+            {
+                return Err(Error::Http01NeedsListener);
+            }
         }
 
         if let Some(dir) = &self.cache.dir {
@@ -734,13 +759,6 @@ impl Config {
         }
 
         if let Some(http3) = &self.http3 {
-            // QUIC cannot consume a PROXY header without a custom UDP socket
-            // and a way to keep the real client separate from the transport
-            // peer. Refuse a public QUIC listener when PROXY is required,
-            // otherwise clients could bypass the header entirely.
-            if self.proxy_protocol && !http3.listen.ip().is_loopback() {
-                return Err(Error::Http3ProxyProtocolUnsupported);
-            }
             if http3.cert.as_os_str().is_empty() {
                 return Err(Error::Http3MissingCert);
             }
@@ -1103,9 +1121,6 @@ pub enum Error {
     #[error("health.timeout_secs must be greater than zero")]
     BadHealthTimeout,
 
-    #[error("http3 on a non-loopback address cannot be combined with proxy_protocol")]
-    Http3ProxyProtocolUnsupported,
-
     #[error("http3.cert must not be empty")]
     Http3MissingCert,
 
@@ -1228,6 +1243,9 @@ pub enum Error {
 
     #[error("acme.contacts must not be empty")]
     AcmeNoContacts,
+
+    #[error("acme HTTP-01 needs a listener on port 80 or acme.http01_listen")]
+    Http01NeedsListener,
 
     #[error("acme.cache_dir must not be empty")]
     AcmeNoCacheDir,
@@ -2080,15 +2098,15 @@ upstream = "app"
     }
 
     #[test]
-    fn rejects_public_http3_when_proxy_protocol_is_required() {
+    fn http01_needs_a_port_80_listener() {
         let text = r#"
-listen = "127.0.0.1:8080"
-proxy_protocol = true
+listen = "127.0.0.1:8443"
 
-[http3]
-listen = "0.0.0.0:443"
-cert = "/tmp/cert.pem"
-key = "/tmp/key.pem"
+[acme]
+domains = ["example.com"]
+contacts = ["mailto:admin@example.com"]
+cache_dir = "/tmp/acme"
+challenge = "http_01"
 
 [[routes]]
 host = "*"
@@ -2096,7 +2114,13 @@ root = "/srv/www"
 "#;
         assert!(matches!(
             Config::parse(text),
-            Err(Error::Http3ProxyProtocolUnsupported)
+            Err(Error::Http01NeedsListener)
         ));
+
+        let with_listener = text.replace(
+            "challenge = \"http_01\"",
+            "challenge = \"http_01\"\nhttp01_listen = \"0.0.0.0:80\"",
+        );
+        assert!(Config::parse(&with_listener).is_ok());
     }
 }

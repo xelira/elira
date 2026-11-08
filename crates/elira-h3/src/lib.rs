@@ -21,6 +21,8 @@ use elira_accesslog::{request_id, Entry};
 use elira_metrics::Metrics;
 use elira_proxy::{BoxError, Proxy};
 
+mod proxy_udp;
+
 pub struct Config {
     pub listen: SocketAddr,
     pub cert: PathBuf,
@@ -28,11 +30,12 @@ pub struct Config {
     pub reuse_port: bool,
     pub client_ca: Option<PathBuf>,
     pub client_auth: elira_tls::ClientAuth,
+    pub proxy_protocol: bool,
 }
 
 pub async fn serve(
     cfg: Config,
-    proxy: Proxy,
+    proxy: Arc<dyn Fn() -> Proxy + Send + Sync>,
     metrics: Arc<Metrics>,
     body_timeout: Option<std::time::Duration>,
     log: Arc<dyn Fn(&Entry) + Send + Sync>,
@@ -47,7 +50,7 @@ pub async fn serve(
     let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls)?;
     let server = quinn::ServerConfig::with_crypto(Arc::new(crypto));
 
-    let endpoint = bind(cfg.listen, server, cfg.reuse_port).await?;
+    let (endpoint, clients) = bind(cfg.listen, server, cfg.reuse_port, cfg.proxy_protocol).await?;
     tracing::info!(listen = %cfg.listen, "http/3 listening");
 
     loop {
@@ -58,13 +61,22 @@ pub async fn serve(
                 let proxy = proxy.clone();
                 let metrics = metrics.clone();
                 let log = log.clone();
+                let clients = clients.clone();
 
                 tokio::spawn(async move {
                     match incoming.await {
                         Ok(conn) => {
                             let peer = conn.remote_address();
-                            if let Err(err) =
-                                connection(conn, peer, proxy, metrics, body_timeout, log).await
+                            if let Err(err) = connection(
+                                conn,
+                                peer,
+                                proxy,
+                                metrics,
+                                body_timeout,
+                                log,
+                                clients,
+                            )
+                            .await
                             {
                                 tracing::debug!(%peer, error = %err, "http/3 connection closed");
                             }
@@ -83,16 +95,19 @@ pub async fn serve(
 
 /// QUIC sockets are released by quinn's driver task, not by the `Endpoint`
 /// drop itself. A reload that rebinds on the same port needs a moment.
+type Clients = proxy_udp::Clients;
+
 async fn bind(
     addr: SocketAddr,
     server: quinn::ServerConfig,
     reuse_port: bool,
-) -> std::io::Result<quinn::Endpoint> {
+    proxy_protocol: bool,
+) -> std::io::Result<(quinn::Endpoint, Option<Clients>)> {
     let mut last = None;
 
     for _ in 0..20 {
-        match try_bind(addr, server.clone(), reuse_port) {
-            Ok(endpoint) => return Ok(endpoint),
+        match try_bind(addr, server.clone(), reuse_port, proxy_protocol) {
+            Ok(bound) => return Ok(bound),
             Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
                 last = Some(err);
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -108,7 +123,8 @@ fn try_bind(
     addr: SocketAddr,
     server: quinn::ServerConfig,
     reuse_port: bool,
-) -> std::io::Result<quinn::Endpoint> {
+    proxy_protocol: bool,
+) -> std::io::Result<(quinn::Endpoint, Option<Clients>)> {
     let domain = if addr.is_ipv4() {
         socket2::Domain::IPV4
     } else {
@@ -126,22 +142,44 @@ fn try_bind(
     let runtime = quinn::default_runtime()
         .ok_or_else(|| std::io::Error::other("no async runtime for quinn"))?;
 
-    quinn::Endpoint::new(
-        quinn::EndpointConfig::default(),
-        Some(server),
-        socket.into(),
-        runtime,
-    )
+    if proxy_protocol {
+        let (socket, clients) = proxy_udp::ProxyUdpSocket::new(socket.into())?;
+        let endpoint = quinn::Endpoint::new_with_abstract_socket(
+            quinn::EndpointConfig::default(),
+            Some(server),
+            socket,
+            runtime,
+        )?;
+        Ok((endpoint, Some(clients)))
+    } else {
+        Ok((
+            quinn::Endpoint::new(
+                quinn::EndpointConfig::default(),
+                Some(server),
+                socket.into(),
+                runtime,
+            )?,
+            None,
+        ))
+    }
 }
 
 async fn connection(
     conn: quinn::Connection,
-    peer: SocketAddr,
-    proxy: Proxy,
+    transport: SocketAddr,
+    proxy: Arc<dyn Fn() -> Proxy + Send + Sync>,
     metrics: Arc<Metrics>,
     body_timeout: Option<std::time::Duration>,
     log: Arc<dyn Fn(&Entry) + Send + Sync>,
+    clients: Option<Clients>,
 ) -> Result<(), BoxError> {
+    // The QUIC transport peer is the load balancer when PROXY protocol is on;
+    // the map holds the address from its header.
+    let peer = clients
+        .as_ref()
+        .and_then(|map| map.lock().ok().and_then(|map| map.get(&transport).copied()))
+        .unwrap_or(transport);
+
     let mut conn =
         h3::server::Connection::<h3_quinn::Connection, Bytes>::new(h3_quinn::Connection::new(conn))
             .await?;
@@ -159,6 +197,12 @@ async fn connection(
         });
     }
 
+    if let Some(map) = clients {
+        if let Ok(mut map) = map.lock() {
+            map.remove(&transport);
+        }
+    }
+
     Ok(())
 }
 
@@ -166,7 +210,7 @@ async fn request<S, B>(
     req: Request<()>,
     stream: h3::server::RequestStream<S, B>,
     peer: SocketAddr,
-    proxy: Proxy,
+    proxy: Arc<dyn Fn() -> Proxy + Send + Sync>,
     metrics: Arc<Metrics>,
     body_timeout: Option<std::time::Duration>,
     log: Arc<dyn Fn(&Entry) + Send + Sync>,
@@ -245,7 +289,7 @@ where
     let (parts, ()) = req.into_parts();
     let request = Request::from_parts(parts, body);
 
-    let response = proxy.handle(request, peer, "https").await;
+    let response = proxy().handle(request, peer, "https").await;
     let status = response.status();
     let elapsed = started.elapsed();
     let status_code = status.as_u16();

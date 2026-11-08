@@ -54,6 +54,15 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// listener can feed per-route and per-upstream metrics without the proxy
 /// holding a metrics registry.
 #[derive(Clone, Debug)]
+pub struct FastStatic {
+    pub file: std::path::PathBuf,
+    pub add_headers: Vec<(HeaderName, HeaderValue)>,
+    pub remove_headers: Vec<HeaderName>,
+    pub server_header: bool,
+    pub alt_svc: Option<HeaderValue>,
+}
+
+#[derive(Clone, Debug)]
 pub struct Labels {
     pub route: String,
     pub upstream: Option<String>,
@@ -618,25 +627,61 @@ impl Proxy {
     /// writes headers itself, so per-route headers, a hidden `Server` or
     /// `Alt-Svc` send the request through hyper instead.
     pub async fn static_file(&self, host: &str, path: &str) -> Option<std::path::PathBuf> {
+        self.fast_static(
+            host,
+            path,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            &HeaderMap::new(),
+        )
+        .await
+        .map(|fast| fast.file)
+    }
+
+    /// Everything the sendfile fast path needs, after the same access checks
+    /// as the normal route. `None` means hyper should handle the request.
+    pub async fn fast_static(
+        &self,
+        host: &str,
+        path: &str,
+        peer: std::net::IpAddr,
+        headers: &HeaderMap,
+    ) -> Option<FastStatic> {
         let (key, _) = canonical_host(host)?;
         let entry = self.inner.router.pick(&key, path)?;
 
-        if !entry.add_headers.is_empty()
-            || !entry.remove_headers.is_empty()
-            || entry.auth.is_some()
-            || entry.acl.is_some()
-            || entry.limiter.is_some()
-            || !entry.error_pages.is_empty()
-            || !self.inner.server_header
-            || self.inner.alt_svc.is_some()
-        {
-            return None;
+        // Resolve the target first: a proxy route must not pay for a token or
+        // an auth check here only to be handed to hyper afterwards.
+        let file = match &entry.target {
+            Target::Files(files) => files.resolve(path).await?,
+            _ => return None,
+        };
+
+        if let Some(acl) = &entry.acl {
+            if !acl.allows(peer) {
+                return None;
+            }
+        }
+        if let Some(auth) = &entry.auth {
+            let header = headers
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok());
+            if !auth.check(header) {
+                return None;
+            }
+        }
+        if let Some(limiter) = &entry.limiter {
+            if !limiter.check(peer, Instant::now()) {
+                return None;
+            }
         }
 
-        match &entry.target {
-            Target::Files(files) => files.resolve(path).await,
-            _ => None,
-        }
+        Some(FastStatic {
+            file,
+            add_headers: entry.add_headers.clone(),
+            remove_headers: entry.remove_headers.clone(),
+            server_header: self.inner.server_header,
+            alt_svc: self.inner.alt_svc.clone(),
+        })
     }
 
     /// Spend one rate-limit token, if the limiter is on.

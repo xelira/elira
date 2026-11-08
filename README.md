@@ -107,6 +107,8 @@ max_item_bytes = 1048576
 # contacts = ["mailto:admin@example.com"]
 # cache_dir = "/var/lib/elira/acme"
 # production = true
+# challenge = "http_01"           # default is "tls_alpn_01"
+# http01_listen = "0.0.0.0:80"    # dedicated plain listener for HTTP-01
 
 [[upstreams]]
 name = "app"
@@ -200,14 +202,16 @@ Static files:
 - index files, MIME types, `ETag`, `If-None-Match`, `If-Modified-Since`
 - single byte ranges; `HEAD`; precompressed `.br`/`.gz` siblings
 - on-the-fly compression; path traversal and symlink escapes rejected
-- `sendfile(2)` for plain HTTP/1.1 GET/HEAD, decided before hyper
+- `sendfile(2)` for plain HTTP/1.1 GET/HEAD, including single ranges,
+  conditionals and protected routes
 
 Cache:
 
 - small `GET` responses with `X-Cache: HIT`, `MISS` or `STALE`
 - `Vary`, `Cache-Control`, `s-maxage`/`max-age`, `Age`
 - `Authorization`/`Cookie` requests never read or write the cache
-- optional disk bodies and stale-while-revalidate with one background refresh
+- optional disk bodies that survive a restart, and stale-while-revalidate with
+  one background refresh
 
 Ops:
 
@@ -215,8 +219,9 @@ Ops:
 - `POST /reload`, `POST /drain`, `POST /cache/purge`, optional Basic auth
 - text or JSON access log with request id, file rotation, nginx-like templates
   and syslog
-- PROXY protocol v1/v2 before TLS and HTTP (TCP only)
-- ACME via TLS-ALPN-01, verified against Let's Encrypt staging and production
+- PROXY protocol v1/v2 before TLS and HTTP, and v2 over QUIC datagrams
+- ACME via TLS-ALPN-01 or HTTP-01, verified against Let's Encrypt staging and
+  production
 - `elira migrate` for a subset of nginx configuration
 
 ## Admin listener
@@ -235,17 +240,14 @@ The listener has no TLS. Put it on loopback or set `auth_file`.
 
 ## Not yet
 
-- PROXY protocol is not accepted on QUIC. With `proxy_protocol = true` the
-  HTTP/3 listener must bind loopback, otherwise config loading fails: a public
-  UDP port would let clients bypass the required header.
-- The HTTP/3 listener is restarted on SIGHUP, which resets live QUIC
-  connections. HTTP/1.1 and HTTP/2 connections survive a reload.
-- `sendfile` declines TLS, HTTP/2, ranges, conditionals, compression, auth,
-  ACLs, per-route limiters, error pages and custom header changes. Everything
-  else takes the normal path. Multi-range requests return the whole file.
-- The cache does not survive a restart. With `cache.dir`, the directory is
-  cleaned at startup rather than reloaded.
-- ACME supports TLS-ALPN-01 only; port 443 must be reachable from the internet.
+- `sendfile` still declines TLS, HTTP/2, compression and multi-range
+  responses; those need hyper or a multipart body. Single ranges,
+  conditionals, auth, ACLs and per-route headers stay on the fast path.
+- The HTTP/3 listener survives a reload when its address, certificate and
+  client-auth settings did not change. Replacing the certificate file restarts
+  the endpoint and resets live QUIC connections.
+- ACME via TLS-ALPN-01 needs port 443; HTTP-01 needs a listener on port 80 or
+  `acme.http01_listen`.
 - No FastCGI, CGI, regex locations, dynamic modules or multi-process workers.
 - DNS resolution uses the system resolver. `dns_ttl_secs` bounds how long a
   pooled connection may outlive a DNS change.

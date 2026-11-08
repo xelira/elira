@@ -302,7 +302,16 @@ pub async fn serve_unix(
                 };
                 connections.spawn(async move {
                     let _permit = permit;
-                    serve_conn(stream, "127.0.0.1:0".parse().expect("loopback"), runtime, conn, metrics, &mut stop).await;
+                    serve_conn(
+                        stream,
+                        "127.0.0.1:0".parse().expect("loopback"),
+                        runtime,
+                        conn,
+                        metrics,
+                        &mut stop,
+                        None,
+                    )
+                    .await;
                 });
             }
         }
@@ -378,6 +387,24 @@ async fn serve_stream(
     };
 
     if let Some(acme) = &options.acme {
+        // HTTP-01 is validated over plain HTTP; there is no TLS to terminate.
+        if acme.uses_http01() {
+            let conn = ConnOptions {
+                secure: false,
+                ..conn
+            };
+            serve_conn(
+                stream,
+                peer,
+                runtime,
+                conn,
+                metrics,
+                stop,
+                Some(acme.clone()),
+            )
+            .await;
+            return;
+        }
         match acme.accept(stream).await {
             Ok((io, h2)) => {
                 let conn = ConnOptions {
@@ -385,7 +412,7 @@ async fn serve_stream(
                     secure: true,
                     ..conn
                 };
-                serve_conn(io, peer, runtime, conn, metrics, stop).await;
+                serve_conn(io, peer, runtime, conn, metrics, stop, Some(acme.clone())).await;
             }
             Err(err) if err.kind() == std::io::ErrorKind::ConnectionAborted => {
                 tracing::debug!(%peer, "acme validation connection");
@@ -420,13 +447,22 @@ async fn serve_stream(
                 Ok(Ok(stream)) => {
                     let h2 = stream.get_ref().1.alpn_protocol() == Some(b"h2".as_slice());
                     let conn = ConnOptions { h2, ..conn };
-                    serve_conn(stream, peer, runtime, conn, metrics, stop).await;
+                    serve_conn(
+                        stream,
+                        peer,
+                        runtime,
+                        conn,
+                        metrics,
+                        stop,
+                        options.acme.clone(),
+                    )
+                    .await;
                 }
                 Ok(Err(err)) => tracing::debug!(%peer, error = %err, "tls handshake failed"),
                 Err(_) => tracing::debug!(%peer, "tls handshake timed out"),
             }
         }
-        None => serve_conn(stream, peer, runtime, conn, metrics, stop).await,
+        None => serve_conn(stream, peer, runtime, conn, metrics, stop, None).await,
     }
 }
 
@@ -437,6 +473,7 @@ async fn serve_conn<I>(
     opts: ConnOptions,
     metrics: Arc<Metrics>,
     stop: &mut watch::Receiver<bool>,
+    acme: Option<Arc<elira_acme::Acme>>,
 ) where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -447,11 +484,13 @@ async fn serve_conn<I>(
     let scheme = if opts.secure { "https" } else { "http" };
     let body_timeout = opts.body_timeout;
     let metrics_for_service = metrics.clone();
+    let acme_for_service = acme.clone();
 
     let service = service_fn(move |req: hyper::Request<Incoming>| {
         let runtime = runtime.clone();
         let idle = idle_for_service.clone();
         let metrics = metrics_for_service.clone();
+        let acme = acme_for_service.clone();
         async move {
             // Reset the keep-alive watchdog: a request means the client is
             // still there, even if the response takes a while.
@@ -492,7 +531,17 @@ async fn serve_conn<I>(
                     None => body,
                 }
             });
-            let response = current.proxy.handle(req, peer, scheme).await;
+            let response = if let Some(acme) = &acme {
+                let token = path
+                    .strip_prefix("/.well-known/acme-challenge/")
+                    .map(|token| token.split('?').next().unwrap_or(token));
+                match token.and_then(|token| acme.http01(token)) {
+                    Some(body) => acme_response(hyper::StatusCode::OK, body),
+                    None => current.proxy.handle(req, peer, scheme).await,
+                }
+            } else {
+                current.proxy.handle(req, peer, scheme).await
+            };
             let elapsed = started.elapsed();
             let status = response.status().as_u16();
             metrics.record_request(status, elapsed);
@@ -588,6 +637,54 @@ async fn serve_conn<I>(
     }
 
     metrics.connection_finished();
+}
+
+fn acme_response(status: hyper::StatusCode, body: String) -> hyper::Response<elira_proxy::Body> {
+    let body = http_body_util::Full::new(hyper::body::Bytes::from(body))
+        .map_err(|never| match never {})
+        .boxed();
+    hyper::Response::builder()
+        .status(status)
+        .header(hyper::header::CONTENT_TYPE, "application/octet-stream")
+        .body(body)
+        .expect("static response")
+}
+
+/// Serve only HTTP-01 challenge tokens on a plain listener.
+pub fn spawn_http01(
+    listener: TcpListener,
+    acme: Arc<elira_acme::Acme>,
+    mut stop: watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = stop.changed() => break,
+                accepted = listener.accept() => {
+                    let Ok((stream, _)) = accepted else { continue };
+                    let acme = acme.clone();
+                    tokio::spawn(async move {
+                        let service = service_fn(move |req: hyper::Request<Incoming>| {
+                            let acme = acme.clone();
+                            async move {
+                                let token = req.uri().path().strip_prefix("/.well-known/acme-challenge/");
+                                let body = token.and_then(|token| acme.http01(token)).unwrap_or_default();
+                                let status = if body.is_empty() {
+                                    hyper::StatusCode::NOT_FOUND
+                                } else {
+                                    hyper::StatusCode::OK
+                                };
+                                Ok::<_, std::convert::Infallible>(acme_response(status, body))
+                            }
+                        });
+                        let _ = http1::Builder::new()
+                            .serve_connection(TokioIo::new(stream), service)
+                            .await;
+                    });
+                }
+            }
+        }
+    });
 }
 
 /// Serve the admin listener: `/metrics`, `/status`, reload, drain and cache

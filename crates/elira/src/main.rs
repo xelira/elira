@@ -109,6 +109,10 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
             contacts: acme.contacts.clone(),
             cache_dir: acme.cache_dir.clone(),
             production: acme.production,
+            challenge: match acme.challenge {
+                elira::config::AcmeChallenge::TlsAlpn01 => elira_acme::Challenge::TlsAlpn01,
+                elira::config::AcmeChallenge::Http01 => elira_acme::Challenge::Http01,
+            },
         })
         .await?;
         options.acme = Some(Arc::new(started));
@@ -120,6 +124,16 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
 
     spawn_signal_task(stop_tx.clone(), reload_tx.clone(), restart_tx)?;
     server::spawn_health_loop(runtime.clone(), metrics.clone(), stop_rx.clone());
+
+    if let (Some(acme), Some(listen)) = (
+        options.acme.clone(),
+        cfg.acme.as_ref().and_then(|acme| acme.http01_listen),
+    ) {
+        let listener = server::bind_tcp(listen, cfg.reuse_port)
+            .with_context(|| format!("cannot bind HTTP-01 listener on {listen}"))?;
+        tracing::info!(%listen, "http-01 challenge listener");
+        server::spawn_http01(listener, acme, stop_rx.clone());
+    }
 
     if let Some(metrics_cfg) = &cfg.metrics {
         let metrics_listener = server::bind_tcp(metrics_cfg.listen, cfg.reuse_port)
@@ -145,6 +159,7 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
         stop_rx.clone(),
         cfg.reuse_port,
         options.body_timeout,
+        cfg.proxy_protocol,
     );
     let mut stop_wait = stop_rx.clone();
 
@@ -202,22 +217,27 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
                     break;
                 }
 
+                let before = h3_identity(runtime.load().http3());
                 reload(&path, &cfg, &runtime, options.clone(), &metrics).await;
+                let after = h3_identity(runtime.load().http3());
 
-                // The new Runtime carries its own http3 config. Restart the
-                // listener against it instead of keeping the old one.
-                if let Some(handle) = h3_task.take() {
-                    handle.abort();
-                    // Wait for the QUIC endpoint to drop before rebinding.
-                    let _ = handle.await;
+                // Routes, the proxy and logging load the current Runtime per
+                // request, so only a changed certificate or listener needs a
+                // new QUIC endpoint. Restarting it drops live HTTP/3 streams.
+                if before != after {
+                    if let Some(handle) = h3_task.take() {
+                        handle.abort();
+                        let _ = handle.await;
+                    }
+                    h3_task = spawn_h3(
+                        runtime.clone(),
+                        metrics.clone(),
+                        stop_rx.clone(),
+                        cfg.reuse_port,
+                        options.body_timeout,
+                        cfg.proxy_protocol,
+                    );
                 }
-                h3_task = spawn_h3(
-                    runtime.clone(),
-                    metrics.clone(),
-                    stop_rx.clone(),
-                    cfg.reuse_port,
-                    options.body_timeout,
-                );
             }
         }
     }
@@ -255,11 +275,17 @@ fn spawn_h3(
     stop: watch::Receiver<bool>,
     reuse_port: bool,
     body_timeout: Option<Duration>,
+    proxy_protocol: bool,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let current = runtime.load();
     let http3 = current.http3().cloned()?;
-    let proxy = current.proxy().clone();
     drop(current);
+
+    // The QUIC listener outlives route reloads; the proxy is loaded per
+    // request so new routes take effect without touching live streams.
+    let proxy_runtime = runtime.clone();
+    let proxy: Arc<dyn Fn() -> elira_proxy::Proxy + Send + Sync> =
+        Arc::new(move || proxy_runtime.load().proxy().clone());
 
     let client_auth = match http3.client_auth {
         elira::config::ClientAuthMode::Off => elira_tls::ClientAuth::Off,
@@ -281,11 +307,47 @@ fn spawn_h3(
             reuse_port,
             client_ca: http3.client_ca,
             client_auth,
+            proxy_protocol,
         };
         if let Err(err) = elira_h3::serve(cfg, proxy, metrics, body_timeout, log, stop).await {
             tracing::error!(error = %err, "http/3 listener stopped");
         }
     }))
+}
+
+/// Identity of the QUIC listener covered by a reload. A different path,
+/// address or file timestamp means the endpoint has to be rebuilt.
+type H3Identity = (
+    std::net::SocketAddr,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    Option<std::path::PathBuf>,
+    elira::config::ClientAuthMode,
+    u64,
+    u64,
+    u64,
+);
+
+fn h3_identity(http3: Option<&elira::config::Http3>) -> Option<H3Identity> {
+    let http3 = http3?;
+    let stamp = |path: &Path| {
+        std::fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|delta| delta.as_nanos() as u64)
+            .unwrap_or(0)
+    };
+    Some((
+        http3.listen,
+        http3.cert.clone(),
+        http3.key.clone(),
+        http3.client_ca.clone(),
+        http3.client_auth,
+        stamp(&http3.cert),
+        stamp(&http3.key),
+        http3.client_ca.as_deref().map(stamp).unwrap_or(0),
+    ))
 }
 
 async fn reload(
