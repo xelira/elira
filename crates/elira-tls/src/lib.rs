@@ -96,6 +96,9 @@ pub enum Error {
     #[error("private key in {path} cannot be used for signing")]
     SigningKey { path: PathBuf },
 
+    #[error("parse certificate {path}: {reason}")]
+    ParseCertificate { path: PathBuf, reason: String },
+
     #[error("invalid certificate {cert} and key {key}: {source}")]
     Tls {
         cert: PathBuf,
@@ -370,6 +373,29 @@ fn load_client_ca(path: &Path) -> Result<RootCertStore, Error> {
         });
     }
     Ok(roots)
+}
+
+/// Expiry of the leaf certificate, for an operational gauge.
+pub fn certificate_expiry(path: &Path) -> Result<std::time::SystemTime, Error> {
+    let chain = load_chain(path)?;
+    let leaf = chain.first().ok_or_else(|| Error::ParseCertificate {
+        path: path.to_path_buf(),
+        reason: "empty chain".to_owned(),
+    })?;
+    let (_, certificate) = x509_parser::parse_x509_certificate(leaf.as_ref()).map_err(|error| {
+        Error::ParseCertificate {
+            path: path.to_path_buf(),
+            reason: error.to_string(),
+        }
+    })?;
+    let timestamp = certificate.validity().not_after.timestamp();
+    if timestamp < 0 {
+        return Err(Error::ParseCertificate {
+            path: path.to_path_buf(),
+            reason: "expiry before the Unix epoch".to_owned(),
+        });
+    }
+    Ok(std::time::UNIX_EPOCH + std::time::Duration::from_secs(timestamp as u64))
 }
 
 fn load_chain(path: &Path) -> Result<Vec<CertificateDer<'static>>, Error> {

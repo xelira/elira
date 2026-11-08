@@ -50,6 +50,7 @@ Living list for the self-improvement loop. One item per session.
 - [x] Upstream pool active-request gauge.
 - [x] Cache stale and health-check counters.
 - [x] Configurable connection drain and shutdown timeouts.
+- [x] TLS certificate expiry metric.
 - [ ] True HTTP/2 connection-pool internals (connections, streams, queued
   requests): hyper-util's `Connect` trait is sealed, so this needs a custom
   HTTP/2 client rather than a connector wrapper.

@@ -173,6 +173,8 @@ pub struct Delta {
     pub quic_connections: u64,
     /// Active upstream requests per pool, a snapshot.
     pub upstream_load: Vec<(String, u64)>,
+    /// Certificate path -> Unix expiry seconds, a snapshot.
+    pub certificate_expiry: Vec<(String, i64)>,
     /// Current connections in flight, not a delta.
     pub connections_in_flight: u64,
     /// Current upstreams considered healthy, not a delta.
@@ -252,6 +254,7 @@ pub struct Metrics {
     tls_handshakes_failed: AtomicU64,
     quic_connections: AtomicU64,
     upstream_load: Mutex<BTreeMap<String, u64>>,
+    certificate_expiry: Mutex<BTreeMap<String, i64>>,
 }
 
 impl Metrics {
@@ -279,6 +282,7 @@ impl Metrics {
             tls_handshakes_failed: AtomicU64::new(0),
             quic_connections: AtomicU64::new(0),
             upstream_load: Mutex::new(BTreeMap::new()),
+            certificate_expiry: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -384,6 +388,14 @@ impl Metrics {
     }
 
     /// Replace the active-request gauge for one upstream pool.
+    /// Record the Unix expiry timestamp of a certificate file.
+    pub fn set_certificate_expiry(&self, path: &str, expires: i64) {
+        self.certificate_expiry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(path.to_owned(), expires);
+    }
+
     pub fn set_upstream_load(&self, upstream: &str, active: u64) {
         self.upstream_load
             .lock()
@@ -479,6 +491,13 @@ impl Metrics {
                 .iter()
                 .map(|(name, active)| (name.clone(), *active))
                 .collect(),
+            certificate_expiry: self
+                .certificate_expiry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .map(|(path, expires)| (path.clone(), *expires))
+                .collect(),
             connections_in_flight: self.connections_in_flight.load(Ordering::Relaxed),
             upstreams_up: self.upstreams_up.load(Ordering::Relaxed) as u64,
             upstreams_down: self.upstreams_down.load(Ordering::Relaxed) as u64,
@@ -549,6 +568,15 @@ impl Metrics {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             for (name, active) in &delta.upstream_load {
                 load.insert(name.clone(), *active);
+            }
+        }
+        if !delta.certificate_expiry.is_empty() {
+            let mut expiry = self
+                .certificate_expiry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for (path, expires) in &delta.certificate_expiry {
+                expiry.insert(path.clone(), *expires);
             }
         }
         self.set_upstreams(usize_of(delta.upstreams_up), usize_of(delta.upstreams_down));
@@ -703,6 +731,41 @@ impl Metrics {
             self.response_bytes.load(Ordering::Relaxed)
         );
 
+        out.push_str("# HELP elira_tls_handshakes_total TLS handshakes by result.\n");
+        out.push_str("# TYPE elira_tls_handshakes_total counter\n");
+        let _ = writeln!(
+            out,
+            "elira_tls_handshakes_total{{result=\"ok\"}} {}",
+            self.tls_handshakes_ok.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            out,
+            "elira_tls_handshakes_total{{result=\"failed\"}} {}",
+            self.tls_handshakes_failed.load(Ordering::Relaxed)
+        );
+        out.push_str("# HELP elira_quic_connections_total Accepted QUIC connections.\n");
+        out.push_str("# TYPE elira_quic_connections_total counter\n");
+        let _ = writeln!(
+            out,
+            "elira_quic_connections_total {}",
+            self.quic_connections.load(Ordering::Relaxed)
+        );
+        out.push_str("# HELP elira_tls_certificate_expires_seconds Certificate expiry as a Unix timestamp.\n");
+        out.push_str("# TYPE elira_tls_certificate_expires_seconds gauge\n");
+        {
+            let expiry = self
+                .certificate_expiry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for (path, expires) in expiry.iter() {
+                let _ = writeln!(
+                    out,
+                    "elira_tls_certificate_expires_seconds{{path=\"{}\"}} {}",
+                    escape_label(path),
+                    expires
+                );
+            }
+        }
         out.push_str("# HELP elira_upstream_active_requests Active requests per upstream pool.\n");
         out.push_str("# TYPE elira_upstream_active_requests gauge\n");
         {
@@ -1818,5 +1881,14 @@ mod tests {
             &text,
             "elira_health_checks_total{result=\"failed\"} 1"
         ));
+    }
+
+    #[test]
+    fn certificate_expiry_is_a_gauge() {
+        let metrics = Metrics::new();
+        metrics.set_certificate_expiry("/tmp/cert.pem", 1_900_000_000);
+        assert!(metrics
+            .render()
+            .contains("elira_tls_certificate_expires_seconds{path=\"/tmp/cert.pem\"} 1900000000"));
     }
 }

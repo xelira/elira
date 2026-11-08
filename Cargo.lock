@@ -843,6 +843,7 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "thiserror",
+ "x509-parser",
 ]
 
 [[package]]

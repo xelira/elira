@@ -9,3 +9,4 @@ repository.workspace = true
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 thiserror = { workspace = true }
+x509-parser = "0.18"

@@ -174,6 +174,7 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
         options.acme = Some(Arc::new(started));
     }
     let metrics = Arc::new(Metrics::new());
+    record_certificate_expiry(&cfg, &metrics);
     if let (Ok(path), Ok(index)) = (
         std::env::var("ELIRA_METRICS_SOCKET"),
         std::env::var("ELIRA_WORKER_INDEX"),
@@ -354,6 +355,23 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn record_certificate_expiry(cfg: &Config, metrics: &Metrics) {
+    let mut paths = Vec::new();
+    if let Some(tls) = &cfg.tls {
+        paths.push(tls.cert.clone());
+    }
+    if let Some(http3) = &cfg.http3 {
+        paths.push(http3.cert.clone());
+    }
+    for path in paths {
+        if let Ok(expiry) = elira_tls::certificate_expiry(&path) {
+            if let Ok(delta) = expiry.duration_since(std::time::UNIX_EPOCH) {
+                metrics.set_certificate_expiry(&path.display().to_string(), delta.as_secs() as i64);
+            }
+        }
+    }
+}
+
 fn reload_counter() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -518,6 +536,7 @@ async fn reload(
     }
 
     runtime.store(Arc::new(built));
+    record_certificate_expiry(&next, metrics);
     metrics.reload_ok();
     tracing::info!("config reloaded");
 }
