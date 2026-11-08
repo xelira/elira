@@ -98,6 +98,7 @@
 - `POST /reload` и `/drain` на агрегированном админ-листенере воркеров.
 - Per-route `cache_enabled` и `cache_ttl_secs`.
 - Метрики TLS handshake и принятых QUIC-соединений.
+- Имя upstream в текстовом/JSON access-логе и `$upstream`.
 - `http3.idle_timeout_secs` и `http3.early_data` (0-RTT проверен QUIC-клиентом);
   настройки TLS resumption
   (`session_tickets`, `session_cache`).

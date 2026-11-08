@@ -260,6 +260,7 @@ pub(crate) async fn try_serve(
         duration: started.elapsed(),
         user_agent,
         request_id: id,
+        upstream: None,
     };
 
     metrics.observe(status.as_u16(), started.elapsed());

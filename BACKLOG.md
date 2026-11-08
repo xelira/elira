@@ -40,12 +40,15 @@ Living list for the self-improvement loop. One item per session.
 - [x] TLS handshake and QUIC connection metrics.
 - [x] Per-route FastCGI pool size.
 - [x] TLS session ticket and resumption settings.
-- [ ] Upstream HTTP/2 connection pool metrics.
+- [x] Upstream name in access logs.
 - [x] `cache.purge` by host/path prefix through the admin API.
 - [x] Expand parser fuzz targets.
 - [x] Cache prefix invalidation API.
 
 ## C — large projects
+
+- [ ] Upstream HTTP/2 connection pool metrics: hyper's legacy client does not
+  expose pool internals; needs a custom connector or client.
 
 - [ ] Shared cache or consistent-hash routing so worker caches do not produce
   avoidable misses.

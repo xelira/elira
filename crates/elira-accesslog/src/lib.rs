@@ -33,6 +33,8 @@ pub struct Entry {
     pub duration: Duration,
     pub user_agent: Option<String>,
     pub request_id: String,
+    /// Upstream that served the request, when the route proxied.
+    pub upstream: Option<String>,
 }
 
 impl Entry {
@@ -45,7 +47,7 @@ impl Entry {
     /// Example:
     ///
     /// ```text
-    /// 203.0.113.5 - [a1b2c3d4e5f60718] "GET /path HTTP/1.1" 200 1234 12ms "curl/8.0" host=example.com
+    /// 203.0.113.5 - [a1b2c3d4e5f60718] "GET /path HTTP/1.1" 200 1234 12ms "curl/8.0" host=example.com upstream=-
     /// ```
     ///
     /// A missing or empty User-Agent is written as `-` inside the quotes,
@@ -77,6 +79,11 @@ impl Entry {
         }
         out.push_str("\" host=");
         escape_line(&self.host, &mut out);
+        out.push_str(" upstream=");
+        match self.upstream.as_deref().filter(|name| !name.is_empty()) {
+            Some(name) => escape_line(name, &mut out),
+            None => out.push('-'),
+        }
         out
     }
 
@@ -106,6 +113,13 @@ impl Entry {
             }
         }
         push_str(&mut out, "request_id", &self.request_id);
+        match &self.upstream {
+            Some(name) => push_str(&mut out, "upstream", name),
+            None => {
+                push_key(&mut out, "upstream");
+                out.push_str("null,");
+            }
+        }
 
         out.pop();
         out.push('}');
@@ -145,6 +159,7 @@ enum Variable {
     RemoteAddr,
     RemotePort,
     Host,
+    Upstream,
     Request,
     RequestMethod,
     RequestUri,
@@ -165,6 +180,7 @@ impl Variable {
             "remote_addr" => Self::RemoteAddr,
             "remote_port" => Self::RemotePort,
             "host" => Self::Host,
+            "upstream" => Self::Upstream,
             "request" => Self::Request,
             "request_method" => Self::RequestMethod,
             "request_uri" => Self::RequestUri,
@@ -190,6 +206,10 @@ impl Variable {
             // unavailable variable.
             Self::RemotePort => out.push('-'),
             Self::Host => escape_line(&entry.host, out),
+            Self::Upstream => match entry.upstream.as_deref().filter(|name| !name.is_empty()) {
+                Some(name) => escape_line(name, out),
+                None => out.push('-'),
+            },
             Self::Request => {
                 out.push_str(entry.method.as_str());
                 out.push(' ');
@@ -503,6 +523,7 @@ mod tests {
             duration: Duration::from_millis(12),
             user_agent: Some("curl/8.0".to_owned()),
             request_id: "a1b2c3d4e5f60718".to_owned(),
+            upstream: None,
         }
     }
 
@@ -510,7 +531,7 @@ mod tests {
     fn line_has_the_documented_shape() {
         assert_eq!(
             entry().line(),
-            "203.0.113.5 - [a1b2c3d4e5f60718] \"GET /path HTTP/1.1\" 200 1234 12ms \"curl/8.0\" host=example.com"
+            "203.0.113.5 - [a1b2c3d4e5f60718] \"GET /path HTTP/1.1\" 200 1234 12ms \"curl/8.0\" host=example.com upstream=-"
         );
     }
 
@@ -518,10 +539,10 @@ mod tests {
     fn line_uses_dash_for_missing_user_agent() {
         let mut e = entry();
         e.user_agent = None;
-        assert!(e.line().ends_with("\"-\" host=example.com"));
+        assert!(e.line().ends_with("\"-\" host=example.com upstream=-"));
 
         e.user_agent = Some(String::new());
-        assert!(e.line().ends_with("\"-\" host=example.com"));
+        assert!(e.line().ends_with("\"-\" host=example.com upstream=-"));
     }
 
     #[test]
@@ -538,7 +559,7 @@ mod tests {
         assert!(!line.contains('\t'));
         assert!(line.contains(r#""GET /a\"b\\c\x0anext HTTP/1.1""#));
         assert!(line.contains(r#""agent\"\x0d\x0a\x09tab\x07""#));
-        assert!(line.ends_with(r#"host=bad\"host"#));
+        assert!(line.ends_with(r#"host=bad\"host upstream=-"#));
     }
 
     #[test]
@@ -553,7 +574,7 @@ mod tests {
                 r#"{"peer":"203.0.113.5","method":"GET","version":"HTTP/1.1","host":"example.com","#,
                 r#""path":"/a\"b\\c\nline\ttab\u0007","#,
                 r#""status":200,"bytes":1234,"duration_ms":12,"#,
-                r#""user_agent":"ua\"\\\r","request_id":"a1b2c3d4e5f60718"}"#
+                r#""user_agent":"ua\"\\\r","request_id":"a1b2c3d4e5f60718","upstream":null}"#
             )
         );
         assert!(!e.json().contains('\n'));
@@ -589,15 +610,17 @@ mod tests {
         let format = Format::parse(concat!(
             "$remote_addr|$remote_port|$host|$request|$request_method|",
             "$request_uri|$server_protocol|$status|$body_bytes_sent|",
-            "$http_user_agent|$http_referer|$request_time|$request_id"
+            "$http_user_agent|$http_referer|$request_time|$request_id|$upstream"
         ))
         .unwrap();
 
+        let mut entry = entry();
+        entry.upstream = Some("app".to_owned());
         assert_eq!(
-            format.render(&entry()),
+            format.render(&entry),
             concat!(
                 "203.0.113.5|-|example.com|GET /path HTTP/1.1|GET|/path|",
-                "HTTP/1.1|200|1234|curl/8.0|-|0.012|a1b2c3d4e5f60718"
+                "HTTP/1.1|200|1234|curl/8.0|-|0.012|a1b2c3d4e5f60718|app"
             )
         );
     }

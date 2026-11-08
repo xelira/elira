@@ -580,11 +580,13 @@ async fn serve_conn<I>(
             let status = response.status().as_u16();
             metrics.record_request(status, elapsed);
             metrics.request_bytes(request_bytes);
+            let mut upstream = None;
             if let Some(labels) = response.extensions().get::<elira_proxy::Labels>().cloned() {
                 metrics.record_route(&labels.route, status, elapsed);
-                if let Some(upstream) = &labels.upstream {
-                    metrics.record_upstream(upstream, status, elapsed);
+                if let Some(name) = &labels.upstream {
+                    metrics.record_upstream(name, status, elapsed);
                 }
+                upstream = labels.upstream;
             }
             match response
                 .headers()
@@ -608,6 +610,7 @@ async fn serve_conn<I>(
                 duration: elapsed,
                 user_agent,
                 request_id: id,
+                upstream,
             };
 
             current.write_log(&entry);
