@@ -7,28 +7,44 @@ Pronounced *eh-LEE-rah*.
 ## Run
 
 ```
+cargo build --release
 cargo run -- run --config elira.toml
 cargo run -- check --config elira.toml
+cargo run -- migrate /etc/nginx/nginx.conf > elira.toml
 ```
 
-SIGHUP reloads routes, upstreams, certificates and the log format without
-dropping connections. The listen address and connection limits need a
-restart, and the server says so instead of pretending otherwise.
+`check` parses and validates without opening sockets. `migrate` converts a
+subset of nginx configuration and prints what it could not carry over.
+
+SIGHUP reloads routes, upstreams, certificates, TLS settings, cache policy,
+health checks and the access log without dropping HTTP/1.1 or HTTP/2
+connections. The listen addresses and connection limits need a restart, and
+the server says so instead of pretending otherwise.
+
+SIGUSR2 starts a replacement and waits for it to bind every listener before
+draining the old process. If the replacement fails, the old process keeps
+running. This needs `reuse_port = true`. The same readiness moment sends
+`READY=1` and `MAINPID` to systemd, so the unit uses `Type=notify`.
 
 ## Config
 
 ```toml
-listen = "127.0.0.1:8080"
+listen = "0.0.0.0:8080"
+listen_unix = "/run/elira.sock"   # optional plain HTTP/1.1 listener
 
 [limits]
 max_headers = 64
 max_header_bytes = 16384
-upstream_timeout_secs = 30
 max_connections = 1024
 idle_timeout_secs = 60
+upstream_timeout_secs = 30
+request_body_timeout_secs = 30
+upstream_body_timeout_secs = 30
+websocket_idle_secs = 3600
 max_body_bytes = 8388608
 requests_per_second = 100
 burst = 200
+response_buffer_bytes = 65536
 trusted_proxies = ["10.0.0.0/8"]
 
 [compression]
@@ -38,9 +54,23 @@ min_bytes = 1024
 [tls]
 cert = "/etc/elira/cert.pem"
 key = "/etc/elira/key.pem"
+# client_ca = "/etc/elira/clients.pem"
+# client_auth = "optional"       # or "required"
+# min_version = "tls12"
+
+# Extra certificates selected by SNI. The pair above stays the default.
+# [[tls.certificates]]
+# cert = "/etc/elira/other.pem"
+# key = "/etc/elira/other.key"
+# names = ["other.example.com", "*.other.example.com"]
 
 [log]
-format = "text"          # or "json"
+format = "text"                  # or "json"
+# file = "/var/log/elira/access.log"
+# max_bytes = 67108864
+# keep = 3
+# template = '$remote_addr "$request" $status $body_bytes_sent $request_time'
+# syslog = "/dev/log"
 
 [health]
 enabled = true
@@ -52,6 +82,8 @@ timeout_secs = 2
 listen = "0.0.0.0:443"
 cert = "/etc/elira/cert.pem"
 key = "/etc/elira/key.pem"
+# client_ca = "/etc/elira/clients.pem"
+# client_auth = "required"
 
 [connect]
 enabled = false                 # an open CONNECT proxy is an SSRF pivot
@@ -59,127 +91,195 @@ allow = ["10.0.0.5:5432"]       # exact host:port destinations only
 
 [metrics]
 listen = "127.0.0.1:9090"
+# auth_file = "/etc/elira/admin.htpasswd"
 
 [cache]
 enabled = true
 ttl_secs = 60
+stale_secs = 120                # serve stale while one refresh runs
+max_bytes = 67108864
 max_item_bytes = 1048576
+# dir = "/var/cache/elira"      # bodies on disk, metadata in memory
+
+# ACME instead of a static [tls] block. TLS-ALPN-01 only, needs port 443.
+# [acme]
+# domains = ["example.com", "www.example.com"]
+# contacts = ["mailto:admin@example.com"]
+# cache_dir = "/var/lib/elira/acme"
+# production = true
 
 [[upstreams]]
 name = "app"
 servers = ["127.0.0.1:3000", "127.0.0.1:3001"]
 balance = "least_conn"
 retries = 1
+dns_ttl_secs = 10               # cap on pooled connection lifetime
+# tls = true
+# http2 = true
+# sni = "app.internal"          # needed when servers contains an IP
+# health_path = "/ready"
+# tls_ca = "/etc/elira/internal.pem"
+# tls_insecure = false
+
+[[upstreams]]
+name = "container"
+servers = ["unix:/run/app.sock"]
 
 [[routes]]
-host = "*"               # or example.com, or *.example.com
+host = "*"                      # or example.com, or *.example.com
 upstream = "app"
 
 [[routes]]
 host = "*"
-path = "/api"            # longest prefix wins
+path = "/api"                   # longest prefix wins
 upstream = "app"
-strip_prefix = true      # /api/users reaches the backend as /users
+strip_prefix = true             # /api/users reaches the backend as /users
+timeout_secs = 5
+requests_per_second = 50
+max_body_bytes = 1048576
+error_pages = ["502 /502.html"]
+error_root = "/srv/errors"
 
 [[routes]]
 host = "old.example.com"
 redirect = { to = "https://new.example.com/", status = 301 }
 
-# A static route uses `root` instead of `upstream`.
+# A static route uses root instead of upstream.
 [[routes]]
 host = "static.example.com"
 root = "/srv/www"
 index = ["index.html"]
-spa = false              # true serves index.html for client-side routes
+spa = false                    # true serves index.html for client-side routes
+try_files = ["$uri", "$uri.html"]
+autoindex = false
+auth_file = "/etc/elira/static.htpasswd"
+ip_allow = ["10.0.0.0/8"]
 add_headers = ["X-Frame-Options: DENY"]
 remove_headers = ["X-Powered-By"]
 ```
 
-## What it does today
+The full reference, reload table and error list live in
+[docs/configuration.md](docs/configuration.md). How a request moves through
+the code is in [docs/architecture.md](docs/architecture.md).
 
-- routes on Host, ignoring case, port and userinfo; HTTP/2 uses `:authority`
-- round-robins across the servers of an upstream
-- TLS via rustls, ALPN `h2` then `http/1.1`, certificates reload on SIGHUP
-- HTTP/1.1, HTTP/2, and HTTP/3 over QUIC on a separate UDP listener
-- websockets and other `Upgrade` protocols, tunneled over a raw upstream socket
-- `CONNECT` tunnels, off by default and limited to an explicit `host:port` list
-- static files: index files, MIME types, ETag and `If-None-Match`,
-  `If-Modified-Since`, single byte ranges, `HEAD`, optional SPA fallback
-- Prometheus metrics on a separate listener: requests by status class,
-  latency histogram, in-flight connections, healthy upstreams
-- round-robins or least-conn across upstreams, retries a dead one for bodyless
+## What it does
+
+Routing:
+
+- exact hosts, `*.example.com`, `host = "*"`, longest path prefix
+- `strip_prefix`, redirect routes, `try_files`, SPA fallback, directory listings
+- per-route `add_headers`/`remove_headers`, `timeout_secs`, token bucket, body
+  cap and error pages
+- HTTP Basic auth from htpasswd (bcrypt) and IPv4/IPv6 allow/deny lists
+
+Upstreams:
+
+- round robin and least connections, active health checks, retries for bodyless
   idempotent requests
-- gzip for compressible responses when the client asks, with `Vary`
-- per-IP token-bucket rate limiting and a `Content-Length` body cap
-- `trusted_proxies` so `X-Forwarded-For` is only extended by peers you name
-- PROXY protocol v1 and v2, so a load balancer can pass the real client address
-- routes by exact host, `*.wildcard`, longest path prefix, with `strip_prefix`
-- redirect routes, per-route `add_headers`/`remove_headers`, `Server` can be hidden
-- `X-Request-Id` echoed and forwarded, `Alt-Svc` advertises HTTP/3
-- brotli and gzip, plus precompressed `.br`/`.gz` static siblings
-- a cache for small `GET` responses with `X-Cache: HIT/MISS/STALE`, optional
-  disk bodies and stale-while-revalidate, honouring `Vary`, `Cache-Control`,
-  and never sharing `Authorization`/`Cookie` requests
-- per-route timeouts, token buckets, body caps, and `error_pages`
-- SNI-selected certificates, mutual TLS, and a minimum TLS version
-- HTTP/2 and per-upstream SNI/CA/trust overrides to upstreams
-- access-log templates and syslog output, alongside file rotation
-- admin listener: `/metrics`, `/status`, `POST /reload`, `/drain`, `/cache/purge`
-- body progress timeouts, tunnel idle timeouts, and buffered small responses
-- SIGUSR2 handoff that waits for the replacement to bind before draining
+- TCP and unix sockets in the same pool
+- TLS with a custom CA, explicit `insecure`, per-upstream SNI and HTTP/2
+- WebSocket and other `Upgrade` tunnelling, `CONNECT` with an explicit allowlist
+- `X-Forwarded-For` extended only for `trusted_proxies`; client-supplied
+  forwarding headers are dropped
+
+TLS:
+
+- rustls with ALPN `h2` then `http/1.1`; HTTP/3 uses `h3`
+- SNI-selected certificates, minimum TLS version
+- mutual TLS on TCP and QUIC, optional or required
+
+HTTP:
+
+- HTTP/1.1, HTTP/2, HTTP/3 over QUIC on a separate UDP listener
+- body progress timeouts, websocket/CONNECT idle timeout
+- optional buffering of small upstream responses
+- gzip/brotli, `Alt-Svc`, `Server` hiding, `X-Request-Id`
+
+Static files:
+
+- index files, MIME types, `ETag`, `If-None-Match`, `If-Modified-Since`
+- single byte ranges; `HEAD`; precompressed `.br`/`.gz` siblings
+- on-the-fly compression; path traversal and symlink escapes rejected
+- `sendfile(2)` for plain HTTP/1.1 GET/HEAD, decided before hyper
+
+Cache:
+
+- small `GET` responses with `X-Cache: HIT`, `MISS` or `STALE`
+- `Vary`, `Cache-Control`, `s-maxage`/`max-age`, `Age`
+- `Authorization`/`Cookie` requests never read or write the cache
+- optional disk bodies and stale-while-revalidate with one background refresh
+
+Ops:
+
+- Prometheus metrics plus JSON `/status` on the admin listener
+- `POST /reload`, `POST /drain`, `POST /cache/purge`, optional Basic auth
+- text or JSON access log with request id, file rotation, nginx-like templates
+  and syslog
+- PROXY protocol v1/v2 before TLS and HTTP (TCP only)
+- ACME via TLS-ALPN-01, verified against Let's Encrypt staging and production
 - `elira migrate` for a subset of nginx configuration
-- unix sockets on both sides: `listen_unix` and `unix:/path` upstreams
-- disk-backed cache bodies, stale-while-revalidate, and per-upstream DNS TTL
-- `try_files` and generated directory listings (`autoindex`)
-- TLS to upstreams, with a custom CA or an explicit insecure mode
-- ACME (Let's Encrypt, TLS-ALPN-01) instead of a static `[tls]` block
-- hot restart on `SIGUSR2` with `reuse_port = true`, no dropped connections
-- `sendfile(2)` for plain HTTP/1.1 static GET/HEAD, decided before hyper
-- static files compressed on the fly, or served from a precompressed sibling
-- access log to a file with size-based rotation and reopen on SIGHUP
-- HTTP Basic auth from an htpasswd file and per-route IP allow/deny lists
-- per-route upstream timeouts, HTTP/2 to upstreams, mutual TLS on the listener
-- Prometheus `/metrics` and a JSON `/status` on the admin listener
-- access log in text or JSON, with a request id per line
-- active health checks: a server that stops answering 2xx/3xx stops receiving
-  traffic, and comes back on its own
-- strips hop-by-hop headers, including the tokens named in `Connection`
-- drops client-supplied `Forwarded`, any `X-Forwarded-*`, `X-Real-IP`,
-  `X-Original-URL`, `X-Rewrite-URL`, and the underscore aliases, then sets
-  its own
-- 64 headers, 16 KiB buffer, 30 s header read timeout, 1024 connections,
-  60 s idle timeout
-- 30 s upstream timeout, 10 s drain on SIGINT or SIGTERM
+
+## Admin listener
+
+With `[metrics]` set:
+
+| Request | Result |
+| --- | --- |
+| `GET /metrics` | Prometheus text |
+| `GET /status` | upstreams, servers, health, active requests, cache stats |
+| `POST /reload` | same as SIGHUP |
+| `POST /drain` | graceful shutdown |
+| `POST /cache/purge` | drop cached responses |
+
+The listener has no TLS. Put it on loopback or set `auth_file`.
 
 ## Not yet
 
-`CONNECT` is disabled unless `[connect]` names the destinations, and it is
-HTTP/1.1 only. `sendfile` is a fast path, not the default for every response:
-TLS, HTTP/2, ranges, conditionals and per-route headers take the normal path.
-Multi-range requests fall back to the whole file. The HTTP/3 listener is
-restarted on SIGHUP, which resets its live connections; HTTP/1.1 and HTTP/2
-connections survive a reload. The ACME path compiles and is wired, but has not
-been run against a real CA.
+- PROXY protocol is not accepted on QUIC. With `proxy_protocol = true` the
+  HTTP/3 listener must bind loopback, otherwise config loading fails: a public
+  UDP port would let clients bypass the required header.
+- The HTTP/3 listener is restarted on SIGHUP, which resets live QUIC
+  connections. HTTP/1.1 and HTTP/2 connections survive a reload.
+- `sendfile` declines TLS, HTTP/2, ranges, conditionals, compression, auth,
+  ACLs, per-route limiters, error pages and custom header changes. Everything
+  else takes the normal path. Multi-range requests return the whole file.
+- The cache does not survive a restart. With `cache.dir`, the directory is
+  cleaned at startup rather than reloaded.
+- ACME supports TLS-ALPN-01 only; port 443 must be reachable from the internet.
+- No FastCGI, CGI, regex locations, dynamic modules or multi-process workers.
+- DNS resolution uses the system resolver. `dns_ttl_secs` bounds how long a
+  pooled connection may outlive a DNS change.
 
 ## Layout
 
-- `crates/elira-config` — parsing and validation, no I/O beyond reading the file
-- `crates/elira-proxy` — request forwarding, header hygiene, health probing
-- `crates/elira-tls` — certificate loading
-- `crates/elira-accesslog` — log formatting
-- `crates/elira-h3` — HTTP/3 over QUIC
-- `crates/elira` — the library, its `server` module, and the binary
+- `crates/elira` — binary, listener, runtime, sendfile, access log, admin API
+- `crates/elira-config` — TOML types, defaults, validation, errors
+- `crates/elira-proxy` — routing, forwarding, cache use, static files, health
+- `crates/elira-tls` — PEM loading, SNI resolver, mTLS verifier, ALPN
+- `crates/elira-upstream` — HTTPS connector and trust options
+- `crates/elira-cache` — bounded response cache, disk bodies, stale window
+- `crates/elira-auth` — htpasswd Basic auth and IP ACLs
+- `crates/elira-limit` — token bucket
+- `crates/elira-accesslog` — entry formatting, templates, syslog, request id
+- `crates/elira-metrics` — counters, histogram, Prometheus rendering
+- `crates/elira-h3` — QUIC endpoint and HTTP/3 request bridge
+- `crates/elira-acme` — TLS-ALPN-01 certificate state machine
+- `crates/elira-migrate` — nginx config to TOML
 
-## Tests
+## Tests and benchmarks
 
 ```
-cargo test
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo bench -p elira-cache
+cargo bench -p elira-config
+make load URL=https://example.com/
 ```
 
-The unit tests cover config validation, header hygiene, log escaping and
-TLS loading. `crates/elira/tests/proxy.rs` drives the real listener over
-real sockets: routing, spoofed headers, idle shutdown, websockets and
-CONNECT.
+The end-to-end suite drives real sockets: routing, header spoofing, static
+ranges, compression, cache privacy and `Vary`, stale refresh, auth and ACLs,
+sendfile fallbacks, TLS and mutual TLS handshakes, PROXY protocol, unix
+listeners and upstreams, a failed hot restart, and access logs.
 
 ## License
 
