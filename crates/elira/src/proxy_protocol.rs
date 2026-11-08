@@ -87,18 +87,18 @@ fn parse_v2(head: &[u8]) -> Option<SocketAddr> {
 
     let family = head[13];
     match family {
-        // TCP over IPv4.
+        // TCP over IPv4: src addr, dst addr, src port, dst port.
         0x11 => {
             let source = Ipv4Addr::new(head[16], head[17], head[18], head[19]);
-            let port = u16::from_be_bytes([head[20], head[21]]);
+            let port = u16::from_be_bytes([head[24], head[25]]);
             Some(SocketAddr::new(IpAddr::V4(source), port))
         }
-        // TCP over IPv6.
+        // TCP over IPv6: 16-byte addresses, then the ports.
         0x21 => {
             let mut octets = [0u8; 16];
             octets.copy_from_slice(&head[16..32]);
             let source = Ipv6Addr::from(octets);
-            let port = u16::from_be_bytes([head[32], head[33]]);
+            let port = u16::from_be_bytes([head[48], head[49]]);
             Some(SocketAddr::new(IpAddr::V6(source), port))
         }
         _ => None,
