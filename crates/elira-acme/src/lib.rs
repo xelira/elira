@@ -21,6 +21,8 @@ use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 
+mod dns;
+
 /// Order matters: a browser that offers both gets HTTP/2 first. The challenge
 /// protocol has to be present as well, otherwise validation handshakes cannot
 /// negotiate it on this socket.
@@ -36,6 +38,10 @@ pub struct AcmeConfig {
     /// limits during development.
     pub production: bool,
     pub challenge: Challenge,
+    /// DNS-01 hook command. Required for [`Challenge::Dns01`].
+    pub dns_hook: Option<PathBuf>,
+    /// Wait after the hook before telling the CA to validate.
+    pub dns_propagation_secs: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -43,6 +49,7 @@ pub enum Challenge {
     #[default]
     TlsAlpn01,
     Http01,
+    Dns01,
 }
 
 #[derive(Debug, Error)]
@@ -58,6 +65,19 @@ pub enum ConfigError {
 
     #[error("invalid contact {contact:?}: expected a mailto: URI")]
     InvalidContact { contact: String },
+
+    #[error("DNS-01 requires dns_hook")]
+    DnsHookMissing,
+
+    #[error("run dns_hook {path}: {source}")]
+    DnsHook {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("dns_hook {path} exited with {status:?}")]
+    DnsHookStatus { path: PathBuf, status: Option<i32> },
 
     #[error("cache directory path is empty")]
     EmptyCacheDir,
@@ -91,7 +111,12 @@ impl AcmeConfig {
             return Err(ConfigError::NoDomains);
         }
         for domain in &self.domains {
-            if !is_valid_domain(domain) {
+            let name = if self.challenge == Challenge::Dns01 {
+                domain.strip_prefix("*.").unwrap_or(domain)
+            } else {
+                domain.as_str()
+            };
+            if !is_valid_domain(name) {
                 return Err(ConfigError::InvalidDomain {
                     domain: domain.clone(),
                 });
@@ -153,20 +178,51 @@ fn is_valid_contact(contact: &str) -> bool {
 /// Dropping it aborts the renewal task. Handshakes already in progress are
 /// owned by the caller and are not affected.
 pub struct Acme {
-    acceptor: AcmeAcceptor,
-    server_config: Arc<ServerConfig>,
-    resolver: Arc<ResolvesServerCertAcme>,
-    http01: bool,
-    renewal: JoinHandle<()>,
+    mode: Mode,
+    renewal: Option<JoinHandle<()>>,
+}
+
+enum Mode {
+    Rustls {
+        acceptor: AcmeAcceptor,
+        server_config: Arc<ServerConfig>,
+        resolver: Arc<ResolvesServerCertAcme>,
+        http01: bool,
+    },
+    Dns(Arc<arc_swap::ArcSwap<ServerConfig>>),
 }
 
 impl Acme {
     pub async fn start(config: AcmeConfig) -> anyhow::Result<Self> {
         config.prepare()?;
 
+        if config.challenge == Challenge::Dns01 {
+            let (server, _, _) = dns::build_config(&config).await?;
+            let shared = Arc::new(arc_swap::ArcSwap::from(server));
+            let renewal_config = config.clone();
+            let renewal_shared = shared.clone();
+            let renewal = tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(12 * 60 * 60)).await;
+                    match dns::build_config(&renewal_config).await {
+                        Ok((server, _, _)) => {
+                            renewal_shared.store(server);
+                            tracing::info!("DNS-01 certificate renewed");
+                        }
+                        Err(error) => tracing::warn!(%error, "DNS-01 renewal failed"),
+                    }
+                }
+            });
+            return Ok(Self {
+                mode: Mode::Dns(shared),
+                renewal: Some(renewal),
+            });
+        }
+
         let challenge = match config.challenge {
             Challenge::TlsAlpn01 => UseChallenge::TlsAlpn01,
             Challenge::Http01 => UseChallenge::Http01,
+            Challenge::Dns01 => unreachable!("handled above"),
         };
         let mut state = rustls_acme::AcmeConfig::new(config.domains.iter())
             .contact(config.contacts.iter())
@@ -204,45 +260,56 @@ impl Acme {
         });
 
         Ok(Self {
-            acceptor,
-            server_config: Arc::new(server_config),
-            resolver,
-            http01: config.challenge == Challenge::Http01,
-            renewal,
+            mode: Mode::Rustls {
+                acceptor,
+                server_config: Arc::new(server_config),
+                resolver,
+                http01: config.challenge == Challenge::Http01,
+            },
+            renewal: Some(renewal),
         })
     }
 
-    /// Finish the TLS handshake and report whether HTTP/2 was negotiated.
-    ///
-    /// A TLS-ALPN-01 validation connection completes with no application
-    /// stream; it is reported as [`io::ErrorKind::ConnectionAborted`] so the
-    /// caller can drop it without serving a request.
     /// The key authorization for an HTTP-01 token, when that challenge type
     /// is active and the token is current.
     pub fn http01(&self, token: &str) -> Option<String> {
-        self.resolver.get_http_01_key_auth(token)
+        match &self.mode {
+            Mode::Rustls { resolver, .. } => resolver.get_http_01_key_auth(token),
+            Mode::Dns(_) => None,
+        }
     }
 
     /// Whether this manager uses HTTP-01, which means the main listener is
     /// plain HTTP rather than TLS.
     pub fn uses_http01(&self) -> bool {
-        self.http01
+        matches!(&self.mode, Mode::Rustls { http01: true, .. })
     }
 
     pub async fn accept(&self, stream: TcpStream) -> io::Result<(Box<dyn AsyncStream>, bool)> {
-        let stream = stream.compat();
-
-        let Some(handshake) = self.acceptor.accept(stream).await? else {
-            return Err(io::Error::new(
-                io::ErrorKind::ConnectionAborted,
-                "TLS-ALPN-01 validation completed",
-            ));
-        };
-
-        let tls = handshake.into_stream(self.server_config.clone()).await?;
-        let h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2");
-
-        Ok((Box::new(tls.compat()), h2))
+        match &self.mode {
+            Mode::Dns(config) => {
+                let acceptor = tokio_rustls::TlsAcceptor::from(config.load_full());
+                let tls = acceptor.accept(stream).await?;
+                let h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2");
+                Ok((Box::new(tls), h2))
+            }
+            Mode::Rustls {
+                acceptor,
+                server_config,
+                ..
+            } => {
+                let stream = stream.compat();
+                let Some(handshake) = acceptor.accept(stream).await? else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "TLS-ALPN-01 validation completed",
+                    ));
+                };
+                let tls = handshake.into_stream(server_config.clone()).await?;
+                let h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2");
+                Ok((Box::new(tls.compat()), h2))
+            }
+        }
     }
 }
 
@@ -250,7 +317,9 @@ impl Drop for Acme {
     fn drop(&mut self) {
         // Without this the renewal task would keep polling a state machine
         // whose only consumer is gone.
-        self.renewal.abort();
+        if let Some(renewal) = &self.renewal {
+            renewal.abort();
+        }
     }
 }
 
@@ -300,6 +369,8 @@ mod tests {
             cache_dir: dir.join("cache"),
             production: false,
             challenge: Challenge::TlsAlpn01,
+            dns_hook: None,
+            dns_propagation_secs: 0,
         }
     }
 
@@ -380,6 +451,21 @@ mod tests {
         let dir = TempDir::new("valid");
         let config = valid_config(dir.path());
 
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn wildcards_are_allowed_only_for_dns01() {
+        let dir = TempDir::new("wildcard");
+        let mut config = valid_config(dir.path());
+        config.domains = vec!["*.example.com".into()];
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidDomain { .. })
+        ));
+
+        config.challenge = Challenge::Dns01;
+        config.dns_hook = Some(Path::new("/bin/true").to_path_buf());
         assert!(config.validate().is_ok());
     }
 }

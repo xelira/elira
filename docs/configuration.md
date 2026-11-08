@@ -229,8 +229,10 @@ HTTP/1.1-соединении подглядывается до hyper, и про
 | `contacts` | массив строк | обязателен | контакты ACME, `mailto:...` |
 | `cache_dir` | путь | обязателен | кэш сертификатов и аккаунта |
 | `production` | bool | `false` | `true` — Let's Encrypt, `false` — staging |
-| `challenge` | `tls_alpn_01` \| `http_01` | `tls_alpn_01` | способ валидации |
+| `challenge` | `tls_alpn_01` \| `http_01` \| `dns_01` | `tls_alpn_01` | способ валидации |
 | `http01_listen` | `IP:порт` | нет | отдельный plain-HTTP листенер для HTTP-01 |
+| `dns_hook` | путь | нет | команда, публикующая TXT для DNS-01 |
+| `dns_propagation_secs` | целое | `30` | пауза после hook перед валидацией |
 
 Сертификат получается по TLS-ALPN-01 прямо на основном TLS-листенере: порт
 80 не нужен, но 443 должен быть доступен извне. `[acme]` и `[tls]` вместе —
@@ -241,6 +243,13 @@ HTTP/1.1-соединении подглядывается до hyper, и про
 production-лимитов. HTTP-01 требует, чтобы `listen` был на порту 80 либо был
 задан `http01_listen`; токен отдаётся по
 `/.well-known/acme-challenge/<token>` без TLS.
+
+DNS-01 работает через внешний hook и поддерживает wildcard-имена. Команда
+получает `DOMAIN`, `TXT_NAME`, `TOKEN` и `VALUE` в окружении и должна
+опубликовать TXT-запись `TXT_NAME = VALUE`. После успешного exit Elira ждёт
+`dns_propagation_secs`, затем просит CA проверить запись. Учётные данные
+аккаунта и сертификат кэшируются в `cache_dir`; обновление проверяется раз
+в 12 часов.
 
 ## `[upstream_tls]`
 

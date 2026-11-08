@@ -126,7 +126,10 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
             challenge: match acme.challenge {
                 elira::config::AcmeChallenge::TlsAlpn01 => elira_acme::Challenge::TlsAlpn01,
                 elira::config::AcmeChallenge::Http01 => elira_acme::Challenge::Http01,
+                elira::config::AcmeChallenge::Dns01 => elira_acme::Challenge::Dns01,
             },
+            dns_hook: acme.dns_hook.clone(),
+            dns_propagation_secs: acme.dns_propagation_secs,
         })
         .await?;
         options.acme = Some(Arc::new(started));

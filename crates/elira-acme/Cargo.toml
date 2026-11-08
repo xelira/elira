@@ -7,10 +7,15 @@ repository.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+arc-swap = { workspace = true }
+elira-tls = { path = "../elira-tls" }
 futures-util = { workspace = true }
+instant-acme = { version = "0.8", features = ["hyper-rustls", "rcgen"] }
 rustls = { workspace = true }
 rustls-acme = { version = "0.15", features = ["tokio"] }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
+tokio-rustls = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true, features = ["compat"] }
 tracing = { workspace = true }

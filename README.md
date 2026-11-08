@@ -242,8 +242,8 @@ Ops:
 - text or JSON access log with request id, file rotation, nginx-like templates
   and syslog
 - PROXY protocol v1/v2 before TLS and HTTP, and v2 over QUIC datagrams
-- ACME via TLS-ALPN-01 or HTTP-01, verified against Let's Encrypt staging and
-  production
+- ACME via TLS-ALPN-01, HTTP-01 or DNS-01 (external hook, wildcards), verified
+  against Let's Encrypt staging and production
 - `elira migrate` for nginx `proxy_pass`/`root`, `try_files`, `add_header`,
   `allow`/`deny`, auth files, gzip, TLS and regex locations
 - `workers > 1`: supervised worker processes sharing the port via SO_REUSEPORT,

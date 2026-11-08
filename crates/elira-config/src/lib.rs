@@ -385,6 +385,15 @@ pub struct Acme {
     /// main listener is TLS or not on port 80.
     #[serde(default)]
     pub http01_listen: Option<SocketAddr>,
+
+    /// Command that publishes a DNS-01 TXT record. Called with DOMAIN,
+    /// TXT_NAME, TOKEN and VALUE in the environment.
+    #[serde(default)]
+    pub dns_hook: Option<PathBuf>,
+
+    /// Seconds to wait after the hook before asking the CA to validate.
+    #[serde(default = "Acme::default_dns_propagation_secs")]
+    pub dns_propagation_secs: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -394,6 +403,14 @@ pub enum AcmeChallenge {
     TlsAlpn01,
     #[serde(rename = "http_01")]
     Http01,
+    #[serde(rename = "dns_01")]
+    Dns01,
+}
+
+impl Acme {
+    fn default_dns_propagation_secs() -> u64 {
+        30
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1002,6 +1019,14 @@ impl Config {
                 && self.listen.port() != 80
             {
                 return Err(Error::Http01NeedsListener);
+            }
+            if acme.challenge == AcmeChallenge::Dns01
+                && acme
+                    .dns_hook
+                    .as_ref()
+                    .is_none_or(|path| path.as_os_str().is_empty())
+            {
+                return Err(Error::DnsHookRequired);
             }
         }
 
@@ -1631,6 +1656,9 @@ pub enum Error {
 
     #[error("acme HTTP-01 needs a listener on port 80 or acme.http01_listen")]
     Http01NeedsListener,
+
+    #[error("acme DNS-01 needs a non-empty acme.dns_hook")]
+    DnsHookRequired,
 
     #[error("acme.cache_dir must not be empty")]
     AcmeNoCacheDir,
@@ -2703,5 +2731,28 @@ max_concurrent = 4
         let cfg = Config::parse(text).expect("valid config");
         assert_eq!(cfg.routes[0].max_concurrent, Some(4));
         assert!(cfg.tls.expect("tls").ocsp.is_some());
+    }
+
+    #[test]
+    fn dns01_requires_a_hook() {
+        let text = r#"
+listen = "127.0.0.1:8443"
+
+[acme]
+domains = ["*.example.com"]
+contacts = ["mailto:admin@example.com"]
+cache_dir = "/tmp/acme"
+challenge = "dns_01"
+
+[[routes]]
+host = "*"
+root = "/srv/www"
+"#;
+        assert!(matches!(Config::parse(text), Err(Error::DnsHookRequired)));
+        let with_hook = text.replace(
+            "challenge = \"dns_01\"",
+            "challenge = \"dns_01\"\ndns_hook = \"/usr/local/bin/publish-txt\"",
+        );
+        assert!(Config::parse(&with_hook).is_ok());
     }
 }
