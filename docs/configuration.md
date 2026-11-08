@@ -282,7 +282,7 @@ DNS-01 работает через внешний hook и поддерживае
 | `client_auth` | `off` \| `optional` \| `required` | `off` | клиентские сертификаты на QUIC |
 | `certificates` | массив таблиц | `[]` | SNI-сертификаты на QUIC, формат как у `[tls]` |
 | `idle_timeout_secs` | целое > 0 | `30` | idle timeout QUIC-соединения |
-| `early_data` | bool | `false` | разрешить 0-RTT на QUIC |
+| `early_data` | bool | `false` | разрешить 0-RTT на QUIC (проверено session resumption-клиентом) |
 
 HTTP/3 живёт на отдельном UDP-порту и не делит сокет с TCP-листенером.
 `cert`/`key` здесь независимы от `[tls]`: их можно не задавать в `[tls]` вовсе,

@@ -36,13 +36,13 @@ Living list for the self-improvement loop. One item per session.
 
 - [x] QUIC idle timeout configuration.
 - [x] QUIC 0-RTT server-side switch (`http3.early_data`).
-- [ ] 0-RTT integration test with a QUIC client.
+- [x] 0-RTT integration test with a QUIC client.
 - [ ] Shared cache or consistent-hash routing so worker caches do not produce
   avoidable misses.
-- [ ] Per-route FastCGI pool size.
+- [x] Per-route FastCGI pool size.
 - [x] TLS session ticket and resumption settings.
 - [ ] Upstream HTTP/2 connection pool metrics.
-- [ ] `cache.purge` by host/path prefix through the admin API.
+- [x] `cache.purge` by host/path prefix through the admin API.
 - [x] Expand parser fuzz targets.
 - [x] Cache prefix invalidation API.
 
