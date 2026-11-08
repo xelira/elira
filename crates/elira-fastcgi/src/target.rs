@@ -10,7 +10,7 @@ use crate::Error;
 ///
 /// A literal address connects immediately; a host name is resolved by the
 /// client for each request, so DNS changes do not require a reload.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Target {
     /// A TCP socket with a literal address.
     Tcp(SocketAddr),

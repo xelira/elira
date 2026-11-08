@@ -90,6 +90,7 @@
   world-writable модулей.
 - Потоковые FastCGI/CGI: stdin/stdout с backpressure и лимитом ответа.
 - OCSP stapling из DER-файла, перечитываемого по SIGHUP.
+- Пул idle-соединений FastCGI с TTL и повторной попыткой на мёртвом сокете.
 - `elira migrate` переносит `try_files`, `add_header`, `allow`/`deny`,
   `auth_basic_user_file`, `client_max_body_size`, `gzip`, TLS и regex-location.
 - FastCGI-бэкенды по TCP и unix-сокетам, CGI-скрипты и нативные

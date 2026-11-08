@@ -93,6 +93,7 @@ struct Inner {
     tunnel_idle: Option<Duration>,
     buffer_bytes: usize,
     max_app_response: usize,
+    fastcgi_pool: elira_fastcgi::Pool,
     refreshing: Arc<Mutex<HashSet<String>>>,
 }
 
@@ -698,6 +699,10 @@ impl Proxy {
                 },
                 buffer_bytes: cfg.limits.response_buffer_bytes,
                 max_app_response: cfg.limits.max_response_bytes,
+                fastcgi_pool: elira_fastcgi::Pool::new(
+                    cfg.limits.fastcgi_pool_idle,
+                    Duration::from_secs(cfg.limits.fastcgi_pool_idle_secs),
+                ),
                 refreshing: Arc::new(Mutex::new(HashSet::new())),
             }),
         })
@@ -1652,14 +1657,17 @@ impl Proxy {
         let request_body = limit_body(request_body, limit).boxed();
         let timeout = entry.timeout.unwrap_or(self.inner.timeout);
 
-        let response = match elira_fastcgi::execute_stream(
-            target,
-            params,
-            request_body,
-            timeout,
-            self.inner.max_app_response,
-        )
-        .await
+        let response = match self
+            .inner
+            .fastcgi_pool
+            .execute_stream(
+                target,
+                params,
+                request_body,
+                timeout,
+                self.inner.max_app_response,
+            )
+            .await
         {
             Ok(response) => response,
             Err(err) => {

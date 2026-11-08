@@ -9,15 +9,17 @@
 //! FastCGI records over a bounded channel. That keeps record framing out of
 //! `tokio::select!` (a partially read record cannot be cancelled) and lets the
 //! request pump and the response reader make progress independently. When the
-//! response headers are complete, the record receiver is handed to a
-//! background task that forwards body chunks over a second bounded channel.
-//! Dropping the body stream closes that channel, which stops both tasks and
-//! closes the socket.
+//! response headers are complete, the record receiver, the write half, and a
+//! background body forwarder take over.
+//!
+//! For a pooled exchange the reader also hands its read half back when it sees
+//! a clean `END_REQUEST`. The body forwarder reunites both halves and sends
+//! the socket to the pool only after the caller has drained the body. If the
+//! caller drops the body early, the forwarder exits without returning anything,
+//! so both halves are dropped and the connection closes.
 
 use std::fmt;
 use std::future::Future;
-use std::io;
-use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -25,11 +27,12 @@ use std::time::Duration;
 use bytes::{Bytes, BytesMut};
 use futures_core::Stream;
 use futures_util::StreamExt;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadHalf};
-use tokio::net::{TcpStream, UnixStream};
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::pool::PoolHandle;
 use crate::protocol::{self, Record, RecordType};
+use crate::socket::{reunite, Socket, SocketRead, SocketWrite};
 use crate::Target;
 use crate::{decode_end_request, protocol_status_name, response, write_record, BoxError, Error};
 
@@ -78,7 +81,7 @@ const BODY_CHANNEL_CAPACITY: usize = 8;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 
 /// Send one request to `target` with a streaming body and return a streaming
-/// response.
+/// response using a one-shot connection.
 ///
 /// A zero `timeout` disables deadlines. A non-zero timeout covers connecting,
 /// writing each record, reading the header block, and reading every later
@@ -93,76 +96,53 @@ pub async fn execute_stream(
     max_stdout: usize,
 ) -> Result<StreamResponse, Error> {
     let target_name = target.to_string();
-
-    match target {
-        Target::Tcp(_) | Target::TcpName(_) => {
-            let address = with_deadline(timeout, &target_name, resolve(target)).await?;
-            let stream = with_deadline(timeout, &target_name, async {
-                TcpStream::connect(address)
-                    .await
-                    .map_err(|source| Error::Connect {
-                        target: target_name.clone(),
-                        source,
-                    })
-            })
-            .await?;
-            stream_exchange(stream, params, body, timeout, max_stdout, target_name).await
-        }
-        Target::Unix(path) => {
-            let stream = with_deadline(timeout, &target_name, async {
-                UnixStream::connect(path)
-                    .await
-                    .map_err(|source| Error::Connect {
-                        target: target_name.clone(),
-                        source,
-                    })
-            })
-            .await?;
-            stream_exchange(stream, params, body, timeout, max_stdout, target_name).await
-        }
-    }
+    let socket = with_deadline(timeout, &target_name, Socket::connect(target)).await?;
+    stream_exchange(
+        socket,
+        params,
+        body,
+        timeout,
+        max_stdout,
+        target_name,
+        false,
+        None,
+    )
+    .await
 }
 
-async fn resolve(target: &Target) -> Result<SocketAddr, Error> {
-    match target {
-        Target::Tcp(address) => Ok(*address),
-        Target::TcpName(name) => tokio::net::lookup_host(name)
-            .await
-            .map_err(|source| Error::Connect {
-                target: target.to_string(),
-                source,
-            })?
-            .next()
-            .ok_or_else(|| Error::Connect {
-                target: target.to_string(),
-                source: io::Error::new(io::ErrorKind::NotFound, "host has no addresses"),
-            }),
-        Target::Unix(_) => unreachable!("Unix targets are connected directly"),
-    }
-}
-
-async fn stream_exchange<S>(
-    stream: S,
+/// One streaming exchange on an already-open connection.
+///
+/// `keep_conn` controls `FCGI_KEEP_CONN`; `pool` is present only for pooled
+/// calls and is used to return the connection once the body is complete.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn stream_exchange(
+    socket: Socket,
     params: Vec<(String, String)>,
     mut body: BodyStream,
     timeout: Duration,
     max_stdout: usize,
     target: String,
-) -> Result<StreamResponse, Error>
-where
-    S: AsyncRead + AsyncWrite + Send + 'static,
-{
-    let (reader, mut writer) = tokio::io::split(stream);
+    keep_conn: bool,
+    pool: Option<PoolHandle>,
+) -> Result<StreamResponse, Error> {
+    let (reader, mut writer) = socket.into_split();
 
     // The reader task lives until the response forwarder (or this function)
     // drops the shutdown sender. Detaching the handle is intentional: the
     // task is cancelled through that channel, not through `abort`.
     let (record_tx, mut record_rx) = mpsc::channel(RECORD_CHANNEL_CAPACITY);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let (read_half_tx, read_half_rx) = if pool.is_some() {
+        let (sender, receiver) = oneshot::channel();
+        (Some(sender), Some(receiver))
+    } else {
+        (None, None)
+    };
     tokio::spawn(read_records(
         reader,
         record_tx,
         shutdown_rx,
+        read_half_tx,
         timeout,
         target.clone(),
     ));
@@ -176,7 +156,7 @@ where
         write_record(
             &mut writer,
             RecordType::BeginRequest,
-            &protocol::begin_request_body(),
+            &protocol::begin_request_body_with_keep_conn(keep_conn),
         ),
     )
     .await?;
@@ -293,6 +273,9 @@ where
                             max_stdout,
                             total_stdout,
                             shutdown_tx,
+                            writer,
+                            read_half_rx,
+                            pool,
                         ));
 
                         return Ok(StreamResponse {
@@ -348,15 +331,14 @@ enum Event {
 }
 
 /// Read records until the response forwarder drops its shutdown sender.
-async fn read_records<S>(
-    mut reader: ReadHalf<S>,
+async fn read_records(
+    mut reader: SocketRead,
     transmitter: mpsc::Sender<Result<Record, Error>>,
     mut shutdown: oneshot::Receiver<()>,
+    mut read_half: Option<oneshot::Sender<SocketRead>>,
     timeout: Duration,
     target: String,
-) where
-    S: AsyncRead + Send + 'static,
-{
+) {
     loop {
         // Cancelling `read_record` here is safe because the whole exchange is
         // ending: the socket is about to be dropped.
@@ -365,25 +347,44 @@ async fn read_records<S>(
             result = with_deadline(timeout, &target, protocol::read_record(&mut reader)) => result,
         };
 
-        let (item, failed) = match result {
-            Ok(Some(record)) => (Ok(record), false),
+        let (item, failed, is_end) = match result {
+            Ok(Some(record)) => {
+                let is_end = record.record_type == RecordType::EndRequest as u8;
+                (Ok(record), false, is_end)
+            }
             Ok(None) => return,
-            Err(error) => (Err(error), true),
+            Err(error) => (Err(error), true, false),
         };
 
-        tokio::select! {
+        let sent = tokio::select! {
             _ = &mut shutdown => return,
-            sent = transmitter.send(item) => {
-                if sent.is_err() {
-                    return;
-                }
-            }
+            sent = transmitter.send(item) => sent,
+        };
+
+        if sent.is_err() || failed {
+            return;
         }
 
-        if failed {
+        if is_end {
+            // The record is in the forwarder's hands. Hand over the read half
+            // too so the forwarder can reunite the socket after the body has
+            // been consumed. If nobody wants it, both halves drop and the
+            // connection closes.
+            if let Some(sender) = read_half.take() {
+                let _ = sender.send(reader);
+            }
             return;
         }
     }
+}
+
+/// What the body channel carries internally.
+enum BodyEvent {
+    /// A response chunk, or an error that must reach the caller.
+    Item(Result<Bytes, BoxError>),
+    /// The response is complete. A present socket (with the pool that owns
+    /// it) is returned only after the caller actually polls this event.
+    End(Option<(Socket, PoolHandle)>),
 }
 
 /// Forward STDOUT records to the caller's body stream.
@@ -391,17 +392,20 @@ async fn read_records<S>(
 async fn forward_body(
     mut records: mpsc::Receiver<Result<Record, Error>>,
     prefix: Bytes,
-    transmitter: mpsc::Sender<Result<Bytes, BoxError>>,
+    transmitter: mpsc::Sender<BodyEvent>,
     max_stdout: usize,
     mut total_stdout: usize,
     shutdown: oneshot::Sender<()>,
+    writer: SocketWrite,
+    read_half: Option<oneshot::Receiver<SocketRead>>,
+    pool: Option<PoolHandle>,
 ) {
     // Holding this sender is what keeps the reader task alive. When this task
     // returns, the sender drops and the reader stops even if it is blocked in
     // a read.
     let _shutdown = shutdown;
 
-    if !prefix.is_empty() && transmitter.send(Ok(prefix)).await.is_err() {
+    if !prefix.is_empty() && transmitter.send(BodyEvent::Item(Ok(prefix))).await.is_err() {
         return;
     }
 
@@ -413,9 +417,9 @@ async fn forward_body(
 
         let Some(item) = item else {
             let _ = transmitter
-                .send(Err(Box::new(Error::Protocol(
+                .send(BodyEvent::Item(Err(Box::new(Error::Protocol(
                     "connection closed before END_REQUEST".to_owned(),
-                ))))
+                )))))
                 .await;
             return;
         };
@@ -423,18 +427,20 @@ async fn forward_body(
         let record = match item {
             Ok(record) => record,
             Err(error) => {
-                let _ = transmitter.send(Err(Box::new(error))).await;
+                let _ = transmitter
+                    .send(BodyEvent::Item(Err(Box::new(error))))
+                    .await;
                 return;
             }
         };
 
         if record.request_id != protocol::REQUEST_ID {
             let _ = transmitter
-                .send(Err(Box::new(Error::Protocol(format!(
+                .send(BodyEvent::Item(Err(Box::new(Error::Protocol(format!(
                     "record for request {}, expected {}",
                     record.request_id,
                     protocol::REQUEST_ID
-                )))))
+                ))))))
                 .await;
             return;
         }
@@ -444,16 +450,16 @@ async fn forward_body(
                 total_stdout = total_stdout.saturating_add(record.content.len());
                 if total_stdout > max_stdout {
                     let _ = transmitter
-                        .send(Err(Box::new(Error::Response(format!(
+                        .send(BodyEvent::Item(Err(Box::new(Error::Response(format!(
                             "STDOUT exceeds the configured limit of {max_stdout} bytes"
-                        )))))
+                        ))))))
                         .await;
                     return;
                 }
 
                 if !record.content.is_empty()
                     && transmitter
-                        .send(Ok(Bytes::from(record.content)))
+                        .send(BodyEvent::Item(Ok(Bytes::from(record.content))))
                         .await
                         .is_err()
                 {
@@ -464,38 +470,57 @@ async fn forward_body(
             // snapshot that was already returned.
             Some(RecordType::Stderr) => {}
             Some(RecordType::EndRequest) => {
-                match decode_end_request(&record.content) {
-                    Ok((_, 0)) => {}
+                let clean = match decode_end_request(&record.content) {
+                    Ok((_, 0)) => true,
                     Ok((_, protocol_status)) => {
                         let _ = transmitter
-                            .send(Err(Box::new(Error::Protocol(format!(
+                            .send(BodyEvent::Item(Err(Box::new(Error::Protocol(format!(
                                 "server ended the request with protocol status \
                                  {protocol_status} ({})",
                                 protocol_status_name(protocol_status)
-                            )))))
+                            ))))))
                             .await;
+                        false
                     }
                     Err(error) => {
-                        let _ = transmitter.send(Err(Box::new(error))).await;
+                        let _ = transmitter
+                            .send(BodyEvent::Item(Err(Box::new(error))))
+                            .await;
+                        false
                     }
+                };
+
+                if clean {
+                    let reusable = match (read_half, pool) {
+                        (Some(receiver), Some(pool)) => match receiver.await {
+                            Ok(reader) => reunite(reader, writer).map(|socket| (socket, pool)),
+                            Err(_) => None,
+                        },
+                        _ => None,
+                    };
+                    // Sending `End` here is what makes reuse wait for the
+                    // caller: the socket sits in the body channel until the
+                    // caller polls the end of the stream. If the caller drops
+                    // the body first, the send fails and the socket is closed.
+                    let _ = transmitter.send(BodyEvent::End(reusable)).await;
                 }
                 return;
             }
             Some(other) => {
                 let _ = transmitter
-                    .send(Err(Box::new(Error::Protocol(format!(
+                    .send(BodyEvent::Item(Err(Box::new(Error::Protocol(format!(
                         "unexpected {} record while waiting for the response",
                         other.name()
-                    )))))
+                    ))))))
                     .await;
                 return;
             }
             None => {
                 let _ = transmitter
-                    .send(Err(Box::new(Error::Protocol(format!(
+                    .send(BodyEvent::Item(Err(Box::new(Error::Protocol(format!(
                         "unexpected record type {} while waiting for the response",
                         record.record_type
-                    )))))
+                    ))))))
                     .await;
                 return;
             }
@@ -545,7 +570,11 @@ where
     with_deadline(timeout, target, write_record(stream, record_type, &[])).await
 }
 
-async fn with_deadline<F, T>(duration: Duration, target: &str, future: F) -> Result<T, Error>
+pub(crate) async fn with_deadline<F, T>(
+    duration: Duration,
+    target: &str,
+    future: F,
+) -> Result<T, Error>
 where
     F: Future<Output = Result<T, Error>>,
 {
@@ -564,13 +593,23 @@ where
 
 /// Minimal adapter from a bounded Tokio channel to [`futures_core::Stream`].
 struct ChannelStream {
-    receiver: mpsc::Receiver<Result<Bytes, BoxError>>,
+    receiver: mpsc::Receiver<BodyEvent>,
 }
 
 impl Stream for ChannelStream {
     type Item = Result<Bytes, BoxError>;
 
     fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.receiver.poll_recv(context)
+        match self.receiver.poll_recv(context) {
+            Poll::Ready(Some(BodyEvent::Item(item))) => Poll::Ready(Some(item)),
+            Poll::Ready(Some(BodyEvent::End(reusable))) => {
+                if let Some((socket, pool)) = reusable {
+                    pool.release(socket);
+                }
+                Poll::Ready(None)
+            }
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }

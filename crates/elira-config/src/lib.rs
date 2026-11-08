@@ -124,6 +124,14 @@ pub struct Limits {
     #[serde(default = "Limits::default_websocket_idle_secs")]
     pub websocket_idle_secs: u64,
 
+    /// Idle FastCGI connections kept per backend.
+    #[serde(default = "Limits::default_fastcgi_pool_idle")]
+    pub fastcgi_pool_idle: usize,
+
+    /// Drop an idle FastCGI connection after this many seconds.
+    #[serde(default = "Limits::default_fastcgi_pool_ttl")]
+    pub fastcgi_pool_idle_secs: u64,
+
     /// Hard cap on a streamed application response body.
     #[serde(default = "Limits::default_max_response_bytes")]
     pub max_response_bytes: usize,
@@ -152,6 +160,8 @@ impl Default for Limits {
             websocket_idle_secs: Self::default_websocket_idle_secs(),
             response_buffer_bytes: 0,
             max_response_bytes: Self::default_max_response_bytes(),
+            fastcgi_pool_idle: Self::default_fastcgi_pool_idle(),
+            fastcgi_pool_idle_secs: Self::default_fastcgi_pool_ttl(),
         }
     }
 }
@@ -187,6 +197,14 @@ impl Limits {
 
     fn default_max_response_bytes() -> usize {
         64 * 1024 * 1024
+    }
+
+    fn default_fastcgi_pool_idle() -> usize {
+        16
+    }
+
+    fn default_fastcgi_pool_ttl() -> u64 {
+        30
     }
 }
 

@@ -130,11 +130,18 @@ pub(crate) fn decode_header(raw: [u8; 8]) -> Result<Header, Error> {
     })
 }
 
-/// The body of `BEGIN_REQUEST`: role, flags, and five reserved bytes.
-pub(crate) fn begin_request_body() -> [u8; 8] {
+/// Build a `BEGIN_REQUEST` body with the `FCGI_KEEP_CONN` flag optionally set.
+///
+/// One-shot requests pass `false` and leave the flags at zero. Pooled
+/// requests pass `true` so the responder keeps the connection open after
+/// `END_REQUEST`.
+///
+/// Flag bit 0 is `FCGI_KEEP_CONN`; the rest stay zero because this client
+/// never negotiates multiplexing.
+pub(crate) fn begin_request_body_with_keep_conn(keep_conn: bool) -> [u8; 8] {
     let mut body = [0u8; 8];
     body[..2].copy_from_slice(&ROLE_RESPONDER.to_be_bytes());
-    // Flags stay zero: this client never asks for keep-alive or multiplexing.
+    body[2] = u8::from(keep_conn);
     body
 }
 
@@ -345,11 +352,16 @@ mod tests {
     }
 
     #[test]
-    fn begin_request_is_responder_with_zero_flags() {
-        let body = begin_request_body();
+    fn begin_request_is_responder_with_expected_flags() {
+        let body = begin_request_body_with_keep_conn(false);
         assert_eq!(u16::from_be_bytes([body[0], body[1]]), ROLE_RESPONDER);
         assert_eq!(body[2], 0);
         assert_eq!(&body[3..], &[0; 5]);
+
+        let pooled = begin_request_body_with_keep_conn(true);
+        assert_eq!(u16::from_be_bytes([pooled[0], pooled[1]]), ROLE_RESPONDER);
+        assert_eq!(pooled[2], 1, "FCGI_KEEP_CONN");
+        assert_eq!(&pooled[3..], &[0; 5]);
     }
 
     #[test]

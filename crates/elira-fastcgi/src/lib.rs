@@ -1,10 +1,9 @@
 //! A small FastCGI client.
 //!
-//! The proxy opens one connection per request, speaks the `RESPONDER` role,
-//! and turns the CGI response into a [`Response`]. It deliberately has no
-//! connection pool: FastCGI applications that support multiplexing are rare,
-//! and a pool hides the difference between "the server is slow" and "the
-//! server is gone".
+//! [`execute`] and [`execute_stream`] open one connection per request and
+//! speak the `RESPONDER` role. [`Pool`] adds optional connection reuse: idle
+//! connections are keyed by [`Target`], capped per target, and discarded when
+//! they go stale or sit longer than the configured TTL.
 //!
 //! ```no_run
 //! use std::time::Duration;
@@ -27,14 +26,17 @@
 //! ```
 
 mod error;
+mod pool;
 mod protocol;
 mod response;
+mod socket;
 mod stream;
 mod target;
 
 use std::time::Duration;
 
 pub use error::Error;
+pub use pool::Pool;
 pub use stream::{execute_stream, BodyStream, StreamResponse};
 pub use target::Target;
 
@@ -150,10 +152,31 @@ async fn write_request<S>(stream: &mut S, request: &Request) -> Result<(), Error
 where
     S: AsyncWrite + Unpin,
 {
+    write_request_with_flags(stream, request, false).await
+}
+
+pub(crate) async fn write_request_keep_alive<S>(
+    stream: &mut S,
+    request: &Request,
+) -> Result<(), Error>
+where
+    S: AsyncWrite + Unpin,
+{
+    write_request_with_flags(stream, request, true).await
+}
+
+async fn write_request_with_flags<S>(
+    stream: &mut S,
+    request: &Request,
+    keep_conn: bool,
+) -> Result<(), Error>
+where
+    S: AsyncWrite + Unpin,
+{
     write_record(
         stream,
         RecordType::BeginRequest,
-        &protocol::begin_request_body(),
+        &protocol::begin_request_body_with_keep_conn(keep_conn),
     )
     .await?;
 
@@ -203,7 +226,7 @@ where
     stream.write_all(content).await.map_err(write_error)
 }
 
-async fn read_response<S>(stream: &mut S) -> Result<Response, Error>
+pub(crate) async fn read_response<S>(stream: &mut S) -> Result<Response, Error>
 where
     S: AsyncRead + Unpin,
 {

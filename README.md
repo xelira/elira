@@ -198,8 +198,8 @@ Upstreams:
 
 - round robin and least connections, active health checks, retries for bodyless
   idempotent requests
-- streaming FastCGI over TCP (including DNS names) or unix sockets, streaming
-  CGI scripts, and native `.so` modules
+- streaming FastCGI over TCP (including DNS names) or unix sockets with an
+  idle connection pool, streaming CGI scripts, and native `.so` modules
 - TCP and unix sockets in the same pool
 - TLS with a custom CA, explicit `insecure`, per-upstream SNI and HTTP/2
 - WebSocket and other `Upgrade` tunnelling, `CONNECT` with an explicit allowlist
