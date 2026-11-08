@@ -876,6 +876,15 @@ impl Proxy {
             .collect()
     }
 
+    /// Custom HTTP/2 pool statistics per upstream.
+    pub fn pool_h2_stats(&self) -> Vec<(String, elira_h2::Stats)> {
+        self.inner
+            .pools
+            .iter()
+            .filter_map(|pool| pool.h2.as_ref().map(|h2| (pool.name.clone(), h2.stats())))
+            .collect()
+    }
+
     /// How many upstream servers are up, and how many are down.
     pub fn upstream_counts(&self) -> (usize, usize) {
         let mut up = 0;

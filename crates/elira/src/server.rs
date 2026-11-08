@@ -363,6 +363,15 @@ pub fn spawn_health_loop(
                     for (upstream, active) in current.proxy.pool_loads() {
                         metrics.set_upstream_load(&upstream, active);
                     }
+                    for (upstream, stats) in current.proxy.pool_h2_stats() {
+                        metrics.set_h2_pool(
+                            &upstream,
+                            stats.connections as u64,
+                            stats.active_streams as u64,
+                            stats.total_connections,
+                            stats.queued_streams as u64,
+                        );
+                    }
                 }
             }
         }

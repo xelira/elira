@@ -175,6 +175,8 @@ pub struct Delta {
     pub upstream_load: Vec<(String, u64)>,
     /// Certificate path -> Unix expiry seconds, a snapshot.
     pub certificate_expiry: Vec<(String, i64)>,
+    /// Custom HTTP/2 pool: upstream -> (connections, active, total, queued).
+    pub h2_pools: Vec<(String, u64, u64, u64, u64)>,
     /// Current connections in flight, not a delta.
     pub connections_in_flight: u64,
     /// Current upstreams considered healthy, not a delta.
@@ -255,6 +257,7 @@ pub struct Metrics {
     quic_connections: AtomicU64,
     upstream_load: Mutex<BTreeMap<String, u64>>,
     certificate_expiry: Mutex<BTreeMap<String, i64>>,
+    h2_pools: Mutex<BTreeMap<String, (u64, u64, u64, u64)>>,
 }
 
 impl Metrics {
@@ -283,6 +286,7 @@ impl Metrics {
             quic_connections: AtomicU64::new(0),
             upstream_load: Mutex::new(BTreeMap::new()),
             certificate_expiry: Mutex::new(BTreeMap::new()),
+            h2_pools: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -396,6 +400,21 @@ impl Metrics {
             .insert(path.to_owned(), expires);
     }
 
+    /// Replace the custom HTTP/2 pool gauges for one upstream.
+    pub fn set_h2_pool(
+        &self,
+        upstream: &str,
+        connections: u64,
+        active: u64,
+        total: u64,
+        queued: u64,
+    ) {
+        self.h2_pools
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(upstream.to_owned(), (connections, active, total, queued));
+    }
+
     pub fn set_upstream_load(&self, upstream: &str, active: u64) {
         self.upstream_load
             .lock()
@@ -497,6 +516,13 @@ impl Metrics {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .iter()
                 .map(|(path, expires)| (path.clone(), *expires))
+                .collect(),
+            h2_pools: self
+                .h2_pools
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .map(|(name, (a, b, c, d))| (name.clone(), *a, *b, *c, *d))
                 .collect(),
             connections_in_flight: self.connections_in_flight.load(Ordering::Relaxed),
             upstreams_up: self.upstreams_up.load(Ordering::Relaxed) as u64,
@@ -779,6 +805,36 @@ impl Metrics {
                     "elira_upstream_active_requests{{upstream=\"{}\"}} {}",
                     escape_label(name),
                     active
+                );
+            }
+        }
+        out.push_str("# HELP elira_h2_pool_connections Live custom HTTP/2 pool connections.\n");
+        out.push_str("# TYPE elira_h2_pool_connections gauge\n");
+        {
+            let pools = self
+                .h2_pools
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for (name, (connections, active, total, queued)) in pools.iter() {
+                let _ = writeln!(
+                    out,
+                    "elira_h2_pool_connections{{upstream=\"{}\"}} {connections}",
+                    escape_label(name)
+                );
+                let _ = writeln!(
+                    out,
+                    "elira_h2_pool_active_streams{{upstream=\"{}\"}} {active}",
+                    escape_label(name)
+                );
+                let _ = writeln!(
+                    out,
+                    "elira_h2_pool_total_connections{{upstream=\"{}\"}} {total}",
+                    escape_label(name)
+                );
+                let _ = writeln!(
+                    out,
+                    "elira_h2_pool_queued_streams{{upstream=\"{}\"}} {queued}",
+                    escape_label(name)
                 );
             }
         }
@@ -1890,5 +1946,25 @@ mod tests {
         assert!(metrics
             .render()
             .contains("elira_tls_certificate_expires_seconds{path=\"/tmp/cert.pem\"} 1900000000"));
+    }
+
+    #[test]
+    fn h2_pool_gauges_render() {
+        let metrics = Metrics::new();
+        metrics.set_h2_pool("app", 2, 3, 10, 1);
+        let text = metrics.render();
+        assert!(line(&text, "elira_h2_pool_connections{upstream=\"app\"} 2"));
+        assert!(line(
+            &text,
+            "elira_h2_pool_active_streams{upstream=\"app\"} 3"
+        ));
+        assert!(line(
+            &text,
+            "elira_h2_pool_total_connections{upstream=\"app\"} 10"
+        ));
+        assert!(line(
+            &text,
+            "elira_h2_pool_queued_streams{upstream=\"app\"} 1"
+        ));
     }
 }

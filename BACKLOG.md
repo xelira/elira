@@ -57,7 +57,7 @@ Living list for the self-improvement loop. One item per session.
 - [x] Expires/Date TTL fallback.
 - [x] Request Cache-Control/Pragma no-cache bypass.
 - [x] Custom HTTP/2 upstream client with pool stats.
-- [ ] Prometheus gauges for the custom HTTP/2 pool (currently in `/status`).
+- [x] Prometheus gauges for the custom HTTP/2 pool.
 
 - [x] Shared disk cache read-through (`cache.shared`).
 - [x] Global eviction and locking for the shared cache.
