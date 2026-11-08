@@ -277,6 +277,9 @@ pub struct UpstreamTls {
     /// Extra PEM roots, added to the system store.
     #[serde(default)]
     pub ca: Option<PathBuf>,
+    /// Offer HTTP/2 in ALPN. Upstreams must speak h2 or h1; both are accepted.
+    #[serde(default)]
+    pub http2: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -342,6 +345,10 @@ pub struct Route {
     /// CIDR blocks refused on this route; wins over `ip_allow`.
     #[serde(default)]
     pub ip_deny: Vec<String>,
+
+    /// Overrides `limits.upstream_timeout_secs` for this route.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 
     /// Response headers to set, as `Name: value`.
     #[serde(default)]
@@ -419,6 +426,24 @@ pub struct Tls {
     pub cert: PathBuf,
     #[serde(default)]
     pub key: PathBuf,
+
+    /// PEM bundle of roots a client certificate must chain to.
+    #[serde(default)]
+    pub client_ca: Option<PathBuf>,
+
+    /// Whether to ask clients for a certificate.
+    #[serde(default)]
+    pub client_auth: ClientAuthMode,
+}
+
+/// Client certificate policy for the TLS listener.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientAuthMode {
+    #[default]
+    Off,
+    Optional,
+    Required,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -586,6 +611,18 @@ impl Config {
             if tls.key.as_os_str().is_empty() {
                 return Err(Error::TlsMissingKey);
             }
+
+            let wants_clients = tls.client_auth != ClientAuthMode::Off;
+            match &tls.client_ca {
+                // Off ignores the CA entirely, so a stale path is harmless.
+                Some(path) if wants_clients => {
+                    if path.as_os_str().is_empty() {
+                        return Err(Error::TlsClientCaEmpty);
+                    }
+                }
+                None if wants_clients => return Err(Error::TlsClientCaRequired),
+                _ => {}
+            }
         }
 
         let mut names = HashSet::new();
@@ -657,6 +694,10 @@ impl Config {
 
             if route.autoindex && route.root.is_none() {
                 return Err(Error::AutoindexWithoutRoot { index });
+            }
+
+            if route.timeout_secs == Some(0) {
+                return Err(Error::BadRouteTimeout { index });
             }
 
             if let Some(path) = &route.auth_file {
@@ -829,6 +870,12 @@ pub enum Error {
     #[error("tls.key is required when [tls] is set and must not be empty")]
     TlsMissingKey,
 
+    #[error("tls.client_ca is required unless tls.client_auth = \"off\"")]
+    TlsClientCaRequired,
+
+    #[error("tls.client_ca must not be empty")]
+    TlsClientCaEmpty,
+
     #[error("upstream name is empty")]
     EmptyUpstreamName,
 
@@ -879,6 +926,9 @@ pub enum Error {
 
     #[error("route {index}: auth_file must not be empty")]
     EmptyAuthFile { index: usize },
+
+    #[error("route {index}: timeout_secs must be greater than zero")]
+    BadRouteTimeout { index: usize },
 
     #[error("route {index}: \"{value}\" is not a CIDR block")]
     BadAcl { index: usize, value: String },
@@ -1468,5 +1518,66 @@ upstream = "app"
 ip_allow = ["10.0.0.0/99"]
 "#;
         assert!(matches!(Config::parse(text), Err(Error::BadAcl { .. })));
+    }
+
+    #[test]
+    fn rejects_a_zero_route_timeout() {
+        let text = r#"
+listen = "127.0.0.1:8080"
+
+[[upstreams]]
+name = "app"
+servers = ["127.0.0.1:3000"]
+
+[[routes]]
+host = "*"
+upstream = "app"
+timeout_secs = 0
+"#;
+        assert!(matches!(
+            Config::parse(text),
+            Err(Error::BadRouteTimeout { .. })
+        ));
+    }
+
+    #[test]
+    fn client_auth_needs_a_ca() {
+        let text = r#"
+listen = "127.0.0.1:8443"
+
+[tls]
+cert = "/tmp/cert.pem"
+key = "/tmp/key.pem"
+client_auth = "required"
+
+[[routes]]
+host = "*"
+redirect = { to = "https://example.com", status = 301 }
+"#;
+        assert!(matches!(
+            Config::parse(text),
+            Err(Error::TlsClientCaRequired)
+        ));
+    }
+
+    #[test]
+    fn http2_can_be_enabled_for_upstreams() {
+        let text = r#"
+listen = "127.0.0.1:8080"
+
+[upstream_tls]
+http2 = true
+
+[[upstreams]]
+name = "app"
+servers = ["127.0.0.1:3000"]
+tls = true
+
+[[routes]]
+host = "*"
+upstream = "app"
+"#;
+        let cfg = Config::parse(text).expect("valid config");
+        assert!(cfg.upstream_tls.http2);
     }
 }

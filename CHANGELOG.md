@@ -24,16 +24,23 @@
 - Статика: index-файлы, MIME-типы, `ETag` и `If-None-Match`,
   `If-Modified-Since`, одиночные byte ranges, `HEAD`, SPA fallback и редирект
   каталога без завершающего `/`.
-- Сжатие gzip для подходящих ответов при `Accept-Encoding: gzip`, с `Vary` и
-  потоковой передачей тела.
+- Сжатие gzip/brotli для подходящих ответов и статики, с `Vary` и потоковой
+  передачей тела; предсжатые `.br`/`.gz` рядом с файлом выигрывают.
+- `sendfile(2)` для простых статических GET/HEAD по HTTP/1.1 без TLS.
 - Ограничение частоты запросов на IP через token bucket и лимит тела по
   `Content-Length`.
 - `trusted_proxies` для `X-Forwarded-For`; заголовки `Forwarded`,
   `X-Forwarded-*`, `X-Real-IP` и их underscore-алиасы от клиента отбрасываются.
 - PROXY protocol версий 1 и 2 до TLS и HTTP.
-- Access-лог в текстовом или JSON-формате с request id на каждый запрос.
+- Access-лог в текстовом или JSON-формате с request id на каждый запрос; вывод
+  в stdout или в файл с ротацией по размеру.
+- Basic auth из htpasswd (bcrypt) и списки `ip_allow`/`ip_deny` на маршруте.
+- Таймаут upstream'а, переопределяемый на маршруте через `timeout_secs`.
+- mTLS на TCP-листенере: `client_auth` и `client_ca` в `[tls]`.
+- HTTP/2 до upstream'а по `[upstream_tls] http2 = true`.
 - Prometheus-метрики на отдельном листенере: запросы по классам статусов,
   гистограмма задержки, число соединений в работе и состояние upstream'ов.
+  Там же `GET /status` с JSON-снимком upstream'ов и их серверов.
 - Перезагрузка конфигурации по `SIGHUP`: маршруты, upstream'ы, сертификаты и
   формат лога применяются без разрыва HTTP/1.1 и HTTP/2 соединений.
 - Ограничения на число и размер заголовков, число соединений, idle-таймаут,
@@ -42,7 +49,7 @@
 - Graceful shutdown по `SIGINT` и `SIGTERM` с ограниченным временем на
   завершение соединений.
 - Команда `elira check` для разбора и валидации конфигурации без открытия
-  сокетов.
+  сокетов и `elira migrate` для конвертации подмножества nginx-конфига.
 - Dockerfile, unit для systemd и release workflow для `x86_64` и `aarch64`.
 
 ### Changed

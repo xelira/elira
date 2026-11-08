@@ -126,6 +126,8 @@ remove_headers = ["X-Powered-By"]
 - static files compressed on the fly, or served from a precompressed sibling
 - access log to a file with size-based rotation and reopen on SIGHUP
 - HTTP Basic auth from an htpasswd file and per-route IP allow/deny lists
+- per-route upstream timeouts, HTTP/2 to upstreams, mutual TLS on the listener
+- Prometheus `/metrics` and a JSON `/status` on the admin listener
 - access log in text or JSON, with a request id per line
 - active health checks: a server that stops answering 2xx/3xx stops receiving
   traffic, and comes back on its own

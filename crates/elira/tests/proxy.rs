@@ -484,7 +484,15 @@ async fn metrics_listener_reports_requests() {
         .expect("bind metrics");
     let metrics_addr = metrics_listener.local_addr().expect("metrics addr");
     let (_metrics_stop, metrics_stop_rx) = watch::channel(false);
-    server::spawn_metrics(metrics_listener, metrics.clone(), metrics_stop_rx);
+    let status_runtime = Arc::new(ArcSwap::from_pointee(
+        Runtime::build(&Config::parse(&config).expect("parse")).expect("runtime"),
+    ));
+    server::spawn_metrics(
+        metrics_listener,
+        status_runtime,
+        metrics.clone(),
+        metrics_stop_rx,
+    );
 
     roundtrip(
         addr,
@@ -509,6 +517,14 @@ async fn metrics_listener_reports_requests() {
         "{body}"
     );
     assert!(body.contains("elira_connections_in_flight"), "{body}");
+
+    let status = roundtrip(
+        metrics_addr,
+        "GET /status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(status.contains("application/json"), "{status}");
+    assert!(status.contains("\"upstreams\""), "{status}");
 }
 
 #[tokio::test]
@@ -1421,4 +1437,49 @@ ip_allow = ["127.0.0.1/32"]
     )
     .await;
     assert_eq!(status(&response), "HTTP/1.1 200 OK");
+}
+
+#[tokio::test]
+async fn route_timeout_overrides_the_global_one() {
+    // Accept the connection, read the request, then answer too late.
+    let slow = TcpListener::bind("127.0.0.1:0").await.expect("bind slow");
+    let slow_addr = slow.local_addr().expect("slow addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = slow.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut head = [0u8; 1024];
+                let _ = stream.read(&mut head).await;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .await;
+            });
+        }
+    });
+
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[upstreams]]
+name = "slow"
+servers = ["{slow_addr}"]
+
+[[routes]]
+host = "*"
+upstream = "slow"
+timeout_secs = 1
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let response = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&response), "HTTP/1.1 504 Gateway Timeout");
 }

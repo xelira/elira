@@ -22,7 +22,7 @@ use tokio_rustls::TlsAcceptor;
 use elira_accesslog::{request_id, Entry};
 use elira_metrics::Metrics;
 
-use crate::config::{Config, Health, Http3, LogFormat};
+use crate::config::{ClientAuthMode, Config, Health, Http3, LogFormat};
 use crate::proxy::{BoxError, Proxy};
 
 /// Everything that can change on SIGHUP. A connection keeps the runtime it
@@ -39,7 +39,20 @@ pub struct Runtime {
 impl Runtime {
     pub fn build(cfg: &Config) -> anyhow::Result<Self> {
         let tls = match &cfg.tls {
-            Some(tls) => Some(Arc::new(elira_tls::server_config(&tls.cert, &tls.key)?)),
+            Some(tls) => {
+                let mode = match tls.client_auth {
+                    ClientAuthMode::Off => elira_tls::ClientAuth::Off,
+                    ClientAuthMode::Optional => elira_tls::ClientAuth::Optional,
+                    ClientAuthMode::Required => elira_tls::ClientAuth::Required,
+                };
+                let config = elira_tls::server_config_with_client_auth(
+                    &tls.cert,
+                    &tls.key,
+                    tls.client_ca.as_deref(),
+                    mode,
+                )?;
+                Some(Arc::new(config))
+            }
             None => None,
         };
 
@@ -451,9 +464,11 @@ async fn serve_conn<I>(
     metrics.connection_finished();
 }
 
-/// Serve `/metrics` on a small separate listener. Everything else is a 404.
+/// Serve `/metrics` and `/status` on a small separate listener. Everything
+/// else is a 404.
 pub fn spawn_metrics(
     listener: TcpListener,
+    runtime: Arc<ArcSwap<Runtime>>,
     metrics: Arc<Metrics>,
     mut stop: watch::Receiver<bool>,
 ) {
@@ -467,24 +482,35 @@ pub fn spawn_metrics(
                     };
 
                     let metrics = metrics.clone();
+                    let runtime = runtime.clone();
                     tokio::spawn(async move {
                         let service = service_fn(move |req: hyper::Request<Incoming>| {
                             let metrics = metrics.clone();
+                            let runtime = runtime.clone();
                             async move {
-                                let (status, body) = if req.method() == hyper::Method::GET
-                                    && req.uri().path() == "/metrics"
-                                {
-                                    (hyper::StatusCode::OK, metrics.render())
-                                } else {
-                                    (hyper::StatusCode::NOT_FOUND, "not found".to_owned())
+                                let (status, content_type, body) = match req.uri().path() {
+                                    "/metrics" if req.method() == hyper::Method::GET => (
+                                        hyper::StatusCode::OK,
+                                        "text/plain; version=0.0.4; charset=utf-8",
+                                        metrics.render(),
+                                    ),
+                                    // Loading the runtime per request keeps the
+                                    // answer current across a SIGHUP reload.
+                                    "/status" if req.method() == hyper::Method::GET => (
+                                        hyper::StatusCode::OK,
+                                        "application/json",
+                                        runtime.load().proxy().status().to_string(),
+                                    ),
+                                    _ => (
+                                        hyper::StatusCode::NOT_FOUND,
+                                        "text/plain; charset=utf-8",
+                                        "not found".to_owned(),
+                                    ),
                                 };
 
                                 let response = hyper::Response::builder()
                                     .status(status)
-                                    .header(
-                                        hyper::header::CONTENT_TYPE,
-                                        "text/plain; version=0.0.4; charset=utf-8",
-                                    )
+                                    .header(hyper::header::CONTENT_TYPE, content_type)
                                     .body(http_body_util::Full::new(hyper::body::Bytes::from(body)))
                                     .expect("static response");
 

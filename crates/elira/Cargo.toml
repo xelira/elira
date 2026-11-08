@@ -12,6 +12,7 @@ elira-acme = { path = "../elira-acme" }
 elira-config = { path = "../elira-config" }
 elira-h3 = { path = "../elira-h3" }
 elira-metrics = { path = "../elira-metrics" }
+elira-migrate = { path = "../elira-migrate" }
 elira-proxy = { path = "../elira-proxy" }
 elira-tls = { path = "../elira-tls" }
 anyhow = { workspace = true }

@@ -9,7 +9,7 @@ repository.workspace = true
 anyhow = { workspace = true }
 http = { workspace = true }
 hyper-util = { workspace = true }
-hyper-rustls = { version = "0.27.10", default-features = false, features = ["aws-lc-rs", "http1", "tls12"] }
+hyper-rustls = { version = "0.27.10", default-features = false, features = ["aws-lc-rs", "http1", "http2", "tls12"] }
 rustls = { workspace = true }
 rustls-native-certs = "0.8"
 rustls-pemfile = { workspace = true }

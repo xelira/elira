@@ -30,6 +30,14 @@ enum Command {
         #[arg(short, long, default_value = "elira.toml")]
         config: PathBuf,
     },
+    /// Convert an nginx config into elira TOML.
+    Migrate {
+        /// nginx config to read.
+        input: PathBuf,
+        /// Write the TOML here instead of stdout.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -47,6 +55,25 @@ async fn main() -> anyhow::Result<()> {
                 cfg.routes.len(),
                 cfg.upstreams.len()
             );
+            Ok(())
+        }
+        Command::Migrate { input, output } => {
+            let source = std::fs::read_to_string(&input)
+                .with_context(|| format!("cannot read {}", input.display()))?;
+            let migration = elira_migrate::migrate(&source)?;
+
+            for warning in &migration.warnings {
+                eprintln!("warning: {warning}");
+            }
+
+            match output {
+                Some(path) => {
+                    std::fs::write(&path, &migration.toml)
+                        .with_context(|| format!("cannot write {}", path.display()))?;
+                    eprintln!("wrote {}", path.display());
+                }
+                None => print!("{}", migration.toml),
+            }
             Ok(())
         }
         Command::Run { config } => {
@@ -97,7 +124,12 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
     if let Some(metrics_cfg) = &cfg.metrics {
         let metrics_listener = server::bind_tcp(metrics_cfg.listen, cfg.reuse_port)
             .with_context(|| format!("cannot bind metrics on {}", metrics_cfg.listen))?;
-        server::spawn_metrics(metrics_listener, metrics.clone(), stop_rx.clone());
+        server::spawn_metrics(
+            metrics_listener,
+            runtime.clone(),
+            metrics.clone(),
+            stop_rx.clone(),
+        );
     }
 
     let mut h3_task = spawn_h3(runtime.clone(), stop_rx.clone(), cfg.reuse_port);

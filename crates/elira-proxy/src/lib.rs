@@ -84,6 +84,7 @@ struct RouteEntry {
     remove_headers: Vec<HeaderName>,
     auth: Option<Arc<BasicAuth>>,
     acl: Option<Arc<IpAcl>>,
+    timeout: Option<Duration>,
 }
 
 struct Router {
@@ -140,6 +141,7 @@ fn parse_header_line(line: &str) -> Option<(HeaderName, HeaderValue)> {
 }
 
 struct Pool {
+    name: String,
     servers: Vec<Authority>,
     health: Vec<AtomicBool>,
     active: Vec<AtomicUsize>,
@@ -212,6 +214,41 @@ impl Pool {
 }
 
 impl Proxy {
+    /// The current pools and their servers, for the admin status endpoint.
+    pub fn status(&self) -> serde_json::Value {
+        let pools: Vec<_> = self
+            .inner
+            .pools
+            .iter()
+            .map(|pool| {
+                let servers: Vec<_> = pool
+                    .servers
+                    .iter()
+                    .enumerate()
+                    .map(|(index, server)| {
+                        serde_json::json!({
+                            "address": server.to_string(),
+                            "healthy": pool.health[index].load(Ordering::Relaxed),
+                            "active": pool.active[index].load(Ordering::Relaxed),
+                        })
+                    })
+                    .collect();
+
+                serde_json::json!({
+                    "name": pool.name,
+                    "balance": match pool.balance {
+                        Balance::RoundRobin => "round_robin",
+                        Balance::LeastConn => "least_conn",
+                    },
+                    "retries": pool.retries,
+                    "servers": servers,
+                })
+            })
+            .collect();
+
+        serde_json::json!({ "upstreams": pools })
+    }
+
     pub fn new(cfg: &Config) -> Result<Self, Error> {
         let mut pools: HashMap<String, Arc<Pool>> = HashMap::new();
         for up in &cfg.upstreams {
@@ -228,6 +265,7 @@ impl Proxy {
             pools.insert(
                 up.name.clone(),
                 Arc::new(Pool {
+                    name: up.name.clone(),
                     servers,
                     health,
                     active,
@@ -316,6 +354,7 @@ impl Proxy {
                     .collect(),
                 auth,
                 acl,
+                timeout: route.timeout_secs.map(Duration::from_secs),
             };
 
             let host = route.host.trim().to_ascii_lowercase();
@@ -391,6 +430,7 @@ impl Proxy {
             insecure: cfg.upstream_tls.insecure,
             ca: cfg.upstream_tls.ca.clone(),
             sni: None,
+            http2: cfg.upstream_tls.http2,
         })
         .map_err(|err| Error::UpstreamTls {
             reason: err.to_string(),
@@ -796,6 +836,8 @@ impl Proxy {
             template.insert(UPGRADE, upgrade.clone());
         }
 
+        let route_timeout = entry.timeout.unwrap_or(self.inner.timeout);
+
         let mut body = Some(body);
 
         if is_get && requested_upgrade.is_none() {
@@ -827,7 +869,7 @@ impl Proxy {
             *upstream.headers_mut() = template;
 
             return self
-                .forward_upgrade(upstream, client, upgrade, server)
+                .forward_upgrade(upstream, client, upgrade, server, route_timeout)
                 .await;
         }
 
@@ -858,9 +900,7 @@ impl Proxy {
                 .map_err(|_| text(StatusCode::BAD_GATEWAY, "bad request"))?;
             *upstream.headers_mut() = template.clone();
 
-            match tokio::time::timeout(self.inner.timeout, self.inner.client.request(upstream))
-                .await
-            {
+            match tokio::time::timeout(route_timeout, self.inner.client.request(upstream)).await {
                 Ok(Ok(answer)) => {
                     response = Some(answer);
                     break;
@@ -1050,6 +1090,7 @@ impl Proxy {
         client_upgrade: hyper::upgrade::OnUpgrade,
         upgrade: HeaderValue,
         server: Authority,
+        timeout: Duration,
     ) -> Result<Response<Body>, Response<Body>> {
         // Tunnels outlive the connection task that the accept loop tracks,
         // so they need their own bound.
@@ -1061,24 +1102,20 @@ impl Proxy {
         let host = server.host().trim_start_matches('[').trim_end_matches(']');
         let port = server.port_u16().unwrap_or(80);
 
-        let mut stream = match tokio::time::timeout(
-            self.inner.timeout,
-            TcpStream::connect((host, port)),
-        )
-        .await
+        let mut stream = match tokio::time::timeout(timeout, TcpStream::connect((host, port))).await
         {
             Ok(Ok(stream)) => stream,
             _ => return Err(text(StatusCode::BAD_GATEWAY, "bad gateway")),
         };
 
         let head = serialize_head(&upstream);
-        match tokio::time::timeout(self.inner.timeout, stream.write_all(head.as_bytes())).await {
+        match tokio::time::timeout(timeout, stream.write_all(head.as_bytes())).await {
             Ok(Ok(())) => {}
             _ => return Err(text(StatusCode::BAD_GATEWAY, "bad gateway")),
         }
 
         let (status, mut headers, upstream_upgrade, leftover) =
-            read_head(&mut stream, self.inner.timeout).await?;
+            read_head(&mut stream, timeout).await?;
 
         if status != StatusCode::SWITCHING_PROTOCOLS {
             // The upstream refused the upgrade. Pass the answer through with
@@ -1611,6 +1648,7 @@ mod tests {
     #[test]
     fn least_conn_prefers_the_idle_server() {
         let pool = Pool {
+            name: "test".to_owned(),
             servers: vec![
                 "127.0.0.1:1".parse().unwrap(),
                 "127.0.0.1:2".parse().unwrap(),

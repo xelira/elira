@@ -623,6 +623,7 @@ dependencies = [
  "elira-config",
  "elira-h3",
  "elira-metrics",
+ "elira-migrate",
  "elira-proxy",
  "elira-tls",
  "http",
@@ -719,6 +720,14 @@ name = "elira-metrics"
 version = "0.1.0"
 
 [[package]]
+name = "elira-migrate"
+version = "0.1.0"
+dependencies = [
+ "elira-config",
+ "thiserror",
+]
+
+[[package]]
 name = "elira-proxy"
 version = "0.1.0"
 dependencies = [
@@ -739,6 +748,7 @@ dependencies = [
  "hyper-util",
  "ipnet",
  "percent-encoding",
+ "serde_json",
  "thiserror",
  "tokio",
  "tokio-util",

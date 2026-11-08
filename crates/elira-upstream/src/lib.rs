@@ -22,13 +22,15 @@ pub struct TlsOptions {
     /// Server name for SNI when it differs from the URI authority. `None`
     /// takes the name from the URI.
     pub sni: Option<String>,
+    /// Offer `h2` in ALPN. Off keeps the upstream on HTTP/1.1.
+    pub http2: bool,
 }
 
 /// Build an HTTPS connector that accepts both `https` and `http` upstreams.
 ///
-/// HTTP/2 is intentionally not enabled: the proxy forwards to upstreams over
-/// HTTP/1.1, and offering `h2` here would make hyper expect a different
-/// connection setup.
+/// HTTP/2 is offered only when asked for: an upstream that negotiates `h2`
+/// while the caller expects HTTP/1.1 breaks in a way that is hard to read at
+/// the proxy layer.
 pub fn https_connector(options: &TlsOptions) -> anyhow::Result<HttpsConnector<HttpConnector>> {
     let config = client_config(options)?;
 
@@ -47,7 +49,11 @@ pub fn https_connector(options: &TlsOptions) -> anyhow::Result<HttpsConnector<Ht
         None => builder,
     };
 
-    Ok(builder.enable_http1().build())
+    if options.http2 {
+        Ok(builder.enable_http1().enable_http2().build())
+    } else {
+        Ok(builder.enable_http1().build())
+    }
 }
 
 fn client_config(options: &TlsOptions) -> anyhow::Result<ClientConfig> {
@@ -289,6 +295,7 @@ mod tests {
                 insecure: true,
                 ca: None,
                 sni: None,
+                http2: false,
             },
             server.localhost_uri(),
         )
@@ -318,6 +325,7 @@ mod tests {
                 // The URI uses an IP literal, so the certificate name has to
                 // come from the explicit SNI override.
                 sni: Some("localhost".to_owned()),
+                http2: false,
             },
             server.ip_uri(),
         )
