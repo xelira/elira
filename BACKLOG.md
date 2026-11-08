@@ -53,6 +53,7 @@ Living list for the self-improvement loop. One item per session.
 - [x] TLS certificate expiry metric.
 - [x] Per-route access-log toggle.
 - [x] RFC 7239 Forwarded and X-Forwarded-Port.
+- [x] Cache-Control must-revalidate. Disk format bumped to ELIRA2.
 - [ ] True HTTP/2 connection-pool internals (connections, streams, queued
   requests): hyper-util's `Connect` trait is sealed, so this needs a custom
   HTTP/2 client rather than a connector wrapper.

@@ -104,6 +104,7 @@
 - `limits.connection_drain_secs` и `limits.shutdown_timeout_secs`.
 - Gauge `elira_tls_certificate_expires_seconds` для TCP/QUIC сертификатов.
 - Per-route `access_log = false`.
+- `Cache-Control: must-revalidate` запрещает stale-выдачу.
 - Заголовки `Forwarded` и `X-Forwarded-Port` к upstream.
 - `cache.shared`: read-through общего дискового кэша между воркерами,
   общий бюджет, advisory-lock и стабильное имя файла на key+Vary.

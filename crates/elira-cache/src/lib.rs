@@ -50,6 +50,8 @@ pub struct Entry {
     /// missing request header is recorded as `None`, which must only match
     /// another missing header.
     vary: Vec<(HeaderName, Option<Vec<u8>>)>,
+    /// `Cache-Control: must-revalidate` forbids serving this entry stale.
+    must_revalidate: bool,
 }
 
 impl Entry {
@@ -63,6 +65,9 @@ impl Entry {
     }
 
     fn is_usable(&self, now: Instant, stale: Duration) -> bool {
+        if self.must_revalidate {
+            return self.is_fresh(now);
+        }
         now.saturating_duration_since(self.stored_at) < self.ttl + stale
     }
 
@@ -455,6 +460,7 @@ impl Cache {
             return false;
         }
 
+        let must_revalidate = CacheControl::parse(response).must_revalidate;
         let Some(ttl) = response_ttl(response, ttl.unwrap_or(self.default_ttl)) else {
             return false;
         };
@@ -478,6 +484,7 @@ impl Cache {
             stored_at: now,
             ttl,
             vary,
+            must_revalidate,
         };
 
         let location = match &self.disk {
@@ -858,7 +865,7 @@ fn encode(key: &str, entry: &Entry, body: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     let mut out = Vec::with_capacity(body.len() + 256);
-    out.extend_from_slice(b"ELIRA1\n");
+    out.extend_from_slice(b"ELIRA2\n");
     put_bytes(&mut out, key.as_bytes());
 
     put_u32(&mut out, entry.vary.len() as u32);
@@ -886,13 +893,14 @@ fn encode(key: &str, entry: &Entry, body: &[u8]) -> Option<Vec<u8>> {
         .unwrap_or(0);
     put_u64(&mut out, inserted);
     put_u64(&mut out, entry.ttl.as_millis() as u64);
+    out.push(u8::from(entry.must_revalidate));
     put_u32(&mut out, body.len() as u32);
     out.extend_from_slice(body);
     Some(out)
 }
 
 fn decode(data: &[u8]) -> Option<(String, Entry, u64, usize)> {
-    if !data.starts_with(b"ELIRA1\n") {
+    if !data.starts_with(b"ELIRA2\n") {
         return None;
     }
     let mut pos = 7;
@@ -925,6 +933,8 @@ fn decode(data: &[u8]) -> Option<(String, Entry, u64, usize)> {
 
     let inserted = take_u64(data, &mut pos)?;
     let ttl = Duration::from_millis(take_u64(data, &mut pos)?);
+    let must_revalidate = *data.get(pos)? != 0;
+    pos += 1;
     let body_len = take_u32(data, &mut pos)? as usize;
     if data.len() - pos != body_len {
         return None;
@@ -939,6 +949,7 @@ fn decode(data: &[u8]) -> Option<(String, Entry, u64, usize)> {
             stored_at: Instant::now(),
             ttl,
             vary,
+            must_revalidate,
         },
         inserted,
         body_len,
@@ -1024,6 +1035,7 @@ struct CacheControl {
     no_store: bool,
     private: bool,
     no_cache: bool,
+    must_revalidate: bool,
     s_maxage: Option<u64>,
     max_age: Option<u64>,
     /// A header value that is not valid UTF-8 cannot be inspected reliably.
@@ -1060,6 +1072,8 @@ impl CacheControl {
                     control.private = true;
                 } else if name.eq_ignore_ascii_case("no-cache") {
                     control.no_cache = true;
+                } else if name.eq_ignore_ascii_case("must-revalidate") {
+                    control.must_revalidate = true;
                 } else if name.eq_ignore_ascii_case("s-maxage") {
                     control.s_maxage = value.and_then(|value| value.parse().ok());
                 } else if name.eq_ignore_ascii_case("max-age") {
@@ -2240,5 +2254,29 @@ mod tests {
             Some(b"two".to_vec())
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn must_revalidate_is_never_served_stale() {
+        let cache = Cache::with_disk(1024, Duration::from_secs(1), None, Duration::from_secs(10));
+        let request = HeaderMap::new();
+        let mut response = HeaderMap::new();
+        response.insert(
+            "cache-control",
+            "max-age=1, must-revalidate".parse().unwrap(),
+        );
+        let now = Instant::now();
+        assert!(cache.insert(
+            "example.com/x",
+            &request,
+            &response,
+            200,
+            b"body".to_vec(),
+            now
+        ));
+
+        let after = now + Duration::from_secs(2);
+        assert!(cache.get("example.com/x", &request, after).is_none());
+        assert!(cache.get_stale("example.com/x", &request, after).is_none());
     }
 }
