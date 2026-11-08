@@ -596,6 +596,10 @@ pub struct Route {
     #[serde(default)]
     pub cache_ttl_secs: Option<u64>,
 
+    /// Write this route's requests to the access log.
+    #[serde(default = "Route::default_access_log")]
+    pub access_log: bool,
+
     /// Error pages as `STATUS /path.html`, served from `error_root` or `root`.
     #[serde(default)]
     pub error_pages: Vec<String>,
@@ -620,6 +624,10 @@ impl Route {
 
     fn default_fastcgi_index() -> String {
         "index.php".to_owned()
+    }
+
+    fn default_access_log() -> bool {
+        true
     }
 }
 

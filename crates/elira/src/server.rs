@@ -630,7 +630,14 @@ async fn serve_conn<I>(
                 upstream,
             };
 
-            current.write_log(&entry);
+            if response
+                .extensions()
+                .get::<elira_proxy::Labels>()
+                .map(|labels| labels.access_log)
+                .unwrap_or(true)
+            {
+                current.write_log(&entry);
+            }
 
             Ok::<_, std::convert::Infallible>(response)
         }

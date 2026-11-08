@@ -543,6 +543,7 @@ advisory-lock `.elira-cache.lock`, а `max_bytes` считается по все
 | `max_response_bytes` | целое > 0 | `limits.max_response_bytes` | свой предел потокового ответа |
 | `cache_enabled` | bool | глобальный | использовать ли общий кэш для маршрута |
 | `cache_ttl_secs` | целое > 0 | глобальный | свой TTL записей маршрута |
+| `access_log` | bool | `true` | писать ли запросы этого маршрута в access-лог |
 | `max_concurrent` | целое > 0 | `16` | одновременные FastCGI/CGI/module запросы |
 | `error_pages` | массив строк | `[]` | `"404 /404.html"` |
 | `error_root` | путь | `root` | каталог для страниц ошибок проксирующего маршрута |

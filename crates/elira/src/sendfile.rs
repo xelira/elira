@@ -266,7 +266,9 @@ pub(crate) async fn try_serve(
     metrics.observe(status.as_u16(), started.elapsed());
     metrics.connection_finished();
 
-    current.write_log(&entry);
+    if fast.access_log {
+        current.write_log(&entry);
+    }
 
     Some(())
 }

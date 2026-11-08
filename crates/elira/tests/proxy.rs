@@ -2473,3 +2473,49 @@ cache_ttl_secs = 1
     .await;
     assert!(expired.contains("x-cache: MISS"), "{expired}");
 }
+
+#[tokio::test]
+async fn route_can_disable_the_access_log() {
+    let root = temp_root("access-toggle");
+    std::fs::write(root.join("index.html"), "ok").unwrap();
+    let log = root.join("access.log");
+
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[log]
+file = "{log}"
+max_bytes = 1048576
+
+[[routes]]
+host = "*"
+path = "/silent"
+root = "{root}"
+access_log = false
+
+[[routes]]
+host = "*"
+root = "{root}"
+"#,
+        log = log.display(),
+        root = root.display()
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    roundtrip(
+        addr,
+        "GET /silent HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let logged = std::fs::read_to_string(&log).expect("log file");
+    assert!(logged.contains("GET / "), "{logged}");
+    assert!(!logged.contains("GET /silent"), "{logged}");
+}

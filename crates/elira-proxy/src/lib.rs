@@ -61,12 +61,14 @@ pub struct FastStatic {
     pub remove_headers: Vec<HeaderName>,
     pub server_header: bool,
     pub alt_svc: Option<HeaderValue>,
+    pub access_log: bool,
 }
 
 #[derive(Clone, Debug)]
 pub struct Labels {
     pub route: String,
     pub upstream: Option<String>,
+    pub access_log: bool,
 }
 pub type Body = BoxBody<Bytes, BoxError>;
 
@@ -139,6 +141,7 @@ struct RouteEntry {
     fastcgi_pool: Option<Arc<elira_fastcgi::Pool>>,
     cache: Option<bool>,
     cache_ttl: Option<Duration>,
+    access_log: bool,
 }
 
 struct Router {
@@ -639,6 +642,7 @@ impl Proxy {
                 max_response: route.max_response_bytes,
                 cache: route.cache_enabled,
                 cache_ttl: route.cache_ttl_secs.map(Duration::from_secs),
+                access_log: route.access_log,
                 fastcgi_pool: route.fastcgi_pool_idle.map(|idle| {
                     Arc::new(elira_fastcgi::Pool::new(
                         idle,
@@ -819,6 +823,7 @@ impl Proxy {
             remove_headers: entry.remove_headers.clone(),
             server_header: self.inner.server_header,
             alt_svc: self.inner.alt_svc.clone(),
+            access_log: entry.access_log,
         })
     }
 
@@ -1139,6 +1144,11 @@ impl Proxy {
             Target::Proxy(pool) => pool,
             Target::Files(files) => {
                 let mut response = files.serve(&req, peer).await;
+                response.extensions_mut().insert(Labels {
+                    route: entry.label.clone(),
+                    upstream: None,
+                    access_log: entry.access_log,
+                });
                 self.apply_error_page(&mut response, entry, peer).await;
                 self.apply_route(&mut response, entry, &request_id);
                 return Ok(response);
@@ -1152,6 +1162,11 @@ impl Proxy {
                             text(StatusCode::INTERNAL_SERVER_ERROR, "response build failed")
                         })?;
                 response.headers_mut().insert(LOCATION, location.clone());
+                response.extensions_mut().insert(Labels {
+                    route: entry.label.clone(),
+                    upstream: None,
+                    access_log: entry.access_log,
+                });
                 self.apply_route(&mut response, entry, &request_id);
                 return Ok(response);
             }
@@ -1160,6 +1175,7 @@ impl Proxy {
                 response.extensions_mut().insert(Labels {
                     route: entry.label.clone(),
                     upstream: None,
+                    access_log: entry.access_log,
                 });
                 self.apply_route(&mut response, entry, &request_id);
                 return Ok(response);
@@ -1169,6 +1185,7 @@ impl Proxy {
                 response.extensions_mut().insert(Labels {
                     route: entry.label.clone(),
                     upstream: None,
+                    access_log: entry.access_log,
                 });
                 self.apply_route(&mut response, entry, &request_id);
                 return Ok(response);
@@ -1178,6 +1195,7 @@ impl Proxy {
                 response.extensions_mut().insert(Labels {
                     route: entry.label.clone(),
                     upstream: None,
+                    access_log: entry.access_log,
                 });
                 self.apply_error_page(&mut response, entry, peer).await;
                 self.apply_route(&mut response, entry, &request_id);
@@ -1301,6 +1319,7 @@ impl Proxy {
                     response.extensions_mut().insert(Labels {
                         route: entry.label.clone(),
                         upstream: Some(pool.name.clone()),
+                        access_log: entry.access_log,
                     });
                     if stale {
                         self.refresh(
@@ -1541,6 +1560,7 @@ impl Proxy {
         response.extensions_mut().insert(Labels {
             route: entry.label.clone(),
             upstream: Some(pool.name.clone()),
+            access_log: entry.access_log,
         });
         self.apply_error_page(&mut response, entry, peer).await;
         self.apply_route(&mut response, entry, &request_id);

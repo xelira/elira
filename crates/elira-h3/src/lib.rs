@@ -306,6 +306,11 @@ where
     let elapsed = started.elapsed();
     let status_code = status.as_u16();
     metrics.record_request(status_code, elapsed);
+    let log_request = response
+        .extensions()
+        .get::<elira_proxy::Labels>()
+        .map(|labels| labels.access_log)
+        .unwrap_or(true);
     let mut upstream = None;
     if let Some(labels) = response.extensions().get::<elira_proxy::Labels>().cloned() {
         metrics.record_route(&labels.route, status_code, elapsed);
@@ -371,7 +376,9 @@ where
         request_id: id,
         upstream,
     };
-    log(&entry);
+    if log_request {
+        log(&entry);
+    }
 
     Ok(())
 }

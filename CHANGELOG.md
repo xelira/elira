@@ -103,6 +103,7 @@
 - Счётчики stale-попаданий кэша и health-проверок.
 - `limits.connection_drain_secs` и `limits.shutdown_timeout_secs`.
 - Gauge `elira_tls_certificate_expires_seconds` для TCP/QUIC сертификатов.
+- Per-route `access_log = false`.
 - `cache.shared`: read-through общего дискового кэша между воркерами,
   общий бюджет, advisory-lock и стабильное имя файла на key+Vary.
 - `http3.idle_timeout_secs` и `http3.early_data` (0-RTT проверен QUIC-клиентом);
