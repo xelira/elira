@@ -1014,12 +1014,16 @@ fn response_ttl(response: &HeaderMap, default_ttl: Duration) -> Option<Duration>
         return None;
     }
 
-    let ttl = control
-        .s_maxage
-        .or(control.max_age)
-        .map(Duration::from_secs)
-        .unwrap_or(default_ttl)
-        .min(default_ttl);
+    let ttl = match control.s_maxage.or(control.max_age) {
+        Some(seconds) => Duration::from_secs(seconds),
+        None if response.contains_key(http::header::EXPIRES) => {
+            // An Expires header that is already past means the response is
+            // stale on arrival; do not fall back to the default TTL.
+            expires_ttl(response)?
+        }
+        None => default_ttl,
+    }
+    .min(default_ttl);
 
     // A zero lifetime means the response is stale on arrival; storing it only
     // wastes budget.
@@ -1028,6 +1032,19 @@ fn response_ttl(response: &HeaderMap, default_ttl: Duration) -> Option<Duration>
     } else {
         Some(ttl)
     }
+}
+
+fn expires_ttl(response: &HeaderMap) -> Option<Duration> {
+    let expires = response
+        .get(http::header::EXPIRES)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| httpdate::parse_http_date(value).ok())?;
+    let reference = response
+        .get(http::header::DATE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| httpdate::parse_http_date(value).ok())
+        .unwrap_or_else(std::time::SystemTime::now);
+    expires.duration_since(reference).ok()
 }
 
 #[derive(Default)]
@@ -2278,5 +2295,64 @@ mod tests {
         let after = now + Duration::from_secs(2);
         assert!(cache.get("example.com/x", &request, after).is_none());
         assert!(cache.get_stale("example.com/x", &request, after).is_none());
+    }
+
+    #[test]
+    fn expires_sets_the_lifetime_when_no_max_age_is_present() {
+        let cache = Cache::new(1024, Duration::from_secs(60));
+        let request = HeaderMap::new();
+        let now_wall = std::time::SystemTime::now();
+        let mut response = HeaderMap::new();
+        response.insert(
+            http::header::DATE,
+            httpdate::fmt_http_date(now_wall).parse().unwrap(),
+        );
+        response.insert(
+            http::header::EXPIRES,
+            httpdate::fmt_http_date(now_wall + Duration::from_secs(5))
+                .parse()
+                .unwrap(),
+        );
+        let now = Instant::now();
+        assert!(cache.insert(
+            "example.com/x",
+            &request,
+            &response,
+            200,
+            b"body".to_vec(),
+            now
+        ));
+        assert!(cache
+            .get("example.com/x", &request, now + Duration::from_secs(3))
+            .is_some());
+        assert!(cache
+            .get("example.com/x", &request, now + Duration::from_secs(7))
+            .is_none());
+    }
+
+    #[test]
+    fn an_expired_expires_header_is_not_stored() {
+        let cache = Cache::new(1024, Duration::from_secs(60));
+        let request = HeaderMap::new();
+        let now_wall = std::time::SystemTime::now();
+        let mut response = HeaderMap::new();
+        response.insert(
+            http::header::DATE,
+            httpdate::fmt_http_date(now_wall).parse().unwrap(),
+        );
+        response.insert(
+            http::header::EXPIRES,
+            httpdate::fmt_http_date(now_wall - Duration::from_secs(1))
+                .parse()
+                .unwrap(),
+        );
+        assert!(!cache.insert(
+            "example.com/x",
+            &request,
+            &response,
+            200,
+            b"body".to_vec(),
+            Instant::now()
+        ));
     }
 }
