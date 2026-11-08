@@ -331,6 +331,18 @@ pub struct Route {
     #[serde(default)]
     pub autoindex: bool,
 
+    /// htpasswd file with bcrypt hashes. Empty means no authentication.
+    #[serde(default)]
+    pub auth_file: Option<PathBuf>,
+
+    /// CIDR blocks allowed to reach this route.
+    #[serde(default)]
+    pub ip_allow: Vec<String>,
+
+    /// CIDR blocks refused on this route; wins over `ip_allow`.
+    #[serde(default)]
+    pub ip_deny: Vec<String>,
+
     /// Response headers to set, as `Name: value`.
     #[serde(default)]
     pub add_headers: Vec<String>,
@@ -647,6 +659,19 @@ impl Config {
                 return Err(Error::AutoindexWithoutRoot { index });
             }
 
+            if let Some(path) = &route.auth_file {
+                if path.as_os_str().is_empty() {
+                    return Err(Error::EmptyAuthFile { index });
+                }
+            }
+
+            for value in route.ip_allow.iter().chain(route.ip_deny.iter()) {
+                value.parse::<ipnet::IpNet>().map_err(|_| Error::BadAcl {
+                    index,
+                    value: value.clone(),
+                })?;
+            }
+
             for candidate in &route.try_files {
                 if candidate.is_empty()
                     || candidate.chars().any(char::is_control)
@@ -851,6 +876,12 @@ pub enum Error {
 
     #[error("route {index}: `autoindex` needs a root")]
     AutoindexWithoutRoot { index: usize },
+
+    #[error("route {index}: auth_file must not be empty")]
+    EmptyAuthFile { index: usize },
+
+    #[error("route {index}: \"{value}\" is not a CIDR block")]
+    BadAcl { index: usize, value: String },
 
     #[error("[acme] and [tls] cannot both be set")]
     TlsAndAcme,
@@ -1399,5 +1430,43 @@ autoindex = true
             Config::parse(&text),
             Err(Error::LogRotationTooSmall)
         ));
+    }
+
+    #[test]
+    fn parses_auth_and_acl() {
+        let text = r#"
+listen = "127.0.0.1:8080"
+
+[[upstreams]]
+name = "app"
+servers = ["127.0.0.1:3000"]
+
+[[routes]]
+host = "*"
+upstream = "app"
+auth_file = "/etc/elira/htpasswd"
+ip_allow = ["10.0.0.0/8"]
+ip_deny = ["10.1.2.3/32"]
+"#;
+        let cfg = Config::parse(text).expect("valid config");
+        assert!(cfg.routes[0].auth_file.is_some());
+        assert_eq!(cfg.routes[0].ip_allow.len(), 1);
+    }
+
+    #[test]
+    fn rejects_a_bad_acl() {
+        let text = r#"
+listen = "127.0.0.1:8080"
+
+[[upstreams]]
+name = "app"
+servers = ["127.0.0.1:3000"]
+
+[[routes]]
+host = "*"
+upstream = "app"
+ip_allow = ["10.0.0.0/99"]
+"#;
+        assert!(matches!(Config::parse(text), Err(Error::BadAcl { .. })));
     }
 }

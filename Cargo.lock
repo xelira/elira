@@ -615,6 +615,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arc-swap",
+ "base64",
+ "bcrypt",
  "clap",
  "elira-accesslog",
  "elira-acme",
@@ -723,6 +725,7 @@ dependencies = [
  "async-compression",
  "bytes",
  "elira-accesslog",
+ "elira-auth",
  "elira-cache",
  "elira-config",
  "elira-limit",

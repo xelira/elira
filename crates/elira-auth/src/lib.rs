@@ -21,8 +21,9 @@ use base64::Engine;
 use ipnet::{AddrParseError, IpNet};
 use thiserror::Error;
 
-/// Readers that are not backed by a named file report errors without a path.
-/// The variant exists so `from_file` can name the offending file.
+/// Failures while loading credentials and access rules. Both loaders fail
+/// eagerly so a bad configuration stops startup instead of silently weakening
+/// authentication.
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("open {path}: {source}")]
@@ -42,10 +43,7 @@ pub enum Error {
     MissingColon { line: usize },
 
     #[error("htpasswd line {line}: empty {field}")]
-    EmptyField {
-        line: usize,
-        field: &'static str,
-    },
+    EmptyField { line: usize, field: &'static str },
 
     #[error("invalid CIDR {value:?}: {source}")]
     InvalidCidr {
@@ -157,9 +155,8 @@ impl BasicAuth {
             return false;
         };
 
-        // The password must be verified even when the name is unknown? No:
-        // there is no hash to verify against, and inventing one would make the
-        // unknown-user path as expensive as the known-user path for no gain.
+        // An unknown name has no hash to compare against, so fail before
+        // paying for a bcrypt verification.
         let Some(hash) = self.users.get(user) else {
             return false;
         };
@@ -293,10 +290,7 @@ mod tests {
     #[test]
     fn rejects_a_non_basic_scheme() {
         let auth = auth(&format!("alice:{}\n", hash("s3cret")));
-        assert!(!auth.check(Some(&format!(
-            "Bearer {}",
-            BASE64.encode("alice:s3cret")
-        ))));
+        assert!(!auth.check(Some(&format!("Bearer {}", BASE64.encode("alice:s3cret")))));
     }
 
     #[test]

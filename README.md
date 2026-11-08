@@ -125,6 +125,7 @@ remove_headers = ["X-Powered-By"]
 - `sendfile(2)` for plain HTTP/1.1 static GET/HEAD, decided before hyper
 - static files compressed on the fly, or served from a precompressed sibling
 - access log to a file with size-based rotation and reopen on SIGHUP
+- HTTP Basic auth from an htpasswd file and per-route IP allow/deny lists
 - access log in text or JSON, with a request id per line
 - active health checks: a server that stops answering 2xx/3xx stops receiving
   traffic, and comes back on its own

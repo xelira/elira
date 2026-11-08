@@ -14,9 +14,9 @@ use async_compression::tokio::bufread::{BrotliEncoder, GzipEncoder};
 use bytes::Bytes;
 use futures_util::TryStreamExt;
 use http::header::{
-    HeaderName, HeaderValue, ACCEPT_ENCODING, ALT_SVC, CACHE_CONTROL, CONNECTION, CONTENT_ENCODING,
-    CONTENT_LENGTH, CONTENT_TYPE, HOST, LOCATION, SERVER, SET_COOKIE, TRANSFER_ENCODING, UPGRADE,
-    VARY,
+    HeaderName, HeaderValue, ACCEPT_ENCODING, ALT_SVC, AUTHORIZATION, CACHE_CONTROL, CONNECTION,
+    CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HOST, LOCATION, SERVER, SET_COOKIE,
+    TRANSFER_ENCODING, UPGRADE, VARY, WWW_AUTHENTICATE,
 };
 use http::uri::Authority;
 use http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
@@ -32,6 +32,7 @@ use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 use tokio_util::io::{ReaderStream, StreamReader};
 
+use elira_auth::{BasicAuth, IpAcl};
 use elira_cache::Cache;
 use elira_config::{Balance, Compression, Config, Health};
 use elira_limit::RateLimiter;
@@ -81,6 +82,8 @@ struct RouteEntry {
     strip_prefix: bool,
     add_headers: Vec<(HeaderName, HeaderValue)>,
     remove_headers: Vec<HeaderName>,
+    auth: Option<Arc<BasicAuth>>,
+    acl: Option<Arc<IpAcl>>,
 }
 
 struct Router {
@@ -274,6 +277,29 @@ impl Proxy {
                 });
             };
 
+            let auth = match &route.auth_file {
+                Some(path) => Some(Arc::new(BasicAuth::from_file(path).map_err(|err| {
+                    Error::RouteConfig {
+                        host: route.host.clone(),
+                        reason: err.to_string(),
+                    }
+                })?)),
+                None => None,
+            };
+
+            let acl = if route.ip_allow.is_empty() && route.ip_deny.is_empty() {
+                None
+            } else {
+                Some(Arc::new(
+                    IpAcl::new(&route.ip_allow, &route.ip_deny).map_err(|err| {
+                        Error::RouteConfig {
+                            host: route.host.clone(),
+                            reason: err.to_string(),
+                        }
+                    })?,
+                ))
+            };
+
             let entry = RouteEntry {
                 prefix: route.path.clone().unwrap_or_default(),
                 target,
@@ -288,6 +314,8 @@ impl Proxy {
                     .iter()
                     .filter_map(|name| HeaderName::from_bytes(name.as_bytes()).ok())
                     .collect(),
+                auth,
+                acl,
             };
 
             let host = route.host.trim().to_ascii_lowercase();
@@ -409,6 +437,8 @@ impl Proxy {
 
         if !entry.add_headers.is_empty()
             || !entry.remove_headers.is_empty()
+            || entry.auth.is_some()
+            || entry.acl.is_some()
             || !self.inner.server_header
             || self.inner.alt_svc.is_some()
         {
@@ -663,6 +693,28 @@ impl Proxy {
             .router
             .pick(&key, req.uri().path())
             .ok_or_else(|| text(StatusCode::NOT_FOUND, "no route"))?;
+
+        if let Some(acl) = &entry.acl {
+            if !acl.allows(peer.ip()) {
+                return Err(text(StatusCode::FORBIDDEN, "forbidden"));
+            }
+        }
+
+        if let Some(auth) = &entry.auth {
+            let header = req
+                .headers()
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok());
+
+            if !auth.check(header) {
+                let mut response = text(StatusCode::UNAUTHORIZED, "authentication required");
+                response.headers_mut().insert(
+                    WWW_AUTHENTICATE,
+                    HeaderValue::from_static("Basic realm=\"elira\""),
+                );
+                return Err(response);
+            }
+        }
 
         let pool = match &entry.target {
             Target::Proxy(pool) => pool,
@@ -1485,6 +1537,9 @@ pub enum Error {
 
     #[error("upstream TLS: {reason}")]
     UpstreamTls { reason: String },
+
+    #[error("route for \"{host}\": {reason}")]
+    RouteConfig { host: String, reason: String },
 }
 
 #[cfg(test)]

@@ -1320,3 +1320,105 @@ root = "{root}"
     let logged = std::fs::read_to_string(&log_path).expect("log file");
     assert!(logged.contains("GET /"), "{logged}");
 }
+
+#[tokio::test]
+async fn basic_auth_guards_a_route() {
+    let upstream = upstream().await;
+    let root = temp_root("auth");
+    let htpasswd = root.join("htpasswd");
+    let hash = bcrypt::hash("secret", 4).expect("bcrypt");
+    std::fs::write(&htpasswd, format!("user:{hash}\n")).unwrap();
+
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "*"
+upstream = "app"
+auth_file = "{htpasswd}"
+"#,
+        htpasswd = htpasswd.display()
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let anonymous = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&anonymous), "HTTP/1.1 401 Unauthorized");
+    assert!(
+        anonymous
+            .to_ascii_lowercase()
+            .contains("www-authenticate: basic"),
+        "{anonymous}"
+    );
+
+    let wrong = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nAuthorization: Basic dXNlcjp3cm9uZw==\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&wrong), "HTTP/1.1 401 Unauthorized");
+
+    let good = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nAuthorization: Basic dXNlcjpzZWNyZXQ=\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&good), "HTTP/1.1 200 OK");
+}
+
+#[tokio::test]
+async fn ip_acl_denies_and_allows() {
+    let upstream = upstream().await;
+
+    let denied = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "*"
+upstream = "app"
+ip_deny = ["127.0.0.1/32"]
+"#
+    );
+    let (addr, _stop, _metrics) = start(&denied).await;
+    let response = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&response), "HTTP/1.1 403 Forbidden");
+
+    let allowed = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "*"
+upstream = "app"
+ip_allow = ["127.0.0.1/32"]
+"#
+    );
+    let (addr, _stop, _metrics) = start(&allowed).await;
+    let response = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&response), "HTTP/1.1 200 OK");
+}

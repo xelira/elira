@@ -30,3 +30,7 @@ tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+bcrypt = "0.17"
+base64 = "0.22"
