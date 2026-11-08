@@ -35,11 +35,12 @@ Living list for the self-improvement loop. One item per session.
 ## B — performance and compatibility
 
 - [x] QUIC idle timeout configuration.
-- [ ] QUIC 0-RTT if quinn exposes a server-side switch.
+- [x] QUIC 0-RTT server-side switch (`http3.early_data`).
+- [ ] 0-RTT integration test with a QUIC client.
 - [ ] Shared cache or consistent-hash routing so worker caches do not produce
   avoidable misses.
 - [ ] Per-route FastCGI pool size.
-- [ ] TLS session ticket and resumption settings.
+- [x] TLS session ticket and resumption settings.
 - [ ] Upstream HTTP/2 connection pool metrics.
 - [ ] `cache.purge` by host/path prefix through the admin API.
 - [x] Expand parser fuzz targets.

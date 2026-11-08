@@ -34,6 +34,12 @@ pub struct ServerOptions<'a> {
     pub tls13_only: bool,
     /// DER OCSP response for the default certificate.
     pub ocsp: Option<&'a Path>,
+    /// TLS 1.3 tickets per handshake.
+    pub session_tickets: usize,
+    /// In-memory session cache entries; zero disables resumption.
+    pub session_cache: usize,
+    /// Maximum 0-RTT early data in bytes; zero disables early data.
+    pub early_data: u32,
 }
 
 /// ALPN order matters: clients that accept both get the first shared protocol.
@@ -124,6 +130,9 @@ pub fn server_config(cert: &Path, key: &Path) -> Result<ServerConfig, Error> {
         client_auth: ClientAuth::Off,
         tls13_only: false,
         ocsp: None,
+        session_tickets: 2,
+        session_cache: 256,
+        early_data: 0,
     })
 }
 
@@ -152,6 +161,9 @@ pub fn server_config_with_client_auth(
         client_auth: mode,
         tls13_only: false,
         ocsp: None,
+        session_tickets: 2,
+        session_cache: 256,
+        early_data: 0,
     })
 }
 
@@ -168,7 +180,7 @@ pub fn quic_server_config_with_client_auth(
     client_ca: Option<&Path>,
     mode: ClientAuth,
 ) -> Result<ServerConfig, Error> {
-    quic_server_config_full(cert, key, &[], client_ca, mode)
+    quic_server_config_full(cert, key, &[], client_ca, mode, 0)
 }
 
 /// QUIC listener with SNI-selected certificates as well as client auth.
@@ -178,6 +190,7 @@ pub fn quic_server_config_full(
     named: &[NamedCert],
     client_ca: Option<&Path>,
     mode: ClientAuth,
+    early_data: u32,
 ) -> Result<ServerConfig, Error> {
     build(
         &ServerOptions {
@@ -187,6 +200,9 @@ pub fn quic_server_config_full(
             client_auth: mode,
             tls13_only: true,
             ocsp: None,
+            session_tickets: 2,
+            session_cache: 256,
+            early_data,
         },
         &[b"h3"],
     )
@@ -242,6 +258,13 @@ fn build(options: &ServerOptions<'_>, alpn: &[&[u8]]) -> Result<ServerConfig, Er
     let resolver = NamedResolver { named, default };
     let mut config = builder.with_cert_resolver(Arc::new(resolver));
     config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+    config.send_tls13_tickets = options.session_tickets;
+    config.session_storage = if options.session_cache == 0 {
+        Arc::new(rustls::server::NoServerSessionStorage {})
+    } else {
+        rustls::server::ServerSessionMemoryCache::new(options.session_cache)
+    };
+    config.max_early_data_size = options.early_data;
     Ok(config)
 }
 

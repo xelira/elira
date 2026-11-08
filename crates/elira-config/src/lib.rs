@@ -323,6 +323,10 @@ pub struct Http3 {
     /// QUIC idle timeout in seconds.
     #[serde(default = "Http3::default_idle_timeout_secs")]
     pub idle_timeout_secs: u64,
+
+    /// Allow 0-RTT early data on QUIC.
+    #[serde(default)]
+    pub early_data: bool,
 }
 
 impl Http3 {
@@ -699,6 +703,14 @@ pub struct Tls {
     #[serde(default = "Tls::default_ocsp_refresh_secs")]
     pub ocsp_refresh_secs: u64,
 
+    /// TLS 1.3 session tickets sent after a handshake.
+    #[serde(default = "Tls::default_session_tickets")]
+    pub session_tickets: usize,
+
+    /// In-memory session cache entries. Zero disables resumption.
+    #[serde(default = "Tls::default_session_cache")]
+    pub session_cache: usize,
+
     /// Additional certificates selected by SNI. The `cert`/`key` pair above
     /// stays the default when no name matches.
     #[serde(default)]
@@ -720,6 +732,14 @@ pub struct ServerCert {
 impl Tls {
     fn default_ocsp_refresh_secs() -> u64 {
         24 * 60 * 60
+    }
+
+    fn default_session_tickets() -> usize {
+        2
+    }
+
+    fn default_session_cache() -> usize {
+        256
     }
 }
 
@@ -2957,5 +2977,33 @@ root = "/srv/www"
             Config::parse(&zero),
             Err(Error::Http3IdleTimeoutZero)
         ));
+    }
+
+    #[test]
+    fn tls_resumption_and_early_data_parse() {
+        let text = r#"
+listen = "127.0.0.1:8443"
+[tls]
+cert = "/tmp/cert.pem"
+key = "/tmp/key.pem"
+session_tickets = 4
+session_cache = 0
+[http3]
+listen = "[::]:443"
+cert = "/tmp/cert.pem"
+key = "/tmp/key.pem"
+early_data = true
+idle_timeout_secs = 15
+[[routes]]
+host = "*"
+root = "/srv/www"
+"#;
+        let cfg = Config::parse(text).expect("valid");
+        let tls = cfg.tls.expect("tls");
+        assert_eq!(tls.session_tickets, 4);
+        assert_eq!(tls.session_cache, 0);
+        let h3 = cfg.http3.expect("http3");
+        assert!(h3.early_data);
+        assert_eq!(h3.idle_timeout_secs, 15);
     }
 }

@@ -189,6 +189,8 @@ HTTP/1.1-соединении подглядывается до hyper, и про
 | `ocsp` | путь | нет | DER OCSP-ответ для stapling; перечитывается по SIGHUP |
 | `ocsp_hook` | путь | нет | команда, обновляющая `ocsp`; после неё идёт reload |
 | `ocsp_refresh_secs` | целое > 0 | `86400` | период вызова `ocsp_hook` |
+| `session_tickets` | целое ≥ 0 | `2` | TLS 1.3 tickets на handshake |
+| `session_cache` | целое ≥ 0 | `256` | записей resumption-кэша; `0` выключает |
 | `certificates` | массив таблиц | `[]` | дополнительные сертификаты по SNI |
 
 Элемент `certificates`:
@@ -280,6 +282,7 @@ DNS-01 работает через внешний hook и поддерживае
 | `client_auth` | `off` \| `optional` \| `required` | `off` | клиентские сертификаты на QUIC |
 | `certificates` | массив таблиц | `[]` | SNI-сертификаты на QUIC, формат как у `[tls]` |
 | `idle_timeout_secs` | целое > 0 | `30` | idle timeout QUIC-соединения |
+| `early_data` | bool | `false` | разрешить 0-RTT на QUIC |
 
 HTTP/3 живёт на отдельном UDP-порту и не делит сокет с TCP-листенером.
 `cert`/`key` здесь независимы от `[tls]`: их можно не задавать в `[tls]` вовсе,
