@@ -160,6 +160,7 @@ pub struct Cache {
     default_ttl: Duration,
     stale: Duration,
     disk: Option<PathBuf>,
+    shared: bool,
     files: AtomicU64,
     store: Mutex<Store>,
 }
@@ -182,6 +183,19 @@ impl Cache {
         disk: Option<PathBuf>,
         stale: Duration,
     ) -> Self {
+        Self::with_shared_disk(max_bytes, default_ttl, disk, stale, false)
+    }
+
+    /// Disk-backed cache that other processes may read through the same
+    /// directory. There is no global eviction lock; each process trims its
+    /// own accounting and expired files are ignored on read.
+    pub fn with_shared_disk(
+        max_bytes: usize,
+        default_ttl: Duration,
+        disk: Option<PathBuf>,
+        stale: Duration,
+        shared: bool,
+    ) -> Self {
         let (entries, total_bytes, next_seq) = match &disk {
             Some(dir) => load_dir(dir, stale),
             None => (HashMap::new(), 0, 0),
@@ -191,6 +205,7 @@ impl Cache {
             default_ttl,
             stale,
             disk,
+            shared,
             files: AtomicU64::new(0),
             store: Mutex::new(Store {
                 entries,
@@ -252,7 +267,15 @@ impl Cache {
         }
 
         let mut store = self.lock();
-        let mut records = store.entries.remove(key)?;
+        let records = store.entries.remove(key);
+        let mut records = match records {
+            Some(records) => records,
+            None if self.shared && self.disk.is_some() => {
+                drop(store);
+                return self.load_shared(key, request, now, allow_stale);
+            }
+            None => return None,
+        };
 
         let mut candidate: Option<(usize, bool)> = None;
         for (index, record) in records.iter().enumerate() {
@@ -305,7 +328,76 @@ impl Cache {
         chosen
     }
 
-    /// Stores a response when its headers allow sharing.
+    fn load_shared(
+        &self,
+        key: &str,
+        request: &HeaderMap,
+        now: Instant,
+        allow_stale: bool,
+    ) -> Option<(Entry, bool)> {
+        let dir = self.disk.as_ref()?;
+        let files = fs::read_dir(dir).ok()?;
+        let now_system = SystemTime::now();
+
+        for file in files.flatten() {
+            let path = file.path();
+            let name = file.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with("elira-cache-") || !name.ends_with(".entry") {
+                continue;
+            }
+            let Ok(data) = fs::read(&path) else {
+                continue;
+            };
+            let Some((stored_key, mut entry, inserted_ms, body_len)) = decode(&data) else {
+                continue;
+            };
+            if stored_key != key || !entry.matches(request) {
+                continue;
+            }
+            let inserted = UNIX_EPOCH + Duration::from_millis(inserted_ms);
+            let age = now_system.duration_since(inserted).unwrap_or_default();
+            if age >= entry.ttl + self.stale {
+                continue;
+            }
+            let stale = age >= entry.ttl;
+            if stale && !allow_stale {
+                continue;
+            }
+            entry.stored_at = now.checked_sub(age).unwrap_or(now);
+            entry.body.clear();
+            let body = match read_at(&path, (data.len() - body_len) as u64, body_len) {
+                Ok(body) => body,
+                Err(_) => continue,
+            };
+
+            let record = Record {
+                entry: entry.clone(),
+                location: Location::Disk {
+                    path,
+                    offset: (data.len() - body_len) as u64,
+                    len: body_len,
+                },
+                size: body_len,
+                seq: 0,
+            };
+            let mut store = self.lock();
+            store.total_bytes += body_len;
+            store
+                .entries
+                .entry(key.to_owned())
+                .or_default()
+                .push(record);
+            drop(store);
+            self.trim_to_budget();
+            let mut entry = entry;
+            entry.body = body;
+            return Some((entry, stale));
+        }
+        None
+    }
+
+    /// Drops every stored response and its disk body.
     pub fn insert(
         &self,
         key: &str,
@@ -1828,5 +1920,55 @@ mod tests {
         let entry = cache.get("example.com/", &request, later + Duration::from_secs(8));
         assert!(entry.is_some(), "revalidation must reset the TTL");
         assert!(!cache.revalidate("other/", &request, later));
+    }
+
+    #[test]
+    fn shared_disk_cache_reads_entries_written_by_another_instance() {
+        let dir = temp_dir("shared");
+        let request = HeaderMap::new();
+        let response = HeaderMap::new();
+        let now = Instant::now();
+
+        let writer = Cache::with_shared_disk(
+            1024,
+            Duration::from_secs(60),
+            Some(dir.clone()),
+            Duration::ZERO,
+            true,
+        );
+        let reader = Cache::with_shared_disk(
+            1024,
+            Duration::from_secs(60),
+            Some(dir.clone()),
+            Duration::ZERO,
+            true,
+        );
+        let isolated = Cache::with_shared_disk(
+            1024,
+            Duration::from_secs(60),
+            Some(dir.clone()),
+            Duration::ZERO,
+            false,
+        );
+        assert!(writer.insert(
+            "example.com/x",
+            &request,
+            &response,
+            200,
+            b"shared".to_vec(),
+            now
+        ));
+
+        assert_eq!(
+            reader
+                .get("example.com/x", &request, Instant::now())
+                .map(|entry| entry.body),
+            Some(b"shared".to_vec())
+        );
+
+        assert!(isolated
+            .get("example.com/x", &request, Instant::now())
+            .is_none());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

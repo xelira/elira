@@ -686,11 +686,12 @@ impl Proxy {
             };
 
         let cache = if cfg.cache.enabled {
-            Some(Arc::new(Cache::with_disk(
+            Some(Arc::new(Cache::with_shared_disk(
                 cfg.cache.max_bytes,
                 Duration::from_secs(cfg.cache.ttl_secs),
                 cfg.cache.dir.clone(),
                 Duration::from_secs(cfg.cache.stale_secs),
+                cfg.cache.shared,
             )))
         } else {
             None

@@ -639,6 +639,11 @@ pub struct Cache {
     /// background. Zero disables stale serving.
     #[serde(default)]
     pub stale_secs: u64,
+
+    /// Share `dir` between processes. Entries are read through from disk;
+    /// eviction remains per process.
+    #[serde(default)]
+    pub shared: bool,
 }
 
 impl Default for Cache {
@@ -650,6 +655,7 @@ impl Default for Cache {
             max_item_bytes: Self::default_max_item_bytes(),
             dir: None,
             stale_secs: 0,
+            shared: false,
         }
     }
 }
@@ -1102,6 +1108,9 @@ impl Config {
             if dir.as_os_str().is_empty() {
                 return Err(Error::EmptyCacheDir);
             }
+        }
+        if self.cache.shared && self.cache.dir.is_none() {
+            return Err(Error::SharedCacheWithoutDir);
         }
 
         if let Some(file) = &self.log.file {
@@ -1783,6 +1792,9 @@ pub enum Error {
 
     #[error("cache.dir must not be empty")]
     EmptyCacheDir,
+
+    #[error("cache.shared needs cache.dir")]
+    SharedCacheWithoutDir,
 
     #[error("log.file must not be empty")]
     EmptyLogFile,
@@ -3005,5 +3017,22 @@ root = "/srv/www"
         let h3 = cfg.http3.expect("http3");
         assert!(h3.early_data);
         assert_eq!(h3.idle_timeout_secs, 15);
+    }
+
+    #[test]
+    fn shared_cache_needs_a_directory() {
+        let text = r#"
+listen = "127.0.0.1:8080"
+[cache]
+enabled = true
+shared = true
+[[routes]]
+host = "*"
+root = "/srv/www"
+"#;
+        assert!(matches!(
+            Config::parse(text),
+            Err(Error::SharedCacheWithoutDir)
+        ));
     }
 }

@@ -50,8 +50,9 @@ Living list for the self-improvement loop. One item per session.
 - [ ] Upstream HTTP/2 connection pool metrics: hyper's legacy client does not
   expose pool internals; needs a custom connector or client.
 
-- [ ] Shared cache or consistent-hash routing so worker caches do not produce
-  avoidable misses.
+- [x] Shared disk cache read-through (`cache.shared`).
+- [ ] Global eviction and locking for the shared cache; today `max_bytes` is
+  per process and duplicate files are possible.
 
 - [ ] Worker exit during a streaming app response: document that an incomplete
   chunked body is the only observable outcome, or move the client socket into
