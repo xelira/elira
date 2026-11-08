@@ -18,7 +18,7 @@ use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 
 use elira_accesslog::{request_id, Entry};
-use elira_config::LogFormat;
+use elira_metrics::Metrics;
 use elira_proxy::{BoxError, Proxy};
 
 pub struct Config {
@@ -26,15 +26,24 @@ pub struct Config {
     pub cert: PathBuf,
     pub key: PathBuf,
     pub reuse_port: bool,
+    pub client_ca: Option<PathBuf>,
+    pub client_auth: elira_tls::ClientAuth,
 }
 
 pub async fn serve(
     cfg: Config,
     proxy: Proxy,
-    log: LogFormat,
+    metrics: Arc<Metrics>,
+    body_timeout: Option<std::time::Duration>,
+    log: Arc<dyn Fn(&Entry) + Send + Sync>,
     mut stop: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    let tls = elira_tls::quic_server_config(&cfg.cert, &cfg.key)?;
+    let tls = elira_tls::quic_server_config_with_client_auth(
+        &cfg.cert,
+        &cfg.key,
+        cfg.client_ca.as_deref(),
+        cfg.client_auth,
+    )?;
     let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls)?;
     let server = quinn::ServerConfig::with_crypto(Arc::new(crypto));
 
@@ -47,12 +56,16 @@ pub async fn serve(
             incoming = endpoint.accept() => {
                 let Some(incoming) = incoming else { break };
                 let proxy = proxy.clone();
+                let metrics = metrics.clone();
+                let log = log.clone();
 
                 tokio::spawn(async move {
                     match incoming.await {
                         Ok(conn) => {
                             let peer = conn.remote_address();
-                            if let Err(err) = connection(conn, peer, proxy, log).await {
+                            if let Err(err) =
+                                connection(conn, peer, proxy, metrics, body_timeout, log).await
+                            {
                                 tracing::debug!(%peer, error = %err, "http/3 connection closed");
                             }
                         }
@@ -125,7 +138,9 @@ async fn connection(
     conn: quinn::Connection,
     peer: SocketAddr,
     proxy: Proxy,
-    log: LogFormat,
+    metrics: Arc<Metrics>,
+    body_timeout: Option<std::time::Duration>,
+    log: Arc<dyn Fn(&Entry) + Send + Sync>,
 ) -> Result<(), BoxError> {
     let mut conn =
         h3::server::Connection::<h3_quinn::Connection, Bytes>::new(h3_quinn::Connection::new(conn))
@@ -134,9 +149,11 @@ async fn connection(
     while let Some(resolver) = conn.accept().await? {
         let (req, stream) = resolver.resolve_request().await?;
         let proxy = proxy.clone();
+        let metrics = metrics.clone();
+        let log = log.clone();
 
         tokio::spawn(async move {
-            if let Err(err) = request(req, stream, peer, proxy, log).await {
+            if let Err(err) = request(req, stream, peer, proxy, metrics, body_timeout, log).await {
                 tracing::debug!(%peer, error = %err, "http/3 request failed");
             }
         });
@@ -150,7 +167,9 @@ async fn request<S, B>(
     stream: h3::server::RequestStream<S, B>,
     peer: SocketAddr,
     proxy: Proxy,
-    log: LogFormat,
+    metrics: Arc<Metrics>,
+    body_timeout: Option<std::time::Duration>,
+    log: Arc<dyn Fn(&Entry) + Send + Sync>,
 ) -> Result<(), BoxError>
 where
     S: h3::quic::BidiStream<B> + Send + 'static,
@@ -185,7 +204,22 @@ where
     tokio::spawn(async move {
         let mut recv = recv;
         loop {
-            match recv.recv_data().await {
+            let frame = match body_timeout {
+                Some(idle) => match tokio::time::timeout(idle, recv.recv_data()).await {
+                    Ok(frame) => frame,
+                    Err(_) => {
+                        let _ = tx
+                            .send(Err(Box::new(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "request body made no progress",
+                            ))))
+                            .await;
+                        return;
+                    }
+                },
+                None => recv.recv_data().await,
+            };
+            match frame {
                 Ok(Some(mut buf)) => {
                     let bytes = buf.copy_to_bytes(buf.remaining());
                     if tx.send(Ok(Frame::data(bytes))).await.is_err() {
@@ -213,7 +247,26 @@ where
 
     let response = proxy.handle(request, peer, "https").await;
     let status = response.status();
+    let elapsed = started.elapsed();
+    let status_code = status.as_u16();
+    metrics.record_request(status_code, elapsed);
+    if let Some(labels) = response.extensions().get::<elira_proxy::Labels>().cloned() {
+        metrics.record_route(&labels.route, status_code, elapsed);
+        if let Some(upstream) = &labels.upstream {
+            metrics.record_upstream(upstream, status_code, elapsed);
+        }
+    }
+    match response
+        .headers()
+        .get("x-cache")
+        .and_then(|value| value.to_str().ok())
+    {
+        Some("HIT") => metrics.cache_hit(),
+        Some("MISS") => metrics.cache_miss(),
+        _ => {}
+    }
     let bytes = response.body().size_hint().exact().unwrap_or(0);
+    metrics.response_bytes(bytes);
 
     let (parts, body) = response.into_parts();
     let mut out = Response::builder().status(parts.status);
@@ -255,14 +308,11 @@ where
         path,
         status,
         bytes,
-        duration: started.elapsed(),
+        duration: elapsed,
         user_agent,
         request_id: id,
     };
-    match log {
-        LogFormat::Text => tracing::info!(target: "access", "{}", entry.line()),
-        LogFormat::Json => tracing::info!(target: "access", "{}", entry.json()),
-    }
+    log(&entry);
 
     Ok(())
 }

@@ -97,6 +97,25 @@ pub struct Limits {
     /// forwarding headers replaced.
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
+
+    /// Abort a client that stops sending a request body for this long. Zero
+    /// disables the check.
+    #[serde(default = "Limits::default_body_timeout_secs")]
+    pub request_body_timeout_secs: u64,
+
+    /// Abort an upstream that stops sending its response body for this long.
+    #[serde(default = "Limits::default_body_timeout_secs")]
+    pub upstream_body_timeout_secs: u64,
+
+    /// Close an idle websocket or CONNECT tunnel. Zero disables the check.
+    #[serde(default = "Limits::default_websocket_idle_secs")]
+    pub websocket_idle_secs: u64,
+
+    /// Buffer an upstream response up to this many bytes before sending it,
+    /// so a slow client does not hold the upstream connection. Zero streams
+    /// straight through.
+    #[serde(default)]
+    pub response_buffer_bytes: usize,
 }
 
 impl Default for Limits {
@@ -111,6 +130,10 @@ impl Default for Limits {
             requests_per_second: 0,
             burst: 0,
             trusted_proxies: Vec::new(),
+            request_body_timeout_secs: Self::default_body_timeout_secs(),
+            upstream_body_timeout_secs: Self::default_body_timeout_secs(),
+            websocket_idle_secs: Self::default_websocket_idle_secs(),
+            response_buffer_bytes: 0,
         }
     }
 }
@@ -134,6 +157,14 @@ impl Limits {
 
     fn default_idle_timeout_secs() -> u64 {
         60
+    }
+
+    fn default_body_timeout_secs() -> u64 {
+        30
+    }
+
+    fn default_websocket_idle_secs() -> u64 {
+        3600
     }
 }
 
@@ -225,6 +256,10 @@ pub struct Connect {
 pub struct MetricsConfig {
     /// Bind loopback here unless you really mean to expose the counters.
     pub listen: SocketAddr,
+
+    /// htpasswd file guarding `/status` and the mutating admin endpoints.
+    #[serde(default)]
+    pub auth_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -237,6 +272,11 @@ pub struct Http3 {
     pub cert: PathBuf,
     #[serde(default)]
     pub key: PathBuf,
+    /// PEM roots for client certificates on the QUIC listener.
+    #[serde(default)]
+    pub client_ca: Option<PathBuf>,
+    #[serde(default)]
+    pub client_auth: ClientAuthMode,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -256,6 +296,27 @@ pub struct Upstream {
     /// Connect to the servers with TLS (https).
     #[serde(default)]
     pub tls: bool,
+
+    /// Server name for certificate validation and SNI. Needed when `servers`
+    /// contains an IP address but the certificate is issued to a name.
+    #[serde(default)]
+    pub sni: Option<String>,
+
+    /// Overrides `health.path` for this upstream.
+    #[serde(default)]
+    pub health_path: Option<String>,
+
+    /// Overrides `[upstream_tls] insecure` for this upstream.
+    #[serde(default)]
+    pub tls_insecure: Option<bool>,
+
+    /// Overrides `[upstream_tls] ca` for this upstream.
+    #[serde(default)]
+    pub tls_ca: Option<PathBuf>,
+
+    /// Overrides `[upstream_tls] http2` for this upstream.
+    #[serde(default)]
+    pub http2: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -280,6 +341,10 @@ pub struct UpstreamTls {
     /// Offer HTTP/2 in ALPN. Upstreams must speak h2 or h1; both are accepted.
     #[serde(default)]
     pub http2: bool,
+
+    /// Lowest TLS version offered to upstreams.
+    #[serde(default)]
+    pub min_version: TlsVersion,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -349,6 +414,26 @@ pub struct Route {
     /// Overrides `limits.upstream_timeout_secs` for this route.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+
+    /// Overrides `limits.requests_per_second` for this route. Zero inherits.
+    #[serde(default)]
+    pub requests_per_second: Option<u32>,
+
+    /// Bucket depth for the route limiter. Zero means the same as the rate.
+    #[serde(default)]
+    pub burst: Option<u32>,
+
+    /// Overrides `limits.max_body_bytes` for this route.
+    #[serde(default)]
+    pub max_body_bytes: Option<usize>,
+
+    /// Error pages as `STATUS /path.html`, served from `error_root` or `root`.
+    #[serde(default)]
+    pub error_pages: Vec<String>,
+
+    /// Directory for `error_pages` when the route proxies instead of serving.
+    #[serde(default)]
+    pub error_root: Option<PathBuf>,
 
     /// Response headers to set, as `Name: value`.
     #[serde(default)]
@@ -434,6 +519,27 @@ pub struct Tls {
     /// Whether to ask clients for a certificate.
     #[serde(default)]
     pub client_auth: ClientAuthMode,
+
+    /// Lowest TLS version offered to clients.
+    #[serde(default)]
+    pub min_version: TlsVersion,
+
+    /// Additional certificates selected by SNI. The `cert`/`key` pair above
+    /// stays the default when no name matches.
+    #[serde(default)]
+    pub certificates: Vec<ServerCert>,
+}
+
+/// A certificate and the names it should answer for.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerCert {
+    pub cert: PathBuf,
+    pub key: PathBuf,
+    /// Exact names or `*.example.com`. An empty list makes the certificate
+    /// the default instead of a named one.
+    #[serde(default)]
+    pub names: Vec<String>,
 }
 
 /// Client certificate policy for the TLS listener.
@@ -444,6 +550,14 @@ pub enum ClientAuthMode {
     Off,
     Optional,
     Required,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TlsVersion {
+    #[default]
+    Tls12,
+    Tls13,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -463,6 +577,14 @@ pub struct Log {
     /// How many rotated files to keep.
     #[serde(default = "Log::default_keep")]
     pub keep: usize,
+
+    /// nginx-like template. Overrides `format` when set.
+    #[serde(default)]
+    pub template: Option<String>,
+
+    /// Also send lines to this Unix datagram socket, usually `/dev/log`.
+    #[serde(default)]
+    pub syslog: Option<PathBuf>,
 }
 
 impl Log {
@@ -496,6 +618,16 @@ impl<'de> Deserialize<'de> for LogFormat {
             ))),
         }
     }
+}
+
+/// Host name without wildcards: letters, digits, dots, hyphens, underscores.
+fn is_plain_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+        && !name.starts_with('.')
+        && !name.ends_with('.')
 }
 
 impl Config {
@@ -577,6 +709,12 @@ impl Config {
             if http3.key.as_os_str().is_empty() {
                 return Err(Error::Http3MissingKey);
             }
+            if http3.client_auth != ClientAuthMode::Off {
+                match &http3.client_ca {
+                    Some(path) if !path.as_os_str().is_empty() => {}
+                    _ => return Err(Error::Http3ClientCaRequired),
+                }
+            }
         }
 
         if self.connect.enabled {
@@ -605,11 +743,14 @@ impl Config {
         }
 
         if let Some(tls) = &self.tls {
-            if tls.cert.as_os_str().is_empty() {
-                return Err(Error::TlsMissingCert);
-            }
-            if tls.key.as_os_str().is_empty() {
-                return Err(Error::TlsMissingKey);
+            let has_cert = !tls.cert.as_os_str().is_empty();
+            let has_key = !tls.key.as_os_str().is_empty();
+            if has_cert != has_key {
+                return Err(if has_cert {
+                    Error::TlsMissingKey
+                } else {
+                    Error::TlsMissingCert
+                });
             }
 
             let wants_clients = tls.client_auth != ClientAuthMode::Off;
@@ -622,6 +763,31 @@ impl Config {
                 }
                 None if wants_clients => return Err(Error::TlsClientCaRequired),
                 _ => {}
+            }
+
+            let has_default = has_cert && has_key;
+            if tls.certificates.is_empty() && !has_default {
+                return Err(Error::TlsMissingCert);
+            }
+
+            let mut seen: Vec<String> = Vec::new();
+            for (index, entry) in tls.certificates.iter().enumerate() {
+                if entry.cert.as_os_str().is_empty() || entry.key.as_os_str().is_empty() {
+                    return Err(Error::TlsCertificatePair { index });
+                }
+                for name in &entry.names {
+                    let name = name.trim().to_ascii_lowercase();
+                    if name.is_empty() || (!name.starts_with("*.") && !is_plain_name(&name)) {
+                        return Err(Error::TlsCertificateName {
+                            index,
+                            name: name.clone(),
+                        });
+                    }
+                    if seen.contains(&name) {
+                        return Err(Error::TlsCertificateNameDuplicate { name: name.clone() });
+                    }
+                    seen.push(name);
+                }
             }
         }
 
@@ -698,6 +864,30 @@ impl Config {
 
             if route.timeout_secs == Some(0) {
                 return Err(Error::BadRouteTimeout { index });
+            }
+
+            if route.requests_per_second == Some(0) {
+                return Err(Error::BadRouteRate { index });
+            }
+
+            if route.error_root.is_some() && route.error_pages.is_empty() {
+                return Err(Error::ErrorRootWithoutPages { index });
+            }
+
+            for page in &route.error_pages {
+                let mut parts = page.splitn(2, char::is_whitespace);
+                let status = parts.next().unwrap_or_default();
+                let path = parts.next().unwrap_or_default().trim();
+                if status.parse::<u16>().is_err()
+                    || !(100..=599).contains(&status.parse::<u16>().unwrap_or(0))
+                    || !path.starts_with('/')
+                    || path.contains("..")
+                {
+                    return Err(Error::BadErrorPage {
+                        index,
+                        page: page.clone(),
+                    });
+                }
             }
 
             if let Some(path) = &route.auth_file {
@@ -855,6 +1045,9 @@ pub enum Error {
     #[error("http3.key must not be empty")]
     Http3MissingKey,
 
+    #[error("http3.client_ca is required unless http3.client_auth = \"off\"")]
+    Http3ClientCaRequired,
+
     #[error("connect.enabled requires a non-empty connect.allow list")]
     ConnectEmptyAllow,
 
@@ -875,6 +1068,15 @@ pub enum Error {
 
     #[error("tls.client_ca must not be empty")]
     TlsClientCaEmpty,
+
+    #[error("tls.certificates[{index}] needs both cert and key")]
+    TlsCertificatePair { index: usize },
+
+    #[error("tls.certificates[{index}]: \"{name}\" is not a host name")]
+    TlsCertificateName { index: usize, name: String },
+
+    #[error("tls certificate name \"{name}\" is used twice")]
+    TlsCertificateNameDuplicate { name: String },
 
     #[error("upstream name is empty")]
     EmptyUpstreamName,
@@ -929,6 +1131,15 @@ pub enum Error {
 
     #[error("route {index}: timeout_secs must be greater than zero")]
     BadRouteTimeout { index: usize },
+
+    #[error("route {index}: requests_per_second must be greater than zero")]
+    BadRouteRate { index: usize },
+
+    #[error("route {index}: error_root needs at least one error_pages entry")]
+    ErrorRootWithoutPages { index: usize },
+
+    #[error("route {index}: \"{page}\" is not \"STATUS /path\"")]
+    BadErrorPage { index: usize, page: String },
 
     #[error("route {index}: \"{value}\" is not a CIDR block")]
     BadAcl { index: usize, value: String },
@@ -1579,5 +1790,151 @@ upstream = "app"
 "#;
         let cfg = Config::parse(text).expect("valid config");
         assert!(cfg.upstream_tls.http2);
+    }
+
+    #[test]
+    fn parses_sni_certificates() {
+        let text = r#"
+listen = "127.0.0.1:8443"
+
+[tls]
+min_version = "tls13"
+client_auth = "off"
+
+[[tls.certificates]]
+cert = "/etc/elira/a.pem"
+key = "/etc/elira/a.key"
+names = ["a.example.com", "*.a.example.com"]
+
+[[tls.certificates]]
+cert = "/etc/elira/b.pem"
+key = "/etc/elira/b.key"
+names = ["b.example.com"]
+
+[[routes]]
+host = "*"
+redirect = { to = "https://example.com", status = 301 }
+"#;
+        let cfg = Config::parse(text).expect("valid config");
+        let tls = cfg.tls.expect("tls");
+        assert_eq!(tls.certificates.len(), 2);
+        assert_eq!(tls.min_version, TlsVersion::Tls13);
+    }
+
+    #[test]
+    fn rejects_duplicate_certificate_names() {
+        let text = r#"
+listen = "127.0.0.1:8443"
+
+[tls]
+
+[[tls.certificates]]
+cert = "/etc/elira/a.pem"
+key = "/etc/elira/a.key"
+names = ["example.com"]
+
+[[tls.certificates]]
+cert = "/etc/elira/b.pem"
+key = "/etc/elira/b.key"
+names = ["example.com"]
+
+[[routes]]
+host = "*"
+redirect = { to = "https://example.com", status = 301 }
+"#;
+        assert!(matches!(
+            Config::parse(text),
+            Err(Error::TlsCertificateNameDuplicate { .. })
+        ));
+    }
+
+    #[test]
+    fn http3_client_auth_needs_a_ca() {
+        let text = r#"
+listen = "127.0.0.1:8443"
+
+[http3]
+listen = "[::]:443"
+cert = "/tmp/cert.pem"
+key = "/tmp/key.pem"
+client_auth = "required"
+
+[[routes]]
+host = "*"
+redirect = { to = "https://example.com", status = 301 }
+"#;
+        assert!(matches!(
+            Config::parse(text),
+            Err(Error::Http3ClientCaRequired)
+        ));
+    }
+
+    #[test]
+    fn parses_per_upstream_overrides_and_route_limits() {
+        let text = r#"
+listen = "127.0.0.1:8080"
+
+[upstream_tls]
+insecure = true
+min_version = "tls13"
+
+[[upstreams]]
+name = "app"
+servers = ["10.0.0.1:8443"]
+tls = true
+http2 = true
+sni = "app.internal"
+health_path = "/ready"
+tls_insecure = false
+
+[[routes]]
+host = "*"
+upstream = "app"
+requests_per_second = 10
+burst = 20
+max_body_bytes = 1024
+error_pages = ["404 /404.html"]
+error_root = "/srv/errors"
+"#;
+        let cfg = Config::parse(text).expect("valid config");
+        let up = &cfg.upstreams[0];
+        assert_eq!(up.sni.as_deref(), Some("app.internal"));
+        assert_eq!(up.health_path.as_deref(), Some("/ready"));
+        assert_eq!(up.http2, Some(true));
+        let route = &cfg.routes[0];
+        assert_eq!(route.requests_per_second, Some(10));
+        assert_eq!(route.error_pages.len(), 1);
+    }
+
+    #[test]
+    fn rejects_a_bad_error_page() {
+        let text = r#"
+listen = "127.0.0.1:8080"
+
+[[routes]]
+host = "*"
+root = "/srv/www"
+error_pages = ["404 nope"]
+"#;
+        assert!(matches!(
+            Config::parse(text),
+            Err(Error::BadErrorPage { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_a_zero_route_rate() {
+        let text = r#"
+listen = "127.0.0.1:8080"
+
+[[routes]]
+host = "*"
+root = "/srv/www"
+requests_per_second = 0
+"#;
+        assert!(matches!(
+            Config::parse(text),
+            Err(Error::BadRouteRate { .. })
+        ));
     }
 }

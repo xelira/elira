@@ -17,9 +17,11 @@ httpdate = { workspace = true }
 ipnet = { workspace = true }
 async-compression = { workspace = true }
 percent-encoding = { workspace = true }
+tokio-rustls = { workspace = true }
 tokio-util = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
+http-body = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }

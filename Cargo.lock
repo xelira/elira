@@ -620,6 +620,7 @@ dependencies = [
  "clap",
  "elira-accesslog",
  "elira-acme",
+ "elira-auth",
  "elira-config",
  "elira-h3",
  "elira-metrics",
@@ -633,6 +634,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
+ "rcgen",
  "rustls",
  "socket2 0.5.10",
  "tokio",
@@ -675,6 +677,9 @@ dependencies = [
 [[package]]
 name = "elira-cache"
 version = "0.1.0"
+dependencies = [
+ "http",
+]
 
 [[package]]
 name = "elira-config"
@@ -695,6 +700,7 @@ dependencies = [
  "bytes",
  "elira-accesslog",
  "elira-config",
+ "elira-metrics",
  "elira-proxy",
  "elira-tls",
  "futures-util",
@@ -741,6 +747,7 @@ dependencies = [
  "elira-upstream",
  "futures-util",
  "http",
+ "http-body",
  "http-body-util",
  "httpdate",
  "hyper",
@@ -751,6 +758,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "tracing",
 ]

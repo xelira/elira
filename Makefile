@@ -1,27 +1,50 @@
 CARGO ?= cargo
 CONFIG ?= elira.toml
 IMAGE ?= elira
+URL ?= http://127.0.0.1:8080/
+FUZZ_TARGET ?= config
+FUZZ_TIME ?= 60
 
-.PHONY: build test lint fmt run check docker
+.PHONY: build fmt lint test check config-check audit deny fuzz load run docker
 
 build:
-	$(CARGO) build --workspace
-
-test:
-	$(CARGO) test --workspace
-
-lint:
-	$(CARGO) fmt --all -- --check
-	$(CARGO) clippy --workspace --all-targets -- -D warnings
+	$(CARGO) build --workspace --locked
 
 fmt:
 	$(CARGO) fmt --all
 
-run:
-	$(CARGO) run -p elira -- run --config $(CONFIG)
+lint:
+	$(CARGO) fmt --all -- --check
+	$(CARGO) clippy --workspace --all-targets --locked -- -D warnings
+
+test:
+	$(CARGO) test --workspace --locked
 
 check:
+	$(CARGO) check --workspace --all-targets --locked
+
+config-check:
 	$(CARGO) run -p elira -- check --config $(CONFIG)
+
+audit:
+	$(CARGO) audit
+
+deny:
+	$(CARGO) deny check
+
+fuzz:
+	@command -v cargo-fuzz >/dev/null 2>&1 || { \
+		echo "error: cargo-fuzz is not installed." >&2; \
+		echo "       cargo install cargo-fuzz --locked" >&2; \
+		exit 1; \
+	}
+	$(CARGO) fuzz run $(FUZZ_TARGET) -- -max_total_time=$(FUZZ_TIME)
+
+load:
+	./scripts/load.sh "$(URL)"
+
+run:
+	$(CARGO) run -p elira -- run --config $(CONFIG)
 
 docker:
 	docker build -t $(IMAGE) .

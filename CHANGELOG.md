@@ -36,11 +36,24 @@
   в stdout или в файл с ротацией по размеру.
 - Basic auth из htpasswd (bcrypt) и списки `ip_allow`/`ip_deny` на маршруте.
 - Таймаут upstream'а, переопределяемый на маршруте через `timeout_secs`.
-- mTLS на TCP-листенере: `client_auth` и `client_ca` в `[tls]`.
+- Таймауты на тело запроса и ответа, простой websocket/CONNECT и опциональная
+  буферизация небольших ответов upstream'а.
+- Свой token bucket, предел тела и `error_pages` на маршруте.
+- Кэш учитывает `Vary`, `Cache-Control`, `Authorization` и `Cookie`; не
+  смешивает ответы разных пользователей и выставляет `Age`.
+- mTLS на TCP- и QUIC-листенерах: `client_auth` и `client_ca`.
+- SNI-сертификаты через `[[tls.certificates]]`, минимальная версия TLS.
+- Свои `sni`, `health_path`, `tls_insecure`, `tls_ca` и `http2` у upstream'а;
+  health-проба для TLS-бэкенда делает настоящее рукопожатие.
 - HTTP/2 до upstream'а по `[upstream_tls] http2 = true`.
 - Prometheus-метрики на отдельном листенере: запросы по классам статусов,
   гистограмма задержки, число соединений в работе и состояние upstream'ов.
-  Там же `GET /status` с JSON-снимком upstream'ов и их серверов.
+  Там же `GET /status` с JSON-снимком upstream'ов и их серверов, а также
+  `POST /reload`, `POST /drain` и `POST /cache/purge`; `metrics.auth_file`
+  закрывает весь листенер Basic auth.
+- Шаблоны access-лога в стиле nginx и отправка в syslog.
+- `SIGUSR2` ждёт готовности замены (файл готовности и systemd `READY=1`),
+  поэтому неудачный рестарт оставляет старый процесс живым.
 - Перезагрузка конфигурации по `SIGHUP`: маршруты, upstream'ы, сертификаты и
   формат лога применяются без разрыва HTTP/1.1 и HTTP/2 соединений.
 - Ограничения на число и размер заголовков, число соединений, idle-таймаут,
@@ -50,6 +63,9 @@
   завершение соединений.
 - Команда `elira check` для разбора и валидации конфигурации без открытия
   сокетов и `elira migrate` для конвертации подмножества nginx-конфига.
+- Fuzz-цели для конфига, мигратора, заголовков и PROXY protocol; CI-джобы
+  MSRV, `cargo-audit`, `cargo-deny`, musl и Docker; e2e-тесты mTLS и
+  неудачного hot restart.
 - Dockerfile, unit для systemd и release workflow для `x86_64` и `aarch64`.
 
 ### Changed

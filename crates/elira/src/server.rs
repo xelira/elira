@@ -22,7 +22,7 @@ use tokio_rustls::TlsAcceptor;
 use elira_accesslog::{request_id, Entry};
 use elira_metrics::Metrics;
 
-use crate::config::{ClientAuthMode, Config, Health, Http3, LogFormat};
+use crate::config::{ClientAuthMode, Config, Health, Http3, LogFormat, TlsVersion};
 use crate::proxy::{BoxError, Proxy};
 
 /// Everything that can change on SIGHUP. A connection keeps the runtime it
@@ -34,6 +34,8 @@ pub struct Runtime {
     health: Health,
     http3: Option<Http3>,
     access_log: Option<Arc<crate::access_log::AccessLog>>,
+    template: Option<elira_accesslog::Format>,
+    syslog: Option<Arc<elira_accesslog::Syslog>>,
 }
 
 impl Runtime {
@@ -45,12 +47,27 @@ impl Runtime {
                     ClientAuthMode::Optional => elira_tls::ClientAuth::Optional,
                     ClientAuthMode::Required => elira_tls::ClientAuth::Required,
                 };
-                let config = elira_tls::server_config_with_client_auth(
-                    &tls.cert,
-                    &tls.key,
-                    tls.client_ca.as_deref(),
-                    mode,
-                )?;
+                let named: Vec<_> = tls
+                    .certificates
+                    .iter()
+                    .map(|entry| elira_tls::NamedCert {
+                        names: entry.names.clone(),
+                        cert: entry.cert.clone(),
+                        key: entry.key.clone(),
+                    })
+                    .collect();
+                let default = if tls.cert.as_os_str().is_empty() {
+                    None
+                } else {
+                    Some((tls.cert.as_path(), tls.key.as_path()))
+                };
+                let config = elira_tls::server_config_with_options(&elira_tls::ServerOptions {
+                    default,
+                    named: &named,
+                    client_ca: tls.client_ca.as_deref(),
+                    client_auth: mode,
+                    tls13_only: tls.min_version == TlsVersion::Tls13,
+                })?;
                 Some(Arc::new(config))
             }
             None => None,
@@ -68,6 +85,20 @@ impl Runtime {
                     cfg.log.max_bytes,
                     cfg.log.keep,
                 )?)),
+                None => None,
+            },
+            template: match &cfg.log.template {
+                Some(template) => Some(
+                    elira_accesslog::Format::parse(template)
+                        .map_err(|err| anyhow::anyhow!("log.template: {err}"))?,
+                ),
+                None => None,
+            },
+            syslog: match &cfg.log.syslog {
+                Some(path) => Some(Arc::new(
+                    elira_accesslog::Syslog::open(path)
+                        .map_err(|err| anyhow::anyhow!("log.syslog {}: {err}", path.display()))?,
+                )),
                 None => None,
             },
         })
@@ -92,6 +123,26 @@ impl Runtime {
     pub fn access_log(&self) -> Option<&Arc<crate::access_log::AccessLog>> {
         self.access_log.as_ref()
     }
+
+    /// Render one access line and send it to every configured sink.
+    pub fn write_log(&self, entry: &Entry) {
+        let line = match &self.template {
+            Some(template) => template.render(entry),
+            None => match self.log {
+                LogFormat::Text => entry.line(),
+                LogFormat::Json => entry.json(),
+            },
+        };
+
+        if let Some(syslog) = &self.syslog {
+            let _ = syslog.send("elira", &line);
+        }
+
+        match self.access_log() {
+            Some(log) => log.write(&line),
+            None => tracing::info!(target: "access", "{}", line),
+        }
+    }
 }
 
 /// What the accept loop needs. Everything here is captured at startup and a
@@ -104,6 +155,7 @@ pub struct Options {
     pub idle_timeout: Duration,
     pub proxy_protocol: bool,
     pub sendfile: bool,
+    pub body_timeout: Option<Duration>,
     pub acme: Option<Arc<elira_acme::Acme>>,
 }
 
@@ -116,6 +168,10 @@ impl Options {
             idle_timeout: Duration::from_secs(cfg.limits.idle_timeout_secs),
             proxy_protocol: cfg.proxy_protocol,
             sendfile: cfg.sendfile,
+            body_timeout: match cfg.limits.request_body_timeout_secs {
+                0 => None,
+                secs => Some(Duration::from_secs(secs)),
+            },
             acme: None,
         }
     }
@@ -239,6 +295,7 @@ struct ConnOptions {
     max_headers: usize,
     max_buf_size: usize,
     idle_timeout: Duration,
+    body_timeout: Option<Duration>,
     h2: bool,
     secure: bool,
 }
@@ -265,6 +322,7 @@ async fn serve_stream(
         max_headers: options.max_headers,
         max_buf_size: options.max_buf_size,
         idle_timeout: options.idle_timeout,
+        body_timeout: options.body_timeout,
         h2: false,
         secure: false,
     };
@@ -337,6 +395,7 @@ async fn serve_conn<I>(
     let idle = Arc::new(tokio::sync::Notify::new());
     let idle_for_service = idle.clone();
     let scheme = if opts.secure { "https" } else { "http" };
+    let body_timeout = opts.body_timeout;
     let metrics_for_service = metrics.clone();
 
     let service = service_fn(move |req: hyper::Request<Incoming>| {
@@ -375,11 +434,36 @@ async fn serve_conn<I>(
                 .map(str::to_owned);
             let id = request_id();
 
-            let req = req.map(|body| body.map_err(|err| -> BoxError { Box::new(err) }).boxed());
+            let request_bytes = req.body().size_hint().exact().unwrap_or(0);
+            let req = req.map(|body| {
+                let body = body.map_err(|err| -> BoxError { Box::new(err) }).boxed();
+                match body_timeout {
+                    Some(idle) => elira_proxy::timeout_body(body, idle),
+                    None => body,
+                }
+            });
             let response = current.proxy.handle(req, peer, scheme).await;
             let elapsed = started.elapsed();
-            metrics.observe(response.status().as_u16(), elapsed);
+            let status = response.status().as_u16();
+            metrics.record_request(status, elapsed);
+            metrics.request_bytes(request_bytes);
+            if let Some(labels) = response.extensions().get::<elira_proxy::Labels>().cloned() {
+                metrics.record_route(&labels.route, status, elapsed);
+                if let Some(upstream) = &labels.upstream {
+                    metrics.record_upstream(upstream, status, elapsed);
+                }
+            }
+            match response
+                .headers()
+                .get("x-cache")
+                .and_then(|v| v.to_str().ok())
+            {
+                Some("HIT") => metrics.cache_hit(),
+                Some("MISS") => metrics.cache_miss(),
+                _ => {}
+            }
             let bytes = response.body().size_hint().exact().unwrap_or(0);
+            metrics.response_bytes(bytes);
             let entry = Entry {
                 peer: peer.ip(),
                 method,
@@ -393,15 +477,7 @@ async fn serve_conn<I>(
                 request_id: id,
             };
 
-            let line = match current.log {
-                LogFormat::Text => entry.line(),
-                LogFormat::Json => entry.json(),
-            };
-
-            match current.access_log() {
-                Some(log) => log.write(&line),
-                None => tracing::info!(target: "access", "{}", line),
-            }
+            current.write_log(&entry);
 
             Ok::<_, std::convert::Infallible>(response)
         }
@@ -464,12 +540,15 @@ async fn serve_conn<I>(
     metrics.connection_finished();
 }
 
-/// Serve `/metrics` and `/status` on a small separate listener. Everything
-/// else is a 404.
+/// Serve the admin listener: `/metrics`, `/status`, reload, drain and cache
+/// purge. With `auth` set, every path requires the same Basic credentials.
 pub fn spawn_metrics(
     listener: TcpListener,
     runtime: Arc<ArcSwap<Runtime>>,
     metrics: Arc<Metrics>,
+    auth: Option<Arc<elira_auth::BasicAuth>>,
+    reload: watch::Sender<u64>,
+    stop_tx: watch::Sender<bool>,
     mut stop: watch::Receiver<bool>,
 ) {
     tokio::spawn(async move {
@@ -483,36 +562,74 @@ pub fn spawn_metrics(
 
                     let metrics = metrics.clone();
                     let runtime = runtime.clone();
+                    let auth = auth.clone();
+                    let reload = reload.clone();
+                    let stop_tx = stop_tx.clone();
                     tokio::spawn(async move {
                         let service = service_fn(move |req: hyper::Request<Incoming>| {
                             let metrics = metrics.clone();
                             let runtime = runtime.clone();
+                            let auth = auth.clone();
+                            let reload = reload.clone();
+                            let stop_tx = stop_tx.clone();
                             async move {
-                                let (status, content_type, body) = match req.uri().path() {
-                                    "/metrics" if req.method() == hyper::Method::GET => (
-                                        hyper::StatusCode::OK,
-                                        "text/plain; version=0.0.4; charset=utf-8",
-                                        metrics.render(),
-                                    ),
+                                if let Some(auth) = &auth {
+                                    let header = req
+                                        .headers()
+                                        .get(hyper::header::AUTHORIZATION)
+                                        .and_then(|value| value.to_str().ok());
+                                    if !auth.check(header) {
+                                        let mut response = json(
+                                            hyper::StatusCode::UNAUTHORIZED,
+                                            "{\"error\":\"authentication required\"}",
+                                        );
+                                        response.headers_mut().insert(
+                                            hyper::header::WWW_AUTHENTICATE,
+                                            hyper::header::HeaderValue::from_static(
+                                                "Basic realm=\"elira\"",
+                                            ),
+                                        );
+                                        return Ok::<_, std::convert::Infallible>(response);
+                                    }
+                                }
+
+                                let method = req.method();
+                                let path = req.uri().path();
+
+                                let response = match (method, path) {
+                                    (&hyper::Method::GET, "/metrics") => {
+                                        text_response(
+                                            hyper::StatusCode::OK,
+                                            "text/plain; version=0.0.4; charset=utf-8",
+                                            metrics.render(),
+                                        )
+                                    }
                                     // Loading the runtime per request keeps the
                                     // answer current across a SIGHUP reload.
-                                    "/status" if req.method() == hyper::Method::GET => (
+                                    (&hyper::Method::GET, "/status") => text_response(
                                         hyper::StatusCode::OK,
                                         "application/json",
                                         runtime.load().proxy().status().to_string(),
                                     ),
-                                    _ => (
+                                    (&hyper::Method::POST, "/reload") => {
+                                        let _ = reload.send(rand_counter());
+                                        json(hyper::StatusCode::ACCEPTED, "{\"reload\":\"queued\"}")
+                                    }
+                                    (&hyper::Method::POST, "/drain") => {
+                                        let _ = stop_tx.send(true);
+                                        json(hyper::StatusCode::ACCEPTED, "{\"drain\":\"started\"}")
+                                    }
+                                    (&hyper::Method::POST, "/cache/purge") => {
+                                        let purged = runtime.load().proxy().purge_cache();
+                                        let body = format!("{{\"purged\":{purged}}}");
+                                        json(hyper::StatusCode::OK, &body)
+                                    }
+                                    _ => text_response(
                                         hyper::StatusCode::NOT_FOUND,
                                         "text/plain; charset=utf-8",
                                         "not found".to_owned(),
                                     ),
                                 };
-
-                                let response = hyper::Response::builder()
-                                    .status(status)
-                                    .header(hyper::header::CONTENT_TYPE, content_type)
-                                    .body(http_body_util::Full::new(hyper::body::Bytes::from(body)))
-                                    .expect("static response");
 
                                 Ok::<_, std::convert::Infallible>(response)
                             }
@@ -526,6 +643,33 @@ pub fn spawn_metrics(
             }
         }
     });
+}
+
+fn text_response(
+    status: hyper::StatusCode,
+    content_type: &'static str,
+    body: String,
+) -> hyper::Response<http_body_util::Full<hyper::body::Bytes>> {
+    hyper::Response::builder()
+        .status(status)
+        .header(hyper::header::CONTENT_TYPE, content_type)
+        .body(http_body_util::Full::new(hyper::body::Bytes::from(body)))
+        .expect("static response")
+}
+
+fn json(
+    status: hyper::StatusCode,
+    body: &str,
+) -> hyper::Response<http_body_util::Full<hyper::body::Bytes>> {
+    text_response(status, "application/json", body.to_owned())
+}
+
+/// The reload channel counts signal deliveries; the value itself is not used.
+fn rand_counter() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }
 
 /// Let the current request finish, but do not wait forever: a client that

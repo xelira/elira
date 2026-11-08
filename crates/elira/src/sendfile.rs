@@ -22,7 +22,6 @@ use tokio::net::TcpStream;
 
 use elira_accesslog::{request_id, Entry};
 
-use crate::config::LogFormat;
 use crate::server::Runtime;
 use elira_metrics::Metrics;
 
@@ -172,15 +171,7 @@ pub(crate) async fn try_serve(
     metrics.observe(http::StatusCode::OK.as_u16(), started.elapsed());
     metrics.connection_finished();
 
-    let line = match current.log() {
-        LogFormat::Text => entry.line(),
-        LogFormat::Json => entry.json(),
-    };
-
-    match current.access_log() {
-        Some(log) => log.write(&line),
-        None => tracing::info!(target: "access", "{}", line),
-    }
+    current.write_log(&entry);
 
     Some(())
 }

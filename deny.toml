@@ -1,19 +1,48 @@
 [advisories]
+version = 2
 yanked = "deny"
-
-[licenses]
-allow = [
-    "MIT",
-    "Apache-2.0",
-    "BSD-3-Clause",
-    "ISC",
-    "Unicode-3.0",
-    "Zlib",
-    "MPL-2.0",
+ignore = [
+    # rustls-pemfile is a thin wrapper around rustls-pki-types' PEM parser and
+    # is no longer maintained. Migrating off it touches elira-tls and
+    # elira-upstream, so track it rather than blocking CI.
+    "RUSTSEC-2025-0134",
 ]
 
+[licenses]
+version = 2
+# Licenses allowed for the current dependency graph plus common permissive
+# licenses we expect to accept. Keeping the list explicit makes a new
+# dependency with an unusual license show up as a review item.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "OpenSSL",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.8
+exceptions = []
+# The allow list is intentionally a little wider than today's graph so new
+# dependencies with common permissive licenses do not fail for no reason.
+unused-allowed-license = "allow"
+
 [bans]
-wildcards = "deny"
+# Duplicate versions are allowed; they are common in the rustls/hyper/quinn
+# tree and are not, by themselves, a reason to block a release.
+multiple-versions = "allow"
+# Internal path dependencies are intentionally versionless.
+wildcards = "allow"
 
 [sources]
 unknown-registry = "deny"
+unknown-git = "deny"

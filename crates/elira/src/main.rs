@@ -118,21 +118,34 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
     let (reload_tx, mut reload_rx) = watch::channel(0u64);
     let (restart_tx, mut restart_rx) = watch::channel(0u64);
 
-    spawn_signal_task(stop_tx.clone(), reload_tx, restart_tx)?;
+    spawn_signal_task(stop_tx.clone(), reload_tx.clone(), restart_tx)?;
     server::spawn_health_loop(runtime.clone(), metrics.clone(), stop_rx.clone());
 
     if let Some(metrics_cfg) = &cfg.metrics {
         let metrics_listener = server::bind_tcp(metrics_cfg.listen, cfg.reuse_port)
             .with_context(|| format!("cannot bind metrics on {}", metrics_cfg.listen))?;
+        let admin_auth = match &metrics_cfg.auth_file {
+            Some(path) => Some(Arc::new(elira_auth::BasicAuth::from_file(path)?)),
+            None => None,
+        };
         server::spawn_metrics(
             metrics_listener,
             runtime.clone(),
             metrics.clone(),
+            admin_auth,
+            reload_tx.clone(),
+            stop_tx.clone(),
             stop_rx.clone(),
         );
     }
 
-    let mut h3_task = spawn_h3(runtime.clone(), stop_rx.clone(), cfg.reuse_port);
+    let mut h3_task = spawn_h3(
+        runtime.clone(),
+        metrics.clone(),
+        stop_rx.clone(),
+        cfg.reuse_port,
+        options.body_timeout,
+    );
     let mut stop_wait = stop_rx.clone();
 
     let serving = tokio::spawn(server::serve(
@@ -142,6 +155,10 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
         metrics.clone(),
         stop_rx.clone(),
     ));
+
+    // Both the readiness file (seen by the old process during SIGUSR2) and
+    // the systemd notification mean the same thing: all listeners are bound.
+    notify_ready();
 
     loop {
         tokio::select! {
@@ -157,12 +174,11 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
                     continue;
                 }
 
-                spawn_replacement();
-                // The replacement binds the same ports immediately; give it a
-                // moment, then let this process drain and exit.
-                tokio::time::sleep(Duration::from_millis(750)).await;
-                let _ = stop_tx.send(true);
-                break;
+                if spawn_replacement() {
+                    let _ = stop_tx.send(true);
+                    break;
+                }
+                tracing::error!("replacement did not become ready; keeping this process");
             }
 
             changed = reload_rx.changed() => {
@@ -170,7 +186,7 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
                     break;
                 }
 
-                reload(&path, &cfg, &runtime, options.clone()).await;
+                reload(&path, &cfg, &runtime, options.clone(), &metrics).await;
 
                 // The new Runtime carries its own http3 config. Restart the
                 // listener against it instead of keeping the old one.
@@ -179,7 +195,13 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
                     // Wait for the QUIC endpoint to drop before rebinding.
                     let _ = handle.await;
                 }
-                h3_task = spawn_h3(runtime.clone(), stop_rx.clone(), cfg.reuse_port);
+                h3_task = spawn_h3(
+                    runtime.clone(),
+                    metrics.clone(),
+                    stop_rx.clone(),
+                    cfg.reuse_port,
+                    options.body_timeout,
+                );
             }
         }
     }
@@ -205,14 +227,27 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
 
 fn spawn_h3(
     runtime: Arc<ArcSwap<Runtime>>,
+    metrics: Arc<Metrics>,
     stop: watch::Receiver<bool>,
     reuse_port: bool,
+    body_timeout: Option<Duration>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let current = runtime.load();
     let http3 = current.http3().cloned()?;
     let proxy = current.proxy().clone();
-    let log = current.log();
     drop(current);
+
+    let client_auth = match http3.client_auth {
+        elira::config::ClientAuthMode::Off => elira_tls::ClientAuth::Off,
+        elira::config::ClientAuthMode::Optional => elira_tls::ClientAuth::Optional,
+        elira::config::ClientAuthMode::Required => elira_tls::ClientAuth::Required,
+    };
+
+    // The listener restarts on reload, but one log closure keeps using the
+    // current runtime, so templates and files stay in sync.
+    let log_runtime = runtime.clone();
+    let log: Arc<dyn Fn(&elira_accesslog::Entry) + Send + Sync> =
+        Arc::new(move |entry| log_runtime.load().write_log(entry));
 
     Some(tokio::spawn(async move {
         let cfg = elira_h3::Config {
@@ -220,18 +255,27 @@ fn spawn_h3(
             cert: http3.cert,
             key: http3.key,
             reuse_port,
+            client_ca: http3.client_ca,
+            client_auth,
         };
-        if let Err(err) = elira_h3::serve(cfg, proxy, log, stop).await {
+        if let Err(err) = elira_h3::serve(cfg, proxy, metrics, body_timeout, log, stop).await {
             tracing::error!(error = %err, "http/3 listener stopped");
         }
     }))
 }
 
-async fn reload(path: &Path, current: &Config, runtime: &ArcSwap<Runtime>, options: Options) {
+async fn reload(
+    path: &Path,
+    current: &Config,
+    runtime: &ArcSwap<Runtime>,
+    options: Options,
+    metrics: &Metrics,
+) {
     let next = match Config::load(path) {
         Ok(next) => next,
         Err(err) => {
             tracing::error!(error = %err, "reload failed, keeping the old config");
+            metrics.reload_failed();
             return;
         }
     };
@@ -266,26 +310,115 @@ async fn reload(path: &Path, current: &Config, runtime: &ArcSwap<Runtime>, optio
     }
 
     runtime.store(Arc::new(built));
+    metrics.reload_ok();
     tracing::info!("config reloaded");
 }
 
-fn spawn_replacement() {
+/// Start a new process and wait until it says its listeners are bound. The old
+/// process must not drain before that: if the replacement fails to bind, the
+/// service would simply stop.
+fn spawn_replacement() -> bool {
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(err) => {
             tracing::error!(error = %err, "cannot find the executable");
-            return;
+            return false;
         }
     };
 
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let ready = std::env::temp_dir().join(format!(
+        "elira-ready-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
 
-    match std::process::Command::new(exe).args(args).spawn() {
-        Ok(child) => {
-            tracing::info!(pid = child.id(), "started a replacement, draining this one")
+    let mut child = match std::process::Command::new(exe)
+        .args(args)
+        .env("ELIRA_READY_FILE", &ready)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(err) => {
+            tracing::error!(error = %err, "cannot start a replacement");
+            return false;
         }
-        Err(err) => tracing::error!(error = %err, "cannot start a replacement"),
+    };
+
+    let pid = child.id();
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while std::time::Instant::now() < deadline {
+        if ready.exists() {
+            let _ = std::fs::remove_file(&ready);
+            tracing::info!(pid, "replacement is ready, draining this one");
+            return true;
+        }
+
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                tracing::error!(pid, %status, "replacement exited before becoming ready");
+                let _ = std::fs::remove_file(&ready);
+                return false;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::error!(pid, error = %err, "cannot poll the replacement");
+                let _ = std::fs::remove_file(&ready);
+                return false;
+            }
+        }
+
+        std::thread::sleep(Duration::from_millis(100));
     }
+
+    tracing::error!(pid, "replacement did not become ready in time");
+    let _ = child.kill();
+    let _ = std::fs::remove_file(&ready);
+    false
+}
+
+/// Tell the process that started us (and systemd, when present) that the
+/// sockets are bound. Called once, after the accept loops are live.
+fn notify_ready() {
+    let pid = std::process::id();
+
+    if let Ok(path) = std::env::var("ELIRA_READY_FILE") {
+        let _ = std::fs::write(path, pid.to_string());
+    }
+
+    let Ok(socket) = std::env::var("NOTIFY_SOCKET") else {
+        return;
+    };
+
+    let message = format!("READY=1\nMAINPID={pid}\n");
+    if let Err(err) = send_to_socket(&socket, message.as_bytes()) {
+        tracing::debug!(error = %err, "systemd notify failed");
+    }
+}
+
+#[cfg(unix)]
+fn send_to_socket(path: &str, message: &[u8]) -> std::io::Result<()> {
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::{SocketAddr, UnixDatagram};
+
+    let socket = UnixDatagram::unbound()?;
+    // systemd uses the abstract namespace by default; a leading '@' in the
+    // environment variable is how it is spelled there.
+    if let Some(name) = path.strip_prefix('@') {
+        let addr = SocketAddr::from_abstract_name(name.as_bytes())?;
+        socket.send_to_addr(message, &addr)?;
+    } else {
+        socket.send_to(message, path)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn send_to_socket(_path: &str, _message: &[u8]) -> std::io::Result<()> {
+    Ok(())
 }
 
 #[cfg(unix)]

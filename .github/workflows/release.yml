@@ -18,6 +18,8 @@ jobs:
         target:
           - x86_64-unknown-linux-gnu
           - aarch64-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
 
     steps:
       - uses: actions/checkout@v4
@@ -30,9 +32,10 @@ jobs:
           args: "--release -p elira --locked"
           strip: true
 
-      # The action can only strip binaries it builds natively.
+      # The action can only strip binaries it builds natively. Both aarch64
+      # targets are cross-compiled, so strip them with binutils.
       - name: Strip aarch64 binary
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        if: startsWith(matrix.target, 'aarch64-')
         env:
           TARGET: ${{ matrix.target }}
         run: |

@@ -117,7 +117,17 @@ remove_headers = ["X-Powered-By"]
 - redirect routes, per-route `add_headers`/`remove_headers`, `Server` can be hidden
 - `X-Request-Id` echoed and forwarded, `Alt-Svc` advertises HTTP/3
 - brotli and gzip, plus precompressed `.br`/`.gz` static siblings
-- an in-memory cache for small `GET` responses with `X-Cache: HIT/MISS`
+- an in-memory cache for small `GET` responses with `X-Cache: HIT/MISS`,
+  honouring `Vary`, `Cache-Control`, and never sharing `Authorization`/`Cookie`
+  requests
+- per-route timeouts, token buckets, body caps, and `error_pages`
+- SNI-selected certificates, mutual TLS, and a minimum TLS version
+- HTTP/2 and per-upstream SNI/CA/trust overrides to upstreams
+- access-log templates and syslog output, alongside file rotation
+- admin listener: `/metrics`, `/status`, `POST /reload`, `/drain`, `/cache/purge`
+- body progress timeouts, tunnel idle timeouts, and buffered small responses
+- SIGUSR2 handoff that waits for the replacement to bind before draining
+- `elira migrate` for a subset of nginx configuration
 - `try_files` and generated directory listings (`autoindex`)
 - TLS to upstreams, with a custom CA or an explicit insecure mode
 - ACME (Let's Encrypt, TLS-ALPN-01) instead of a static `[tls]` block

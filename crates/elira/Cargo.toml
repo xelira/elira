@@ -8,6 +8,7 @@ description = "HTTP server and reverse proxy"
 
 [dependencies]
 elira-accesslog = { path = "../elira-accesslog" }
+elira-auth = { path = "../elira-auth" }
 elira-acme = { path = "../elira-acme" }
 elira-config = { path = "../elira-config" }
 elira-h3 = { path = "../elira-h3" }
@@ -35,3 +36,4 @@ tracing-subscriber = { workspace = true }
 [dev-dependencies]
 bcrypt = "0.17"
 base64 = "0.22"
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }

@@ -487,10 +487,15 @@ async fn metrics_listener_reports_requests() {
     let status_runtime = Arc::new(ArcSwap::from_pointee(
         Runtime::build(&Config::parse(&config).expect("parse")).expect("runtime"),
     ));
+    let (reload_tx, _reload_rx) = watch::channel(0u64);
+    let (drain_tx, _drain_rx) = watch::channel(false);
     server::spawn_metrics(
         metrics_listener,
         status_runtime,
         metrics.clone(),
+        None,
+        reload_tx,
+        drain_tx,
         metrics_stop_rx,
     );
 
@@ -1482,4 +1487,324 @@ timeout_secs = 1
     )
     .await;
     assert_eq!(status(&response), "HTTP/1.1 504 Gateway Timeout");
+}
+
+/// An upstream that varies its answer by Accept-Language and says so.
+async fn vary_upstream() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind vary upstream");
+    let addr = listener.local_addr().expect("vary addr");
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut chunk = [0u8; 2048];
+                loop {
+                    let Ok(read) = stream.read(&mut chunk).await else {
+                        return;
+                    };
+                    head.extend_from_slice(&chunk[..read]);
+                    if read == 0 || head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let text = String::from_utf8_lossy(&head).to_ascii_lowercase();
+                let body = if text.contains("accept-language: de") {
+                    "hallo"
+                } else {
+                    "hello"
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nVary: Accept-Language\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+
+    addr
+}
+
+#[tokio::test]
+async fn cache_honours_vary() {
+    let upstream = vary_upstream().await;
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[cache]
+enabled = true
+ttl_secs = 60
+max_item_bytes = 65536
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "*"
+upstream = "app"
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let english = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nAccept-Language: en\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(english.ends_with("hello"), "{english}");
+
+    let german = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nAccept-Language: de\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(german.ends_with("hallo"), "{german}");
+
+    let english_again = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nAccept-Language: en\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(english_again.contains("x-cache: HIT"), "{english_again}");
+    assert!(english_again.ends_with("hello"), "{english_again}");
+}
+
+#[tokio::test]
+async fn cache_never_stores_authorized_requests() {
+    let upstream = upstream().await;
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[cache]
+enabled = true
+ttl_secs = 60
+max_item_bytes = 65536
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "*"
+upstream = "app"
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let first = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nAuthorization: Bearer one\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(first.contains("Bearer one"), "{first}");
+
+    let second = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nAuthorization: Bearer two\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(second.contains("Bearer two"), "{second}");
+    assert!(!second.contains("x-cache: HIT"), "{second}");
+}
+
+#[tokio::test]
+async fn error_page_replaces_a_missing_file() {
+    let root = temp_root("error-page");
+    std::fs::write(root.join("index.html"), "home").unwrap();
+    std::fs::write(root.join("404.html"), "custom not found").unwrap();
+
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[routes]]
+host = "*"
+root = "{root}"
+error_pages = ["404 /404.html"]
+"#,
+        root = root.display()
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let response = roundtrip(
+        addr,
+        "GET /missing HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&response), "HTTP/1.1 404 Not Found");
+    assert!(response.ends_with("custom not found"), "{response}");
+}
+
+#[tokio::test]
+async fn route_rate_limit_and_body_cap_apply() {
+    let upstream = upstream().await;
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "*"
+upstream = "app"
+requests_per_second = 1
+burst = 1
+max_body_bytes = 10
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let first = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&first), "HTTP/1.1 200 OK");
+
+    let limited = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&limited), "HTTP/1.1 429 Too Many Requests");
+
+    // The limiter is per route, so a different host still has to pay the same
+    // bucket after the wait, but the body cap is checked before forwarding.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let too_large = roundtrip(
+        addr,
+        "POST / HTTP/1.1\r\nHost: other.example\r\nContent-Length: 20\r\nConnection: close\r\n\r\n01234567890123456789",
+    )
+    .await;
+    assert_eq!(status(&too_large), "HTTP/1.1 413 Payload Too Large");
+}
+
+#[tokio::test]
+async fn mutual_tls_requires_a_client_certificate() {
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+
+    let ca_key = KeyPair::generate().expect("ca key");
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca = ca_params.self_signed(&ca_key).expect("ca");
+
+    let server_key = KeyPair::generate().expect("server key");
+    let server_params =
+        CertificateParams::new(vec!["localhost".to_owned()]).expect("server params");
+    let server = server_params
+        .signed_by(&server_key, &ca, &ca_key)
+        .expect("server cert");
+
+    let client_key = KeyPair::generate().expect("client key");
+    let client_params = CertificateParams::new(Vec::<String>::new()).expect("client params");
+    let client = client_params
+        .signed_by(&client_key, &ca, &ca_key)
+        .expect("client cert");
+
+    let root = temp_root("mtls");
+    std::fs::write(root.join("server.pem"), server.pem()).unwrap();
+    std::fs::write(root.join("server.key"), server_key.serialize_pem()).unwrap();
+    std::fs::write(root.join("ca.pem"), ca.pem()).unwrap();
+
+    let upstream = upstream().await;
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[tls]
+cert = "{cert}"
+key = "{key}"
+client_ca = "{ca}"
+client_auth = "required"
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "*"
+upstream = "app"
+"#,
+        cert = root.join("server.pem").display(),
+        key = root.join("server.key").display(),
+        ca = root.join("ca.pem").display(),
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(ca.der().clone()).expect("add ca");
+    let base = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("versions")
+        .with_root_certificates(roots);
+
+    let name = rustls::pki_types::ServerName::try_from("localhost").expect("server name");
+
+    // No certificate: the handshake must fail, not fall through to the route.
+    let anonymous = base.clone().with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(anonymous));
+    let tcp = TcpStream::connect(addr).await.expect("connect");
+    // With TLS 1.3 the client can finish its side before the server checks
+    // the certificate, so the rejection may arrive on the first read.
+    let rejected = match connector.connect(name.clone(), tcp).await {
+        Err(_) => true,
+        Ok(mut tls) => {
+            let _ = tls
+                .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .await;
+            let mut buf = [0u8; 128];
+            matches!(
+                tokio::time::timeout(Duration::from_secs(2), tls.read(&mut buf)).await,
+                Ok(Ok(0)) | Ok(Err(_)) | Err(_)
+            )
+        }
+    };
+    assert!(rejected, "a client without a certificate must be rejected");
+
+    let with_cert = base
+        .with_client_auth_cert(
+            vec![rustls::pki_types::CertificateDer::from(
+                client.der().to_vec(),
+            )],
+            rustls::pki_types::PrivateKeyDer::Pkcs8(client_key.serialize_der().into()),
+        )
+        .expect("client auth config");
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(with_cert));
+    let tcp = TcpStream::connect(addr).await.expect("connect");
+    let mut tls = connector
+        .connect(name, tcp)
+        .await
+        .expect("mutual handshake");
+    tls.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("write");
+
+    let mut response = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match tokio::time::timeout(Duration::from_secs(3), tls.read(&mut chunk)).await {
+            Ok(Ok(0)) | Err(_) => break,
+            Ok(Ok(read)) => response.extend_from_slice(&chunk[..read]),
+            Ok(Err(_)) => break,
+        }
+    }
+    let response = String::from_utf8_lossy(&response).to_string();
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "expected 200, got {response}"
+    );
 }

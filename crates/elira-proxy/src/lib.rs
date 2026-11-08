@@ -5,9 +5,12 @@
 //! upstream before touching the body.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use async_compression::tokio::bufread::{BrotliEncoder, GzipEncoder};
@@ -20,6 +23,7 @@ use http::header::{
 };
 use http::uri::Authority;
 use http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
+use http_body::{Body as HttpBody, Frame, SizeHint};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper_rustls::HttpsConnector;
@@ -27,9 +31,10 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::io::BufReader;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
+use tokio::time::Sleep;
 use tokio_util::io::{ReaderStream, StreamReader};
 
 use elira_auth::{BasicAuth, IpAcl};
@@ -43,6 +48,15 @@ pub mod files;
 use files::Files;
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// What the response belongs to, attached as a response extension so the
+/// listener can feed per-route and per-upstream metrics without the proxy
+/// holding a metrics registry.
+#[derive(Clone, Debug)]
+pub struct Labels {
+    pub route: String,
+    pub upstream: Option<String>,
+}
 pub type Body = BoxBody<Bytes, BoxError>;
 
 #[derive(Clone)]
@@ -53,7 +67,6 @@ pub struct Proxy {
 struct Inner {
     router: Router,
     pools: Vec<Arc<Pool>>,
-    client: Client<HttpsConnector<HttpConnector>, Body>,
     tunnels: Arc<Semaphore>,
     connect: Option<Vec<Authority>>,
     compression: Compression,
@@ -65,6 +78,9 @@ struct Inner {
     limiter: Option<Arc<RateLimiter>>,
     trusted_proxies: Vec<ipnet::IpNet>,
     timeout: Duration,
+    body_timeout: Option<Duration>,
+    tunnel_idle: Option<Duration>,
+    buffer_bytes: usize,
 }
 
 enum Target {
@@ -77,6 +93,7 @@ enum Target {
 }
 
 struct RouteEntry {
+    label: String,
     prefix: String,
     target: Target,
     strip_prefix: bool,
@@ -85,6 +102,9 @@ struct RouteEntry {
     auth: Option<Arc<BasicAuth>>,
     acl: Option<Arc<IpAcl>>,
     timeout: Option<Duration>,
+    limiter: Option<Arc<RateLimiter>>,
+    body_limit: Option<usize>,
+    error_pages: Vec<(StatusCode, String, Arc<Files>)>,
 }
 
 struct Router {
@@ -149,6 +169,9 @@ struct Pool {
     balance: Balance,
     retries: u32,
     scheme: &'static str,
+    client: Client<HttpsConnector<HttpConnector>, Body>,
+    tls: TlsOptions,
+    health_path: Option<String>,
 }
 
 struct ActiveGuard<'a> {
@@ -214,6 +237,21 @@ impl Pool {
 }
 
 impl Proxy {
+    /// Drop every cached response. Returns false when caching is disabled.
+    pub fn purge_cache(&self) -> bool {
+        match &self.inner.cache {
+            Some(cache) => {
+                cache.purge();
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn cache_stats(&self) -> Option<(usize, usize)> {
+        self.inner.cache.as_ref().map(|cache| cache.stats())
+    }
+
     /// The current pools and their servers, for the admin status endpoint.
     pub fn status(&self) -> serde_json::Value {
         let pools: Vec<_> = self
@@ -246,7 +284,13 @@ impl Proxy {
             })
             .collect();
 
-        serde_json::json!({ "upstreams": pools })
+        serde_json::json!({
+            "upstreams": pools,
+            "cache": self.cache_stats().map(|(bytes, entries)| serde_json::json!({
+                "bytes": bytes,
+                "entries": entries,
+            })),
+        })
     }
 
     pub fn new(cfg: &Config) -> Result<Self, Error> {
@@ -262,6 +306,23 @@ impl Proxy {
             }
             let health = (0..servers.len()).map(|_| AtomicBool::new(true)).collect();
             let active = (0..servers.len()).map(|_| AtomicUsize::new(0)).collect();
+
+            // Each pool gets its own connector: trust and ALPN may differ
+            // between upstreams.
+            let tls = TlsOptions {
+                insecure: up.tls_insecure.unwrap_or(cfg.upstream_tls.insecure),
+                ca: up.tls_ca.clone().or_else(|| cfg.upstream_tls.ca.clone()),
+                sni: up.sni.clone(),
+                http2: up.http2.unwrap_or(cfg.upstream_tls.http2),
+                tls13_only: cfg.upstream_tls.min_version == elira_config::TlsVersion::Tls13,
+            };
+            let connector = https_connector(&tls).map_err(|err| Error::UpstreamTls {
+                reason: err.to_string(),
+            })?;
+            let client = Client::builder(TokioExecutor::new())
+                .pool_idle_timeout(Some(Duration::from_secs(30)))
+                .build(connector);
+
             pools.insert(
                 up.name.clone(),
                 Arc::new(Pool {
@@ -273,6 +334,9 @@ impl Proxy {
                     balance: up.balance,
                     retries: up.retries,
                     scheme: if up.tls { "https" } else { "http" },
+                    client,
+                    tls,
+                    health_path: up.health_path.clone(),
                 }),
             );
         }
@@ -338,7 +402,46 @@ impl Proxy {
                 ))
             };
 
+            let limiter = match route.requests_per_second {
+                Some(rate) if rate > 0 => Some(Arc::new(RateLimiter::new(
+                    rate,
+                    route.burst.unwrap_or(rate).max(rate),
+                ))),
+                _ => None,
+            };
+
+            let error_root = route.error_root.clone().or_else(|| route.root.clone());
+            let error_pages = match error_root {
+                Some(root) if !route.error_pages.is_empty() => {
+                    let files = Arc::new(Files::new(
+                        root,
+                        route.index.clone(),
+                        false,
+                        Vec::new(),
+                        false,
+                        false,
+                        0,
+                    ));
+                    let mut pages = Vec::new();
+                    for page in &route.error_pages {
+                        let mut parts = page.splitn(2, char::is_whitespace);
+                        let status = parts.next().and_then(|s| s.parse::<u16>().ok());
+                        let path = parts.next().unwrap_or_default().trim();
+                        if let Some(status) = status.and_then(|s| StatusCode::from_u16(s).ok()) {
+                            pages.push((status, path.to_owned(), files.clone()));
+                        }
+                    }
+                    pages
+                }
+                _ => Vec::new(),
+            };
+
             let entry = RouteEntry {
+                label: format!(
+                    "{}{}",
+                    route.host,
+                    route.path.as_deref().unwrap_or_default()
+                ),
                 prefix: route.path.clone().unwrap_or_default(),
                 target,
                 strip_prefix: route.strip_prefix,
@@ -355,6 +458,9 @@ impl Proxy {
                 auth,
                 acl,
                 timeout: route.timeout_secs.map(Duration::from_secs),
+                limiter,
+                body_limit: route.max_body_bytes,
+                error_pages,
             };
 
             let host = route.host.trim().to_ascii_lowercase();
@@ -426,20 +532,6 @@ impl Proxy {
             None
         };
 
-        let connector = https_connector(&TlsOptions {
-            insecure: cfg.upstream_tls.insecure,
-            ca: cfg.upstream_tls.ca.clone(),
-            sni: None,
-            http2: cfg.upstream_tls.http2,
-        })
-        .map_err(|err| Error::UpstreamTls {
-            reason: err.to_string(),
-        })?;
-
-        let client = Client::builder(TokioExecutor::new())
-            .pool_idle_timeout(Some(Duration::from_secs(30)))
-            .build(connector);
-
         Ok(Self {
             inner: Arc::new(Inner {
                 router: Router {
@@ -448,7 +540,6 @@ impl Proxy {
                     default,
                 },
                 pools: all_pools,
-                client,
                 tunnels: Arc::new(Semaphore::new(cfg.limits.max_connections)),
                 connect,
                 compression: cfg.compression.clone(),
@@ -463,6 +554,15 @@ impl Proxy {
                 limiter,
                 trusted_proxies,
                 timeout: Duration::from_secs(cfg.limits.upstream_timeout_secs),
+                body_timeout: match cfg.limits.upstream_body_timeout_secs {
+                    0 => None,
+                    secs => Some(Duration::from_secs(secs)),
+                },
+                tunnel_idle: match cfg.limits.websocket_idle_secs {
+                    0 => None,
+                    secs => Some(Duration::from_secs(secs)),
+                },
+                buffer_bytes: cfg.limits.response_buffer_bytes,
             }),
         })
     }
@@ -479,6 +579,8 @@ impl Proxy {
             || !entry.remove_headers.is_empty()
             || entry.auth.is_some()
             || entry.acl.is_some()
+            || entry.limiter.is_some()
+            || !entry.error_pages.is_empty()
             || !self.inner.server_header
             || self.inner.alt_svc.is_some()
         {
@@ -524,14 +626,9 @@ impl Proxy {
         }
         let timeout = Duration::from_secs(cfg.timeout_secs);
         for pool in &self.inner.pools {
-            // The probe speaks plain HTTP; a TLS upstream would answer with a
-            // handshake failure. Leave those marked healthy.
-            if pool.scheme == "https" {
-                continue;
-            }
-
+            let path = pool.health_path.as_deref().unwrap_or(&cfg.path);
             for (index, server) in pool.servers.iter().enumerate() {
-                let up = probe(server, &cfg.path, timeout).await;
+                let up = probe(server, path, timeout, pool.scheme == "https", &pool.tls).await;
                 pool.set_health(index, up);
             }
         }
@@ -618,14 +715,14 @@ impl Proxy {
             };
 
         let client_upgrade = hyper::upgrade::on(&mut req);
+        let idle = self.inner.tunnel_idle;
 
         tokio::spawn(async move {
             let _permit = permit;
             match client_upgrade.await {
                 Ok(client) => {
                     let mut client = TokioIo::new(client);
-                    if let Err(err) = tokio::io::copy_bidirectional(&mut client, &mut stream).await
-                    {
+                    if let Err(err) = tunnel(&mut client, &mut stream, idle).await {
                         tracing::debug!(error = %err, "CONNECT tunnel closed");
                     }
                 }
@@ -734,6 +831,35 @@ impl Proxy {
             .pick(&key, req.uri().path())
             .ok_or_else(|| text(StatusCode::NOT_FOUND, "no route"))?;
 
+        // A route may set a stricter cap than the global one.
+        if let Some(limit) = entry.body_limit {
+            if limit > 0 {
+                if let Some(length) = req
+                    .headers()
+                    .get(CONTENT_LENGTH)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<u64>().ok())
+                {
+                    if length > limit as u64 {
+                        return Err(text(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            "request body too large",
+                        ));
+                    }
+                }
+            }
+        }
+
+        if let Some(limiter) = &entry.limiter {
+            if !limiter.check(peer.ip(), Instant::now()) {
+                let mut response = text(StatusCode::TOO_MANY_REQUESTS, "too many requests");
+                response
+                    .headers_mut()
+                    .insert(http::header::RETRY_AFTER, HeaderValue::from_static("1"));
+                return Err(response);
+            }
+        }
+
         if let Some(acl) = &entry.acl {
             if !acl.allows(peer.ip()) {
                 return Err(text(StatusCode::FORBIDDEN, "forbidden"));
@@ -760,6 +886,7 @@ impl Proxy {
             Target::Proxy(pool) => pool,
             Target::Files(files) => {
                 let mut response = files.serve(&req, peer).await;
+                self.apply_error_page(&mut response, entry, peer).await;
                 self.apply_route(&mut response, entry, &request_id);
                 return Ok(response);
             }
@@ -810,10 +937,12 @@ impl Proxy {
                 || req.method() == Method::OPTIONS);
 
         let (parts, body) = req.into_parts();
+        // Kept for Vary matching: the response parts shadow this name later.
+        let request_headers = parts.headers.clone();
         let mut template = HeaderMap::new();
         let drop = connection_tokens(&parts.headers);
         for (name, value) in parts.headers.iter() {
-            if is_hop_by_hop(name) || drop.contains(name) || is_client_forwarding(name) {
+            if hop_by_hop(name, value) || drop.contains(name) || is_client_forwarding(name) {
                 continue;
             }
             template.append(name, value.clone());
@@ -842,11 +971,20 @@ impl Proxy {
 
         if is_get && requested_upgrade.is_none() {
             if let Some(cache) = &self.inner.cache {
-                if let Some(hit) = cache.get(&cache_key, Instant::now()) {
+                let now = Instant::now();
+                if let Some(hit) = cache.get(&cache_key, &request_headers, now) {
+                    let age = hit.age(now);
                     let mut response = cache_response(hit);
+                    if let Ok(value) = HeaderValue::from_str(&age.to_string()) {
+                        response.headers_mut().insert("age", value);
+                    }
                     response
                         .headers_mut()
                         .insert("x-cache", HeaderValue::from_static("HIT"));
+                    response.extensions_mut().insert(Labels {
+                        route: entry.label.clone(),
+                        upstream: Some(pool.name.clone()),
+                    });
                     self.apply_route(&mut response, entry, &request_id);
                     return Ok(response);
                 }
@@ -900,7 +1038,7 @@ impl Proxy {
                 .map_err(|_| text(StatusCode::BAD_GATEWAY, "bad request"))?;
             *upstream.headers_mut() = template.clone();
 
-            match tokio::time::timeout(route_timeout, self.inner.client.request(upstream)).await {
+            match tokio::time::timeout(route_timeout, pool.client.request(upstream)).await {
                 Ok(Ok(answer)) => {
                     response = Some(answer);
                     break;
@@ -1011,25 +1149,12 @@ impl Proxy {
             };
 
             if let Some(cache) = &self.inner.cache {
-                let headers = parts
-                    .headers
-                    .iter()
-                    .filter(|(name, _)| !is_hop_by_hop(name) && *name != CONTENT_LENGTH)
-                    .filter_map(|(name, value)| {
-                        value
-                            .to_str()
-                            .ok()
-                            .map(|value| (name.as_str().to_owned(), value.to_owned()))
-                    })
-                    .collect();
-
                 cache.insert(
-                    cache_key,
-                    elira_cache::Entry {
-                        status: parts.status.as_u16(),
-                        headers,
-                        body: collected.to_vec(),
-                    },
+                    &cache_key,
+                    &request_headers,
+                    &parts.headers,
+                    parts.status.as_u16(),
+                    collected.to_vec(),
                     Instant::now(),
                 );
             }
@@ -1039,12 +1164,38 @@ impl Proxy {
             BodyExt::map_err(body, |err| -> BoxError { Box::new(err) }).boxed()
         };
 
+        // Buffer small complete responses so the upstream socket is free
+        // before a slow client finishes reading. Larger bodies stream.
+        let body = if !cacheable
+            && self.inner.buffer_bytes > 0
+            && !is_head
+            && upstream_len
+                .map(|length| length <= self.inner.buffer_bytes)
+                .unwrap_or(false)
+        {
+            match BodyExt::collect(body).await {
+                Ok(collected) => Full::new(collected.to_bytes())
+                    .map_err(|never| match never {})
+                    .boxed(),
+                Err(err) => {
+                    tracing::warn!(error = %err, "failed to buffer an upstream response");
+                    return Err(text(StatusCode::BAD_GATEWAY, "bad gateway"));
+                }
+            }
+        } else {
+            body
+        };
+
         let body = if let Some(encoding) = compress_with {
             compress(body, encoding)
         } else {
             body
         };
 
+        let body = match self.inner.body_timeout {
+            Some(idle) => timeout_body(body, idle),
+            None => body,
+        };
         let mut response = builder
             .body(body)
             .map_err(|_| text(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"))?;
@@ -1055,8 +1206,45 @@ impl Proxy {
                 .insert("x-cache", HeaderValue::from_static("MISS"));
         }
 
+        response.extensions_mut().insert(Labels {
+            route: entry.label.clone(),
+            upstream: Some(pool.name.clone()),
+        });
+        self.apply_error_page(&mut response, entry, peer).await;
         self.apply_route(&mut response, entry, &request_id);
         Ok(response)
+    }
+
+    /// Replace a configured error response with a file from the route root.
+    /// The original status is kept even if the file itself would be a 200.
+    async fn apply_error_page(
+        &self,
+        response: &mut Response<Body>,
+        entry: &RouteEntry,
+        peer: SocketAddr,
+    ) {
+        let status = response.status();
+        let Some((_, path, files)) = entry
+            .error_pages
+            .iter()
+            .find(|(code, _, _)| *code == status)
+        else {
+            return;
+        };
+
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(path.clone())
+            .body(empty());
+        let Ok(request) = request else {
+            return;
+        };
+
+        let mut page = files.serve(&request, peer).await;
+        if page.status().is_success() {
+            *page.status_mut() = status;
+        }
+        *response = page;
     }
 
     fn apply_route(&self, response: &mut Response<Body>, entry: &RouteEntry, request_id: &str) {
@@ -1140,6 +1328,8 @@ impl Proxy {
         headers.insert(UPGRADE, upgrade);
         headers.insert(SERVER, HeaderValue::from_static("elira"));
 
+        let idle = self.inner.tunnel_idle;
+
         tokio::spawn(async move {
             let _permit = permit;
             match client_upgrade.await {
@@ -1147,13 +1337,11 @@ impl Proxy {
                     let mut client = TokioIo::new(client);
                     let mut upstream = stream;
                     // Bytes the upstream sent right after the 101 would
-                    // otherwise be dropped by copy_bidirectional.
+                    // otherwise be dropped by the copy loop.
                     if !leftover.is_empty() && client.write_all(&leftover).await.is_err() {
                         return;
                     }
-                    if let Err(err) =
-                        tokio::io::copy_bidirectional(&mut client, &mut upstream).await
-                    {
+                    if let Err(err) = tunnel(&mut client, &mut upstream, idle).await {
                         tracing::debug!(error = %err, "tunnel closed");
                     }
                 }
@@ -1265,21 +1453,67 @@ async fn read_head(
 
 /// One health probe: a plain HTTP/1.1 GET with `Connection: close`.
 /// Anything 2xx or 3xx counts as up.
-async fn probe(server: &Authority, path: &str, timeout: Duration) -> bool {
+async fn probe(
+    server: &Authority,
+    path: &str,
+    timeout: Duration,
+    tls: bool,
+    options: &TlsOptions,
+) -> bool {
     let host = server.host().trim_start_matches('[').trim_end_matches(']');
-    let port = server.port_u16().unwrap_or(80);
+    let port = server.port_u16().unwrap_or(if tls { 443 } else { 80 });
 
-    let mut stream = match tokio::time::timeout(timeout, TcpStream::connect((host, port))).await {
+    let stream = match tokio::time::timeout(timeout, TcpStream::connect((host, port))).await {
         Ok(Ok(stream)) => stream,
         _ => return false,
     };
 
     let request = format!("GET {path} HTTP/1.1\r\nHost: {server}\r\nConnection: close\r\n\r\n");
-    match tokio::time::timeout(timeout, stream.write_all(request.as_bytes())).await {
-        Ok(Ok(())) => {}
-        _ => return false,
+    if tls {
+        let config = match elira_upstream::client_config(options) {
+            Ok(config) => config,
+            Err(_) => return false,
+        };
+        let name = match options.sni.as_deref().or(Some(host)) {
+            Some(name) => name.to_owned(),
+            None => return false,
+        };
+        let name = match name.parse::<std::net::IpAddr>() {
+            Ok(ip) => tokio_rustls::rustls::pki_types::ServerName::IpAddress(ip.into()),
+            Err(_) => match tokio_rustls::rustls::pki_types::ServerName::try_from(name) {
+                Ok(name) => name,
+                Err(_) => return false,
+            },
+        };
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+        let mut stream = match tokio::time::timeout(timeout, connector.connect(name, stream)).await
+        {
+            Ok(Ok(stream)) => stream,
+            _ => return false,
+        };
+        if tokio::time::timeout(timeout, stream.write_all(request.as_bytes()))
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        probe_response(&mut stream, timeout).await
+    } else {
+        let mut stream = stream;
+        if tokio::time::timeout(timeout, stream.write_all(request.as_bytes()))
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        probe_response(&mut stream, timeout).await
     }
+}
 
+async fn probe_response<S>(stream: &mut S, timeout: Duration) -> bool
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
     let mut buf = Vec::new();
     loop {
         let mut chunk = [0u8; 64];
@@ -1524,6 +1758,19 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
     )
 }
 
+/// `TE: trailers` is how gRPC asks for trailer frames; dropping it breaks
+/// every gRPC upstream. Other TE values really are hop-by-hop.
+fn hop_by_hop(name: &HeaderName, value: &HeaderValue) -> bool {
+    if name.as_str() == "te" {
+        return value
+            .to_str()
+            .map(|value| value.trim().eq_ignore_ascii_case("trailers"))
+            .map(|trailers| !trailers)
+            .unwrap_or(true);
+    }
+    is_hop_by_hop(name)
+}
+
 fn is_client_forwarding(name: &HeaderName) -> bool {
     // Underscore aliases reach the same backend functions as their dashed
     // form, so normalize before comparing.
@@ -1577,6 +1824,114 @@ pub enum Error {
 
     #[error("route for \"{host}\": {reason}")]
     RouteConfig { host: String, reason: String },
+}
+
+/// A body that fails when it makes no progress for `idle`. Used for both
+/// client uploads and upstream downloads: a peer that stops mid-body would
+/// otherwise hold a connection slot forever.
+pub fn timeout_body(body: Body, idle: Duration) -> Body {
+    IdleBody {
+        inner: body,
+        idle,
+        timer: Box::pin(tokio::time::sleep(idle)),
+        expired: false,
+    }
+    .boxed()
+}
+
+struct IdleBody {
+    inner: Body,
+    idle: Duration,
+    timer: Pin<Box<Sleep>>,
+    expired: bool,
+}
+
+impl HttpBody for IdleBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        if self.expired {
+            return Poll::Ready(None);
+        }
+
+        if self.timer.as_mut().poll(cx).is_ready() {
+            self.expired = true;
+            return Poll::Ready(Some(Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "body made no progress",
+            )))));
+        }
+
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                this.timer
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + this.idle);
+                Poll::Ready(Some(Ok(frame)))
+            }
+            other => other,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// Copy bytes both ways, closing the tunnel after `idle` without traffic.
+async fn tunnel<A, B>(a: &mut A, b: &mut B, idle: Option<Duration>) -> std::io::Result<()>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut a_read, mut a_write) = tokio::io::split(a);
+    let (mut b_read, mut b_write) = tokio::io::split(b);
+
+    let forward = pipe(&mut a_read, &mut b_write, idle);
+    let backward = pipe(&mut b_read, &mut a_write, idle);
+    tokio::pin!(forward);
+    tokio::pin!(backward);
+
+    tokio::select! {
+        result = &mut forward => result,
+        result = &mut backward => result,
+    }
+}
+
+async fn pipe<R, W>(read: &mut R, write: &mut W, idle: Option<Duration>) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        let read = match idle {
+            Some(idle) => match tokio::time::timeout(idle, read.read(&mut buf)).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "tunnel idle",
+                    ))
+                }
+            },
+            None => read.read(&mut buf).await?,
+        };
+        if read == 0 {
+            return Ok(());
+        }
+        write.write_all(&buf[..read]).await?;
+        write.flush().await?;
+    }
 }
 
 #[cfg(test)]
@@ -1647,6 +2002,9 @@ mod tests {
 
     #[test]
     fn least_conn_prefers_the_idle_server() {
+        let tls = TlsOptions::default();
+        let client =
+            Client::builder(TokioExecutor::new()).build(https_connector(&tls).expect("connector"));
         let pool = Pool {
             name: "test".to_owned(),
             servers: vec![
@@ -1659,6 +2017,9 @@ mod tests {
             balance: Balance::LeastConn,
             retries: 0,
             scheme: "http",
+            client,
+            tls,
+            health_path: None,
         };
 
         assert_eq!(pool.pick(), 0);

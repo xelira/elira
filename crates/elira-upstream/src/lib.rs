@@ -24,6 +24,8 @@ pub struct TlsOptions {
     pub sni: Option<String>,
     /// Offer `h2` in ALPN. Off keeps the upstream on HTTP/1.1.
     pub http2: bool,
+    /// Refuse anything below TLS 1.3.
+    pub tls13_only: bool,
 }
 
 /// Build an HTTPS connector that accepts both `https` and `http` upstreams.
@@ -56,13 +58,21 @@ pub fn https_connector(options: &TlsOptions) -> anyhow::Result<HttpsConnector<Ht
     }
 }
 
-fn client_config(options: &TlsOptions) -> anyhow::Result<ClientConfig> {
+/// Build the rustls client configuration used by the connector and by
+/// health probes. Callers that open their own socket (for a probe or a
+/// websocket) need the same trust decisions as normal requests.
+pub fn client_config(options: &TlsOptions) -> anyhow::Result<ClientConfig> {
     // Pick the provider explicitly. Relying on the process default breaks as
     // soon as another crate installs a different backend.
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let versions: &[&rustls::SupportedProtocolVersion] = if options.tls13_only {
+        &[&rustls::version::TLS13]
+    } else {
+        rustls::ALL_VERSIONS
+    };
     let builder = ClientConfig::builder_with_provider(provider.clone())
-        .with_safe_default_protocol_versions()
-        .context("rustls provider does not support the default protocol versions")?;
+        .with_protocol_versions(versions)
+        .context("rustls provider does not support the requested protocol versions")?;
 
     let config = if options.insecure {
         // A custom CA is irrelevant here: the verifier accepts every chain.
@@ -296,6 +306,7 @@ mod tests {
                 ca: None,
                 sni: None,
                 http2: false,
+                tls13_only: false,
             },
             server.localhost_uri(),
         )
@@ -326,6 +337,7 @@ mod tests {
                 // come from the explicit SNI override.
                 sni: Some("localhost".to_owned()),
                 http2: false,
+                tls13_only: false,
             },
             server.ip_uri(),
         )

@@ -11,9 +11,28 @@ use std::sync::Arc;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::danger::ClientCertVerifier;
-use rustls::server::WebPkiClientVerifier;
+use rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
+use rustls::sign::CertifiedKey;
 use rustls::{RootCertStore, ServerConfig};
 use thiserror::Error;
+
+/// A certificate that answers for a set of Server Name Indication values.
+#[derive(Debug, Clone)]
+pub struct NamedCert {
+    pub names: Vec<String>,
+    pub cert: PathBuf,
+    pub key: PathBuf,
+}
+
+/// Everything a TLS listener can be configured with.
+pub struct ServerOptions<'a> {
+    /// The certificate used when SNI does not match anything.
+    pub default: Option<(&'a Path, &'a Path)>,
+    pub named: &'a [NamedCert],
+    pub client_ca: Option<&'a Path>,
+    pub client_auth: ClientAuth,
+    pub tls13_only: bool,
+}
 
 /// ALPN order matters: clients that accept both get the first shared protocol.
 const ALPN_PROTOCOLS: [&[u8]; 2] = [b"h2", b"http/1.1"];
@@ -66,6 +85,9 @@ pub enum Error {
     #[error("no private key in {path}")]
     NoPrivateKey { path: PathBuf },
 
+    #[error("private key in {path} cannot be used for signing")]
+    SigningKey { path: PathBuf },
+
     #[error("invalid certificate {cert} and key {key}: {source}")]
     Tls {
         cert: PathBuf,
@@ -93,7 +115,19 @@ pub enum Error {
 /// Client certificates are not requested. Use
 /// [`server_config_with_client_auth`] when a client CA trust store exists.
 pub fn server_config(cert: &Path, key: &Path) -> Result<ServerConfig, Error> {
-    build(cert, key, &ALPN_PROTOCOLS, None, ClientAuth::Off)
+    server_config_with_options(&ServerOptions {
+        default: Some((cert, key)),
+        named: &[],
+        client_ca: None,
+        client_auth: ClientAuth::Off,
+        tls13_only: false,
+    })
+}
+
+/// Build a TLS listener with SNI-selected certificates, optional client
+/// authentication, and a chosen minimum protocol version.
+pub fn server_config_with_options(options: &ServerOptions<'_>) -> Result<ServerConfig, Error> {
+    build(options, &ALPN_PROTOCOLS)
 }
 
 /// Same material as [`server_config`], but with a client certificate policy.
@@ -108,48 +142,138 @@ pub fn server_config_with_client_auth(
     client_ca: Option<&Path>,
     mode: ClientAuth,
 ) -> Result<ServerConfig, Error> {
-    build(cert, key, &ALPN_PROTOCOLS, client_ca, mode)
+    server_config_with_options(&ServerOptions {
+        default: Some((cert, key)),
+        named: &[],
+        client_ca,
+        client_auth: mode,
+        tls13_only: false,
+    })
 }
 
 /// Same material, but for QUIC: HTTP/3 is the only protocol a QUIC endpoint
 /// can negotiate, so the ALPN list is shorter.
 pub fn quic_server_config(cert: &Path, key: &Path) -> Result<ServerConfig, Error> {
-    build(cert, key, &[b"h3"], None, ClientAuth::Off)
+    quic_server_config_with_client_auth(cert, key, None, ClientAuth::Off)
 }
 
-fn build(
+/// QUIC always uses TLS 1.3; only the client certificate policy varies.
+pub fn quic_server_config_with_client_auth(
     cert: &Path,
     key: &Path,
-    alpn: &[&[u8]],
     client_ca: Option<&Path>,
-    client_auth: ClientAuth,
+    mode: ClientAuth,
 ) -> Result<ServerConfig, Error> {
-    let chain = load_chain(cert)?;
-    let key_der = load_key(key)?;
-    let client_verifier = client_verifier(client_ca, client_auth)?;
+    build(
+        &ServerOptions {
+            default: Some((cert, key)),
+            named: &[],
+            client_ca,
+            client_auth: mode,
+            tls13_only: true,
+        },
+        &[b"h3"],
+    )
+}
+
+fn build(options: &ServerOptions<'_>, alpn: &[&[u8]]) -> Result<ServerConfig, Error> {
+    let client_verifier = client_verifier(options.client_ca, options.client_auth)?;
 
     // Pick the provider explicitly. Relying on the process default breaks as
     // soon as another crate enables a second backend, which quinn does.
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let versions: &[&rustls::SupportedProtocolVersion] = if options.tls13_only {
+        &[&rustls::version::TLS13]
+    } else {
+        rustls::ALL_VERSIONS
+    };
     let builder = ServerConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .expect("aws-lc-rs provides TLS 1.2 and 1.3");
+        .with_protocol_versions(versions)
+        .expect("aws-lc-rs supports the requested protocol versions");
 
     let builder = match client_verifier {
         Some(verifier) => builder.with_client_cert_verifier(verifier),
         None => builder.with_no_client_auth(),
     };
 
-    let mut config = builder
-        .with_single_cert(chain, key_der)
-        .map_err(|source| Error::Tls {
-            cert: cert.to_path_buf(),
-            key: key.to_path_buf(),
-            source,
-        })?;
+    let mut named = Vec::with_capacity(options.named.len());
+    for entry in options.named {
+        named.push((
+            entry.names.clone(),
+            Arc::new(certified(&entry.cert, &entry.key)?),
+        ));
+    }
 
+    let default = match options.default {
+        Some((cert, key)) => Some(Arc::new(certified(cert, key)?)),
+        None => None,
+    };
+
+    if default.is_none() && named.is_empty() {
+        return Err(Error::NoCertificates {
+            path: PathBuf::new(),
+        });
+    }
+
+    let resolver = NamedResolver { named, default };
+    let mut config = builder.with_cert_resolver(Arc::new(resolver));
     config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
     Ok(config)
+}
+
+fn certified(cert: &Path, key: &Path) -> Result<CertifiedKey, Error> {
+    let chain = load_chain(cert)?;
+    let key_der = load_key(key)?;
+    let signing = rustls::crypto::aws_lc_rs::sign::any_supported_type(&key_der).map_err(|_| {
+        Error::SigningKey {
+            path: key.to_path_buf(),
+        }
+    })?;
+    Ok(CertifiedKey::new(chain, signing))
+}
+
+/// SNI dispatcher. Exact names win; `*.example.com` matches exactly one label.
+/// A client without SNI gets the default certificate.
+#[derive(Debug)]
+struct NamedResolver {
+    named: Vec<(Vec<String>, Arc<CertifiedKey>)>,
+    default: Option<Arc<CertifiedKey>>,
+}
+
+impl NamedResolver {
+    fn pick(&self, name: Option<&str>) -> Option<Arc<CertifiedKey>> {
+        let Some(name) = name else {
+            return self.default.clone();
+        };
+        let name = name.to_ascii_lowercase();
+
+        for (names, key) in &self.named {
+            for pattern in names {
+                let pattern = pattern.to_ascii_lowercase();
+                if pattern == name {
+                    return Some(key.clone());
+                }
+                if let Some(suffix) = pattern.strip_prefix("*.") {
+                    let suffix = format!(".{suffix}");
+                    if let Some(prefix) = name.strip_suffix(suffix.as_str()) {
+                        // The dot is part of the suffix, so `prefix` is the
+                        // label before it. A nested name must not match.
+                        if !prefix.is_empty() && !prefix.ends_with('.') && !prefix.contains('.') {
+                            return Some(key.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        self.default.clone()
+    }
+}
+
+impl ResolvesServerCert for NamedResolver {
+    fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        self.pick(hello.server_name())
+    }
 }
 
 /// Build the client certificate verifier, or `None` when clients are not
@@ -480,5 +604,41 @@ mod tests {
             ClientAuth::Required,
         )
         .expect("required client auth with a CA");
+    }
+
+    #[test]
+    fn sni_matching_is_exact_and_wildcard_shallow() {
+        let fixtures = fixtures();
+        let key = Arc::new(
+            certified(&fixtures.join("cert.pem"), &fixtures.join("key.pem"))
+                .expect("fixture certificate"),
+        );
+        let resolver = NamedResolver {
+            named: vec![(
+                vec![
+                    "a.example.com".to_owned(),
+                    "*.b.example.com".to_owned(),
+                    "*.wild.example.com".to_owned(),
+                ],
+                key.clone(),
+            )],
+            default: Some(key.clone()),
+        };
+
+        assert!(resolver.pick(Some("A.Example.COM")).is_some());
+        assert!(resolver.pick(Some("x.b.example.com")).is_some());
+        assert!(
+            resolver.pick(Some("deep.x.b.example.com")).is_some(),
+            "no match should still fall back to the default"
+        );
+        assert!(resolver.pick(Some("x.wild.example.com")).is_some());
+
+        let no_default = NamedResolver {
+            named: vec![(vec!["*.b.example.com".to_owned()], key)],
+            default: None,
+        };
+        assert!(no_default.pick(Some("b.example.com")).is_none());
+        assert!(no_default.pick(Some("x.b.example.com")).is_some());
+        assert!(no_default.pick(Some("deep.x.b.example.com")).is_none());
     }
 }

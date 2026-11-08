@@ -1,4 +1,11 @@
-target
 .git
+.github
+target
+fuzz
+dist
+docs
+examples
 notes
-packages/npm/node_modules
+packages
+deploy
+scripts

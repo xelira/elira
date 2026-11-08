@@ -5,7 +5,8 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=all
 User=elira
 Group=elira
 ExecStart=/usr/local/bin/elira run --config /etc/elira/elira.toml
