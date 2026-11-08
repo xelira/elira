@@ -93,7 +93,25 @@ pub async fn execute(
 
 async fn exchange_target(target: &Target, request: &Request) -> Result<Response, Error> {
     match target {
-        Target::Tcp(address) => {
+        Target::Tcp(_) | Target::TcpName(_) => {
+            let address = match target {
+                Target::Tcp(address) => *address,
+                Target::TcpName(name) => tokio::net::lookup_host(name)
+                    .await
+                    .map_err(|source| Error::Connect {
+                        target: target.to_string(),
+                        source,
+                    })?
+                    .next()
+                    .ok_or_else(|| Error::Connect {
+                        target: target.to_string(),
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "host has no addresses",
+                        ),
+                    })?,
+                Target::Unix(_) => unreachable!(),
+            };
             let mut stream =
                 TcpStream::connect(address)
                     .await

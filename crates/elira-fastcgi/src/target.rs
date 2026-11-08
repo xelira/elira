@@ -8,14 +8,14 @@ use crate::Error;
 
 /// A listening FastCGI application.
 ///
-/// TCP targets hold a resolved [`SocketAddr`]; host names are not resolved
-/// here because the proxy loads configuration synchronously and a blocking
-/// DNS lookup in a config parser is a trap. Resolve the name before calling
-/// [`Target::parse`] when the upstream uses one.
+/// A literal address connects immediately; a host name is resolved by the
+/// client for each request, so DNS changes do not require a reload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
-    /// A TCP socket, usually the local machine.
+    /// A TCP socket with a literal address.
     Tcp(SocketAddr),
+    /// A TCP host name and port, resolved at request time.
+    TcpName(String),
     /// A Unix domain socket.
     Unix(PathBuf),
 }
@@ -48,11 +48,15 @@ impl Target {
                 value,
                 "the port is missing; expected host:port or unix:/path",
             )),
-            Err(_) => Err(invalid(
-                value,
-                "the host must be an IP address and the port must be a number; \
-                 resolve host names before building the target",
-            )),
+            Err(_) => {
+                let (host, port) = value
+                    .rsplit_once(':')
+                    .ok_or_else(|| invalid(value, "the port is missing; expected host:port"))?;
+                if host.is_empty() || port.parse::<u16>().is_err() {
+                    return Err(invalid(value, "expected host:port with a numeric port"));
+                }
+                Ok(Self::TcpName(value.to_owned()))
+            }
         }
     }
 }
@@ -61,6 +65,7 @@ impl fmt::Display for Target {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Tcp(addr) => write!(f, "tcp://{addr}"),
+            Self::TcpName(name) => write!(f, "tcp://{name}"),
             Self::Unix(path) => write!(f, "unix:{}", path.display()),
         }
     }
@@ -98,6 +103,19 @@ mod tests {
     }
 
     #[test]
+    fn keeps_a_host_name_for_later_resolution() {
+        assert_eq!(
+            Target::parse("php.internal:9000").unwrap(),
+            Target::TcpName("php.internal:9000".to_owned())
+        );
+    }
+
+    #[test]
+    fn rejects_a_non_numeric_port() {
+        assert!(Target::parse("php.internal:http").is_err());
+    }
+
+    #[test]
     fn parses_unix_path() {
         assert_eq!(
             Target::parse("unix:/run/php/php-fpm.sock").unwrap(),
@@ -113,7 +131,6 @@ mod tests {
             "127.0.0.1",
             "127.0.0.1:",
             "127.0.0.1:http",
-            "localhost:9000",
             "tcp://127.0.0.1:9000",
             "[::1]",
         ];

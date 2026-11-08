@@ -432,6 +432,23 @@ impl Cache {
         true
     }
 
+    /// Extend a stored response without touching its body, used for a 304
+    /// answer to a conditional refresh.
+    pub fn revalidate(&self, key: &str, request: &HeaderMap, now: Instant) -> bool {
+        let mut store = self.lock();
+        let Some(records) = store.entries.get_mut(key) else {
+            return false;
+        };
+        let Some(record) = records
+            .iter_mut()
+            .find(|record| record.entry.matches(request))
+        else {
+            return false;
+        };
+        record.entry.stored_at = now;
+        true
+    }
+
     /// Drops every stored response and its disk body.
     pub fn purge(&self) {
         let mut store = self.lock();
@@ -1605,5 +1622,27 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn revalidate_extends_the_lifetime() {
+        let cache = Cache::new(1024, Duration::from_secs(10));
+        let request = HeaderMap::new();
+        let response = HeaderMap::new();
+        let now = Instant::now();
+        assert!(cache.insert(
+            "example.com/",
+            &request,
+            &response,
+            200,
+            b"body".to_vec(),
+            now
+        ));
+
+        let later = now + Duration::from_secs(8);
+        assert!(cache.revalidate("example.com/", &request, later));
+        let entry = cache.get("example.com/", &request, later + Duration::from_secs(8));
+        assert!(entry.is_some(), "revalidation must reset the TTL");
+        assert!(!cache.revalidate("other/", &request, later));
     }
 }

@@ -80,6 +80,10 @@
 - sendfile обслуживает одиночные range, conditionals, auth/ACL и per-route
   заголовки; TLS, HTTP/2, сжатие и multi-range остаются в hyper.
 - Маршруты по регулярному выражению пути (`path_regex`) после префиксных.
+- FastCGI принимает DNS-имена в `fastcgi_pass`.
+- Кэш делает условную revalidation (`ETag`/`Last-Modified` → `304`) и сжимает
+  HIT-ответы.
+- SNI-сертификаты и mTLS на QUIC-листенере.
 - FastCGI-бэкенды по TCP и unix-сокетам, CGI-скрипты и нативные
   динамические модули (`.so`).
 - Режим `workers > 1` с супервизором, SO_REUSEPORT, перезапуском упавших

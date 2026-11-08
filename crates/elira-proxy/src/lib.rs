@@ -1133,7 +1133,41 @@ impl Proxy {
                 let now = Instant::now();
                 if let Some((hit, stale)) = cache.get_stale(&cache_key, &request_headers, now) {
                     let age = hit.age(now);
+                    let body_len = hit.body.len();
+                    let cached_status = hit.status;
+                    let cached_type = hit
+                        .headers
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+                        .map(|(_, value)| value.clone())
+                        .unwrap_or_default();
+                    let cached_encoding = hit
+                        .headers
+                        .iter()
+                        .any(|(name, _)| name.eq_ignore_ascii_case("content-encoding"));
+                    let validators = validators_from_entry(&hit);
                     let mut response = cache_response(hit);
+
+                    // A cached body is stored identity-encoded, so it still
+                    // has to go through the same negotiation as a fresh one.
+                    if !is_head
+                        && !cached_encoding
+                        && cached_status == StatusCode::OK.as_u16()
+                        && self.inner.compression.enabled
+                        && body_len >= self.inner.compression.min_bytes
+                        && compressible(&cached_type)
+                    {
+                        if let Some(encoding) = preferred_encoding(&request_headers) {
+                            let headers = response.headers_mut();
+                            headers.remove(CONTENT_LENGTH);
+                            headers.remove(http::header::ETAG);
+                            headers.insert(CONTENT_ENCODING, HeaderValue::from_static(encoding));
+                            headers.append(VARY, HeaderValue::from_static("accept-encoding"));
+                            let body = std::mem::replace(response.body_mut(), empty());
+                            *response.body_mut() = compress(body, encoding);
+                        }
+                    }
+
                     if let Ok(value) = HeaderValue::from_str(&age.to_string()) {
                         response.headers_mut().insert("age", value);
                     }
@@ -1151,6 +1185,7 @@ impl Proxy {
                             cache_key.clone(),
                             template.clone(),
                             request_headers.clone(),
+                            validators,
                             upstream_path.clone(),
                             pool.clone(),
                             route_timeout,
@@ -1394,6 +1429,7 @@ impl Proxy {
         key: String,
         headers: HeaderMap,
         request_headers: HeaderMap,
+        validators: HeaderMap,
         path: String,
         pool: Arc<Pool>,
         timeout: Duration,
@@ -1433,7 +1469,14 @@ impl Proxy {
                     .body(empty())
                     .ok()?;
                 *request.headers_mut() = headers;
+                // Ask the upstream to confirm the stored representation.
+                for (name, value) in &validators {
+                    request.headers_mut().insert(name, value.clone());
+                }
                 let response = send_request(&pool, &server, request, timeout).await.ok()?;
+                if response.status() == StatusCode::NOT_MODIFIED {
+                    return Some((StatusCode::NOT_MODIFIED, HeaderMap::new(), Bytes::new()));
+                }
                 if response.status() != StatusCode::OK {
                     return None;
                 }
@@ -1450,19 +1493,25 @@ impl Proxy {
                     .await
                     .ok()?
                     .to_bytes();
-                Some((response_headers, body))
+                Some((StatusCode::OK, response_headers, body))
             }
             .await;
 
-            if let Some((response_headers, body)) = fetched {
-                cache.insert(
-                    &key,
-                    &request_headers,
-                    &response_headers,
-                    StatusCode::OK.as_u16(),
-                    body.to_vec(),
-                    Instant::now(),
-                );
+            match fetched {
+                Some((StatusCode::NOT_MODIFIED, _, _)) => {
+                    cache.revalidate(&key, &request_headers, Instant::now());
+                }
+                Some((_, response_headers, body)) => {
+                    cache.insert(
+                        &key,
+                        &request_headers,
+                        &response_headers,
+                        StatusCode::OK.as_u16(),
+                        body.to_vec(),
+                        Instant::now(),
+                    );
+                }
+                None => {}
             }
 
             inflight
@@ -2381,6 +2430,23 @@ async fn send_request(
         Ok(Err(err)) => Err(SendError::Failed(err.to_string())),
         Err(_) => Err(SendError::Timeout),
     }
+}
+
+fn validators_from_entry(entry: &elira_cache::Entry) -> HeaderMap {
+    let mut validators = HeaderMap::new();
+    for (name, value) in &entry.headers {
+        let target = if name.eq_ignore_ascii_case("etag") {
+            Some(http::header::IF_NONE_MATCH)
+        } else if name.eq_ignore_ascii_case("last-modified") {
+            Some(http::header::IF_MODIFIED_SINCE)
+        } else {
+            None
+        };
+        if let (Some(target), Ok(value)) = (target, HeaderValue::from_str(value)) {
+            validators.insert(target, value);
+        }
+    }
+    validators
 }
 
 fn application_script(root: &Path, path: &str, index: &str) -> Option<PathBuf> {

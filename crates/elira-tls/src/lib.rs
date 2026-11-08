@@ -164,10 +164,21 @@ pub fn quic_server_config_with_client_auth(
     client_ca: Option<&Path>,
     mode: ClientAuth,
 ) -> Result<ServerConfig, Error> {
+    quic_server_config_full(cert, key, &[], client_ca, mode)
+}
+
+/// QUIC listener with SNI-selected certificates as well as client auth.
+pub fn quic_server_config_full(
+    cert: &Path,
+    key: &Path,
+    named: &[NamedCert],
+    client_ca: Option<&Path>,
+    mode: ClientAuth,
+) -> Result<ServerConfig, Error> {
     build(
         &ServerOptions {
             default: Some((cert, key)),
-            named: &[],
+            named,
             client_ca,
             client_auth: mode,
             tls13_only: true,

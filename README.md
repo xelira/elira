@@ -197,7 +197,8 @@ Upstreams:
 
 - round robin and least connections, active health checks, retries for bodyless
   idempotent requests
-- FastCGI over TCP or unix sockets, CGI scripts, and native `.so` modules
+- FastCGI over TCP (including DNS names) or unix sockets, CGI scripts, and
+  native `.so` modules
 - TCP and unix sockets in the same pool
 - TLS with a custom CA, explicit `insecure`, per-upstream SNI and HTTP/2
 - WebSocket and other `Upgrade` tunnelling, `CONNECT` with an explicit allowlist
@@ -207,7 +208,7 @@ Upstreams:
 TLS:
 
 - rustls with ALPN `h2` then `http/1.1`; HTTP/3 uses `h3`
-- SNI-selected certificates, minimum TLS version
+- SNI-selected certificates on TCP and QUIC, minimum TLS version
 - mutual TLS on TCP and QUIC, optional or required
 
 HTTP:
@@ -231,7 +232,7 @@ Cache:
 - `Vary`, `Cache-Control`, `s-maxage`/`max-age`, `Age`
 - `Authorization`/`Cookie` requests never read or write the cache
 - optional disk bodies that survive a restart, and stale-while-revalidate with
-  one background refresh
+  one background refresh using `If-None-Match`/`If-Modified-Since`
 
 Ops:
 

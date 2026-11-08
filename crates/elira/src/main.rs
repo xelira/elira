@@ -321,6 +321,15 @@ fn spawn_h3(
             reuse_port,
             client_ca: http3.client_ca,
             client_auth,
+            certificates: http3
+                .certificates
+                .iter()
+                .map(|entry| elira_tls::NamedCert {
+                    names: entry.names.clone(),
+                    cert: entry.cert.clone(),
+                    key: entry.key.clone(),
+                })
+                .collect(),
             proxy_protocol,
         };
         if let Err(err) = elira_h3::serve(cfg, proxy, metrics, body_timeout, log, stop).await {

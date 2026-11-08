@@ -30,6 +30,7 @@ pub struct Config {
     pub reuse_port: bool,
     pub client_ca: Option<PathBuf>,
     pub client_auth: elira_tls::ClientAuth,
+    pub certificates: Vec<elira_tls::NamedCert>,
     pub proxy_protocol: bool,
 }
 
@@ -41,9 +42,10 @@ pub async fn serve(
     log: Arc<dyn Fn(&Entry) + Send + Sync>,
     mut stop: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    let tls = elira_tls::quic_server_config_with_client_auth(
+    let tls = elira_tls::quic_server_config_full(
         &cfg.cert,
         &cfg.key,
+        &cfg.certificates,
         cfg.client_ca.as_deref(),
         cfg.client_auth,
     )?;

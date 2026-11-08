@@ -16,8 +16,7 @@ fn free_port() -> u16 {
 #[test]
 #[ignore = "builds the example cdylib"]
 fn module_route_answers_from_a_shared_library() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples/modules/echo");
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/modules/echo");
     let status = Command::new("cargo")
         .args(["build", "--manifest-path"])
         .arg(root.join("Cargo.toml"))

@@ -290,6 +290,9 @@ pub struct Http3 {
     pub client_ca: Option<PathBuf>,
     #[serde(default)]
     pub client_auth: ClientAuthMode,
+    /// Extra certificates selected by SNI on the QUIC listener.
+    #[serde(default)]
+    pub certificates: Vec<ServerCert>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -816,6 +819,25 @@ impl Config {
                 match &http3.client_ca {
                     Some(path) if !path.as_os_str().is_empty() => {}
                     _ => return Err(Error::Http3ClientCaRequired),
+                }
+            }
+            let mut seen: Vec<String> = Vec::new();
+            for (index, entry) in http3.certificates.iter().enumerate() {
+                if entry.cert.as_os_str().is_empty() || entry.key.as_os_str().is_empty() {
+                    return Err(Error::TlsCertificatePair { index });
+                }
+                for name in &entry.names {
+                    let name = name.trim().to_ascii_lowercase();
+                    if name.is_empty() || (!name.starts_with("*.") && !is_plain_name(&name)) {
+                        return Err(Error::TlsCertificateName {
+                            index,
+                            name: name.clone(),
+                        });
+                    }
+                    if seen.contains(&name) {
+                        return Err(Error::TlsCertificateNameDuplicate { name: name.clone() });
+                    }
+                    seen.push(name);
                 }
             }
         }

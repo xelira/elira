@@ -2199,3 +2199,133 @@ upstream = "app"
     let response = sender.send_request(request).await.expect("h2 request");
     assert_eq!(response.status(), http::StatusCode::OK);
 }
+
+#[tokio::test]
+async fn cache_hit_is_compressed_for_clients_that_ask() {
+    let upstream = upstream().await;
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+server_header = false
+
+[compression]
+enabled = true
+min_bytes = 32
+
+[cache]
+enabled = true
+ttl_secs = 60
+max_item_bytes = 65536
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "*"
+upstream = "app"
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let request = "GET /big HTTP/1.1\r\nHost: example.com\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n";
+    let first = roundtrip(addr, request).await;
+    assert!(
+        first
+            .to_ascii_lowercase()
+            .contains("content-encoding: gzip"),
+        "{first}"
+    );
+
+    let second = roundtrip(addr, request).await;
+    assert!(second.contains("x-cache: HIT"), "{second}");
+    assert!(
+        second
+            .to_ascii_lowercase()
+            .contains("content-encoding: gzip"),
+        "{second}"
+    );
+    assert!(
+        second
+            .to_ascii_lowercase()
+            .contains("vary: accept-encoding"),
+        "{second}"
+    );
+}
+
+#[tokio::test]
+async fn stale_refresh_uses_a_conditional_request() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let conditional = Arc::new(AtomicUsize::new(0));
+    let seen = conditional.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let upstream = listener.local_addr().expect("addr");
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                let mut head = [0u8; 2048];
+                let read = stream.read(&mut head).await.unwrap_or(0);
+                let text = String::from_utf8_lossy(&head[..read]).to_ascii_lowercase();
+                let response = if text.contains("if-none-match: \"v1\"") {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    "HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n"
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nETag: \"v1\"\r\n\
+                     Cache-Control: max-age=1\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"
+                };
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[cache]
+enabled = true
+ttl_secs = 1
+stale_secs = 10
+max_item_bytes = 65536
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "*"
+upstream = "app"
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let first = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(first.ends_with("hello"), "{first}");
+
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let stale = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(stale.contains("x-cache: STALE"), "{stale}");
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let refreshed = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(refreshed.contains("x-cache: HIT"), "{refreshed}");
+    assert_eq!(conditional.load(Ordering::SeqCst), 1);
+}
