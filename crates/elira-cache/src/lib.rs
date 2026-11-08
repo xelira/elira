@@ -315,6 +315,22 @@ impl Cache {
         body: Vec<u8>,
         now: Instant,
     ) -> bool {
+        self.insert_with_ttl(key, request, response, status, body, now, None)
+    }
+
+    /// Same as [`Cache::insert`], with a route-level TTL default. The response
+    /// `Cache-Control` may still shorten it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_with_ttl(
+        &self,
+        key: &str,
+        request: &HeaderMap,
+        response: &HeaderMap,
+        status: u16,
+        body: Vec<u8>,
+        now: Instant,
+        ttl: Option<Duration>,
+    ) -> bool {
         if self.max_bytes == 0
             || is_sensitive(request)
             || stores_cookies(response)
@@ -323,7 +339,7 @@ impl Cache {
             return false;
         }
 
-        let Some(ttl) = response_ttl(response, self.default_ttl) else {
+        let Some(ttl) = response_ttl(response, ttl.unwrap_or(self.default_ttl)) else {
             return false;
         };
         let Some(vary_fields) = vary_fields(response) else {

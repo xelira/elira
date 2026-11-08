@@ -137,6 +137,8 @@ struct RouteEntry {
     app_permits: Option<Arc<Semaphore>>,
     max_response: Option<usize>,
     fastcgi_pool: Option<Arc<elira_fastcgi::Pool>>,
+    cache: Option<bool>,
+    cache_ttl: Option<Duration>,
 }
 
 struct Router {
@@ -635,6 +637,8 @@ impl Proxy {
                 error_pages,
                 app_permits,
                 max_response: route.max_response_bytes,
+                cache: route.cache_enabled,
+                cache_ttl: route.cache_ttl_secs.map(Duration::from_secs),
                 fastcgi_pool: route.fastcgi_pool_idle.map(|idle| {
                     Arc::new(elira_fastcgi::Pool::new(
                         idle,
@@ -1221,7 +1225,8 @@ impl Proxy {
 
         let mut body = Some(body);
 
-        if is_get && requested_upgrade.is_none() {
+        let cache_allowed = entry.cache != Some(false);
+        if is_get && requested_upgrade.is_none() && cache_allowed {
             if let Some(cache) = &self.inner.cache {
                 let now = Instant::now();
                 if let Some((hit, stale)) = cache.get_stale(&cache_key, &request_headers, now) {
@@ -1282,6 +1287,7 @@ impl Proxy {
                             upstream_path.clone(),
                             pool.clone(),
                             route_timeout,
+                            entry.cache_ttl,
                         );
                     }
                     self.apply_route(&mut response, entry, &request_id);
@@ -1430,6 +1436,7 @@ impl Proxy {
         }
 
         let cacheable = self.inner.cache.is_some()
+            && cache_allowed
             && is_get
             && requested_upgrade.is_none()
             && parts.status == StatusCode::OK
@@ -1448,13 +1455,14 @@ impl Proxy {
             };
 
             if let Some(cache) = &self.inner.cache {
-                cache.insert(
+                cache.insert_with_ttl(
                     &cache_key,
                     &request_headers,
                     &parts.headers,
                     parts.status.as_u16(),
                     collected.to_vec(),
                     Instant::now(),
+                    entry.cache_ttl,
                 );
             }
 
@@ -1499,7 +1507,7 @@ impl Proxy {
             .body(body)
             .map_err(|_| text(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"))?;
 
-        if self.inner.cache.is_some() && is_get && requested_upgrade.is_none() {
+        if self.inner.cache.is_some() && cache_allowed && is_get && requested_upgrade.is_none() {
             response
                 .headers_mut()
                 .insert("x-cache", HeaderValue::from_static("MISS"));
@@ -1526,6 +1534,7 @@ impl Proxy {
         path: String,
         pool: Arc<Pool>,
         timeout: Duration,
+        cache_ttl: Option<Duration>,
     ) {
         {
             let mut refreshing = self
@@ -1595,13 +1604,14 @@ impl Proxy {
                     cache.revalidate(&key, &request_headers, Instant::now());
                 }
                 Some((_, response_headers, body)) => {
-                    cache.insert(
+                    cache.insert_with_ttl(
                         &key,
                         &request_headers,
                         &response_headers,
                         StatusCode::OK.as_u16(),
                         body.to_vec(),
                         Instant::now(),
+                        cache_ttl,
                     );
                 }
                 None => {}

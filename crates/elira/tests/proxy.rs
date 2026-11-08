@@ -2407,3 +2407,69 @@ upstream = "app"
     let other_host = get("b.example", "/one").await;
     assert!(other_host.contains("x-cache: HIT"), "{other_host}");
 }
+
+#[tokio::test]
+async fn route_cache_overrides_apply() {
+    let upstream = upstream().await;
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[cache]
+enabled = true
+ttl_secs = 60
+max_item_bytes = 65536
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "*"
+path = "/nocache"
+upstream = "app"
+cache_enabled = false
+
+[[routes]]
+host = "*"
+path = "/short"
+upstream = "app"
+cache_ttl_secs = 1
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let first = roundtrip(
+        addr,
+        "GET /nocache HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(!first.contains("x-cache"), "{first}");
+    let second = roundtrip(
+        addr,
+        "GET /nocache HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(!second.contains("x-cache"), "{second}");
+
+    let short = roundtrip(
+        addr,
+        "GET /short HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(short.contains("x-cache: MISS"), "{short}");
+    let hit = roundtrip(
+        addr,
+        "GET /short HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(hit.contains("x-cache: HIT"), "{hit}");
+
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let expired = roundtrip(
+        addr,
+        "GET /short HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(expired.contains("x-cache: MISS"), "{expired}");
+}

@@ -557,6 +557,14 @@ pub struct Route {
     #[serde(default)]
     pub fastcgi_pool_idle: Option<usize>,
 
+    /// Overrides whether this route uses the shared cache.
+    #[serde(default)]
+    pub cache_enabled: Option<bool>,
+
+    /// Overrides the cache TTL for this route.
+    #[serde(default)]
+    pub cache_ttl_secs: Option<u64>,
+
     /// Error pages as `STATUS /path.html`, served from `error_root` or `root`.
     #[serde(default)]
     pub error_pages: Vec<String>,
@@ -1319,6 +1327,9 @@ impl Config {
             if route.max_response_bytes == Some(0) {
                 return Err(Error::BadResponseCap { index });
             }
+            if route.cache_ttl_secs == Some(0) {
+                return Err(Error::BadRouteCacheTtl { index });
+            }
 
             if let Some(path) = &route.path {
                 if !path.starts_with('/') || path.chars().any(char::is_control) {
@@ -1686,6 +1697,9 @@ pub enum Error {
 
     #[error("route {index}: max_response_bytes must be greater than zero")]
     BadResponseCap { index: usize },
+
+    #[error("route {index}: cache_ttl_secs must be greater than zero")]
+    BadRouteCacheTtl { index: usize },
 
     #[error("route {index}: fastcgi_pool_idle is only valid on fastcgi routes")]
     PoolWithoutFastCgi { index: usize },
@@ -2884,6 +2898,27 @@ fastcgi_pool_idle = 4
         assert!(matches!(
             Config::parse(&wrong),
             Err(Error::PoolWithoutFastCgi { .. }) | Err(Error::RouteHasTwoTargets { .. })
+        ));
+    }
+
+    #[test]
+    fn route_cache_overrides_are_validated() {
+        let base = r#"
+listen = "127.0.0.1:8080"
+[[routes]]
+host = "*"
+root = "/srv/www"
+cache_enabled = false
+cache_ttl_secs = 30
+"#;
+        let cfg = Config::parse(base).expect("valid");
+        assert_eq!(cfg.routes[0].cache_enabled, Some(false));
+        assert_eq!(cfg.routes[0].cache_ttl_secs, Some(30));
+
+        let zero = base.replace("cache_ttl_secs = 30", "cache_ttl_secs = 0");
+        assert!(matches!(
+            Config::parse(&zero),
+            Err(Error::BadRouteCacheTtl { .. })
         ));
     }
 }
