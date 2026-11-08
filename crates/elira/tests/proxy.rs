@@ -120,6 +120,18 @@ async fn tcp_echo() -> SocketAddr {
 /// Start the real server on an ephemeral port. Keep the returned sender alive
 /// for the duration of the test: dropping it stops the server.
 async fn start(config: &str) -> (SocketAddr, watch::Sender<bool>, Arc<Metrics>) {
+    let (addr, stop, metrics, _) = start_full(config).await;
+    (addr, stop, metrics)
+}
+
+async fn start_full(
+    config: &str,
+) -> (
+    SocketAddr,
+    watch::Sender<bool>,
+    Arc<Metrics>,
+    Arc<ArcSwap<Runtime>>,
+) {
     let cfg = Config::parse(config).expect("parse config");
     let runtime = Arc::new(ArcSwap::from_pointee(
         Runtime::build(&cfg).expect("build runtime"),
@@ -132,13 +144,13 @@ async fn start(config: &str) -> (SocketAddr, watch::Sender<bool>, Arc<Metrics>) 
     let metrics = Arc::new(Metrics::new());
     tokio::spawn(server::serve(
         listener,
-        runtime,
+        runtime.clone(),
         Options::from_config(&cfg),
         metrics.clone(),
         stop_rx,
     ));
 
-    (addr, stop_tx, metrics)
+    (addr, stop_tx, metrics, runtime)
 }
 
 /// Send a request with `Connection: close` and read until the server hangs up.
@@ -477,16 +489,13 @@ spa = true
 async fn metrics_listener_reports_requests() {
     let upstream = upstream().await;
     let config = NO_DEFAULT.replace("{upstream}", &upstream.to_string());
-    let (addr, _stop, metrics) = start(&config).await;
+    let (addr, _stop, metrics, status_runtime) = start_full(&config).await;
 
     let metrics_listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind metrics");
     let metrics_addr = metrics_listener.local_addr().expect("metrics addr");
     let (_metrics_stop, metrics_stop_rx) = watch::channel(false);
-    let status_runtime = Arc::new(ArcSwap::from_pointee(
-        Runtime::build(&Config::parse(&config).expect("parse")).expect("runtime"),
-    ));
     let (reload_tx, _reload_rx) = watch::channel(0u64);
     let (drain_tx, _drain_rx) = watch::channel(false);
     server::spawn_metrics(
@@ -2328,4 +2337,73 @@ upstream = "app"
     .await;
     assert!(refreshed.contains("x-cache: HIT"), "{refreshed}");
     assert_eq!(conditional.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn admin_cache_purge_respects_a_prefix() {
+    let upstream = upstream().await;
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[cache]
+enabled = true
+ttl_secs = 60
+max_item_bytes = 65536
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "*"
+upstream = "app"
+"#
+    );
+    let (addr, _stop, metrics, runtime) = start_full(&config).await;
+
+    let metrics_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind metrics");
+    let metrics_addr = metrics_listener.local_addr().expect("metrics addr");
+    let (_metrics_stop, metrics_stop_rx) = watch::channel(false);
+    let (reload_tx, _reload_rx) = watch::channel(0u64);
+    let (drain_tx, _drain_rx) = watch::channel(false);
+    server::spawn_metrics(
+        metrics_listener,
+        runtime,
+        metrics,
+        None,
+        reload_tx,
+        drain_tx,
+        metrics_stop_rx,
+    );
+
+    let get = |host: &'static str, path: &'static str| {
+        let request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+        async move { roundtrip(addr, &request).await }
+    };
+
+    let first = get("a.example", "/one").await;
+    assert!(first.contains("x-cache: MISS"), "{first}");
+    let _ = get("a.example", "/two").await;
+    let _ = get("b.example", "/one").await;
+
+    let hit = get("a.example", "/one").await;
+    assert!(hit.contains("x-cache: HIT"), "{hit}");
+
+    let purge = roundtrip(
+        metrics_addr,
+        "POST /cache/purge?prefix=a.example/one HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(purge.contains("200 OK"), "{purge}");
+    assert!(purge.contains("\"purged\":1"), "{purge}");
+
+    let purged = get("a.example", "/one").await;
+    assert!(purged.contains("x-cache: MISS"), "{purged}");
+    let other_path = get("a.example", "/two").await;
+    assert!(other_path.contains("x-cache: HIT"), "{other_path}");
+    let other_host = get("b.example", "/one").await;
+    assert!(other_host.contains("x-cache: HIT"), "{other_host}");
 }

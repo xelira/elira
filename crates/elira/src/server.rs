@@ -782,15 +782,16 @@ pub fn spawn_metrics_aggregate(
                                 let statuses = statuses
                                     .lock()
                                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                                let last = statuses
-                                    .values()
-                                    .next()
-                                    .cloned()
-                                    .unwrap_or_else(|| "null".to_owned());
-                                let body = format!(
-                                    "{{\"workers\":{},\"snapshot\":{last}}}",
-                                    statuses.len()
-                                );
+                                let mut entries: Vec<_> = statuses.iter().collect();
+                                entries.sort_by_key(|(worker, _)| **worker);
+                                let snapshots = entries
+                                    .iter()
+                                    .map(|(worker, status)| {
+                                        format!("{{\"worker\":{worker},\"status\":{status}}}")
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(",");
+                                let body = format!("{{\"workers\":[{snapshots}]}}");
                                 text_response(hyper::StatusCode::OK, "application/json", body)
                             }
                             _ => text_response(

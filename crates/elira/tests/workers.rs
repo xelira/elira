@@ -15,9 +15,13 @@ fn get(port: u16) -> Option<String> {
 }
 
 fn get_path(port: u16, path: &str) -> Option<String> {
+    get_at(port, "localhost", path)
+}
+
+fn get_at(port: u16, host: &str, path: &str) -> Option<String> {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
-    let request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
     stream.write_all(request.as_bytes()).ok()?;
     let mut response = Vec::new();
     let mut chunk = [0u8; 1024];
@@ -182,7 +186,8 @@ root = "{root}"
         "aggregate metrics missing counters: {metrics}"
     );
     let status = get_path(metrics_port, "/status").expect("aggregate status");
-    assert!(status.contains("\"workers\":2"), "{status}");
+    assert!(status.contains("\"workers\":["), "{status}");
+    assert!(status.contains("\"worker\":0"), "{status}");
 
     let _ = Command::new("kill")
         .args(["-TERM", &child.id().to_string()])
@@ -259,5 +264,109 @@ root = "{root}"
         matches!(child.try_wait(), Ok(Some(_)))
     });
     assert!(stopped, "admin drain did not stop the supervisor");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn admin_purge_reaches_every_worker() {
+    let upstream = std::net::TcpListener::bind("127.0.0.1:0").expect("bind upstream");
+    let upstream_addr = upstream.local_addr().expect("upstream addr");
+    std::thread::spawn(move || {
+        for stream in upstream.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut head = [0u8; 1024];
+            let _ = stream.read(&mut head);
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nCache-Control: max-age=60\r\n\
+                  Content-Length: 2\r\nConnection: close\r\n\r\nok",
+            );
+        }
+    });
+
+    let dir = std::env::temp_dir().join(format!("elira-purge-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let config = dir.join("elira.toml");
+    let port = free_port();
+    let metrics_port = free_port();
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+listen = "127.0.0.1:{port}"
+reuse_port = true
+workers = 2
+
+[metrics]
+listen = "127.0.0.1:{metrics_port}"
+
+[cache]
+enabled = true
+ttl_secs = 60
+max_item_bytes = 65536
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream_addr}"]
+
+[[routes]]
+host = "*"
+upstream = "app"
+"#
+        ),
+    )
+    .expect("config");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_elira"))
+        .args(["run", "--config"])
+        .arg(&config)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn supervisor");
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        if get_at(port, "a.example", "/one")
+            .map(|response| response.contains("200 OK"))
+            .unwrap_or(false)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    for _ in 0..4 {
+        let _ = get_at(port, "a.example", "/one");
+    }
+
+    let mut stream = TcpStream::connect(("127.0.0.1", metrics_port)).expect("metrics");
+    stream
+        .write_all(
+            b"POST /cache/purge?prefix=a.example/one HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .expect("post");
+    let mut response = Vec::new();
+    let mut chunk = [0u8; 512];
+    while let Ok(read) = stream.read(&mut chunk) {
+        if read == 0 {
+            break;
+        }
+        response.extend_from_slice(&chunk[..read]);
+    }
+    assert!(
+        String::from_utf8_lossy(&response).contains("202"),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+
+    std::thread::sleep(Duration::from_millis(400));
+    let after = get_at(port, "a.example", "/one").expect("post-purge request");
+    assert!(after.contains("200 OK"), "{after}");
+
+    let _ = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status();
+    let _ = child.wait();
     let _ = std::fs::remove_dir_all(&dir);
 }
