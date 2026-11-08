@@ -394,6 +394,10 @@ pub struct Route {
     #[serde(default)]
     pub path: Option<String>,
 
+    /// Regular expression matched against the path after prefix routes.
+    #[serde(default)]
+    pub path_regex: Option<String>,
+
     /// Name of an upstream to proxy to. Exactly one target.
     #[serde(default)]
     pub upstream: Option<String>,
@@ -902,7 +906,12 @@ impl Config {
 
             // The same host may appear several times with different paths;
             // only an identical pair is ambiguous.
-            if !seen.insert((host.clone(), route.path.clone().unwrap_or_default())) {
+            let discriminator = route
+                .path
+                .clone()
+                .or_else(|| route.path_regex.clone())
+                .unwrap_or_default();
+            if !seen.insert((host.clone(), discriminator)) {
                 return Err(Error::DuplicateRoute {
                     host: route.host.clone(),
                 });
@@ -924,6 +933,20 @@ impl Config {
                         index,
                         path: path.clone(),
                     });
+                }
+            }
+            if route.path.is_some() && route.path_regex.is_some() {
+                return Err(Error::PathAndRegex { index });
+            }
+            if let Some(pattern) = &route.path_regex {
+                if regex::Regex::new(pattern).is_err() {
+                    return Err(Error::BadPathRegex {
+                        index,
+                        pattern: pattern.clone(),
+                    });
+                }
+                if route.strip_prefix {
+                    return Err(Error::StripPrefixWithRegex { index });
                 }
             }
 
@@ -1210,6 +1233,15 @@ pub enum Error {
 
     #[error("route {index}: path \"{path}\" must start with '/'")]
     BadPath { index: usize, path: String },
+
+    #[error("route {index}: path and path_regex are mutually exclusive")]
+    PathAndRegex { index: usize },
+
+    #[error("route {index}: \"{pattern}\" is not a valid regular expression")]
+    BadPathRegex { index: usize, pattern: String },
+
+    #[error("route {index}: strip_prefix cannot be used with path_regex")]
+    StripPrefixWithRegex { index: usize },
 
     #[error("route {index}: `strip_prefix` needs an upstream")]
     StripWithoutUpstream { index: usize },
@@ -2122,5 +2154,30 @@ root = "/srv/www"
             "challenge = \"http_01\"\nhttp01_listen = \"0.0.0.0:80\"",
         );
         assert!(Config::parse(&with_listener).is_ok());
+    }
+
+    #[test]
+    fn regex_routes_are_validated() {
+        let base = r#"
+listen = "127.0.0.1:8080"
+
+[[routes]]
+host = "*"
+root = "/srv/www"
+path_regex = "^(/[a-z]+)/"
+"#;
+        assert!(Config::parse(base).is_ok());
+
+        let invalid = base.replace("^(/[a-z]+)/", "([");
+        assert!(matches!(
+            Config::parse(&invalid),
+            Err(Error::BadPathRegex { .. })
+        ));
+
+        let both = base.replace("root = \"/srv/www\"", "root = \"/srv/www\"\npath = \"/x\"");
+        assert!(matches!(
+            Config::parse(&both),
+            Err(Error::PathAndRegex { .. })
+        ));
     }
 }

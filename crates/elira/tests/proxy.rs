@@ -2007,3 +2007,49 @@ upstream = "app"
     .await;
     assert!(fresh.ends_with("v2"), "{fresh}");
 }
+
+#[tokio::test]
+async fn regex_route_matches_after_prefixes() {
+    let upstream = upstream().await;
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "*"
+path = "/health"
+upstream = "app"
+
+[[routes]]
+host = "*"
+path_regex = "^/api/v[0-9]+/"
+upstream = "app"
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let matched = roundtrip(
+        addr,
+        "GET /api/v2/users HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&matched), "HTTP/1.1 200 OK");
+
+    let prefix = roundtrip(
+        addr,
+        "GET /health HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&prefix), "HTTP/1.1 200 OK");
+
+    let missing = roundtrip(
+        addr,
+        "GET /api/users HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&missing), "HTTP/1.1 404 Not Found");
+}

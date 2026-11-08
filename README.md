@@ -168,7 +168,8 @@ the code is in [docs/architecture.md](docs/architecture.md).
 
 Routing:
 
-- exact hosts, `*.example.com`, `host = "*"`, longest path prefix
+- exact hosts, `*.example.com`, `host = "*"`, longest path prefix and
+  `path_regex` after prefixes
 - `strip_prefix`, redirect routes, `try_files`, SPA fallback, directory listings
 - per-route `add_headers`/`remove_headers`, `timeout_secs`, token bucket, body
   cap and error pages
@@ -248,7 +249,8 @@ The listener has no TLS. Put it on loopback or set `auth_file`.
   the endpoint and resets live QUIC connections.
 - ACME via TLS-ALPN-01 needs port 443; HTTP-01 needs a listener on port 80 or
   `acme.http01_listen`.
-- No FastCGI, CGI, regex locations, dynamic modules or multi-process workers.
+- No FastCGI, CGI, dynamic modules or multi-process workers. Regex locations
+  are supported through `path_regex`.
 - DNS resolution uses the system resolver. `dns_ttl_secs` bounds how long a
   pooled connection may outlive a DNS change.
 

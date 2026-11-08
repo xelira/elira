@@ -106,6 +106,7 @@ enum Target {
 struct RouteEntry {
     label: String,
     prefix: String,
+    regex: Option<regex::Regex>,
     target: Target,
     strip_prefix: bool,
     add_headers: Vec<(HeaderName, HeaderValue)>,
@@ -141,7 +142,18 @@ impl Router {
         lists.push(&self.default);
 
         for list in lists {
-            if let Some(entry) = list.iter().find(|entry| path_matches(&entry.prefix, path)) {
+            if let Some(entry) = list
+                .iter()
+                .find(|entry| entry.regex.is_none() && path_matches(&entry.prefix, path))
+            {
+                return Some(entry);
+            }
+            if let Some(entry) = list.iter().find(|entry| {
+                entry
+                    .regex
+                    .as_ref()
+                    .is_some_and(|regex| regex.is_match(path))
+            }) {
                 return Some(entry);
             }
         }
@@ -492,9 +504,17 @@ impl Proxy {
                 label: format!(
                     "{}{}",
                     route.host,
-                    route.path.as_deref().unwrap_or_default()
+                    route
+                        .path
+                        .as_deref()
+                        .or(route.path_regex.as_deref())
+                        .unwrap_or_default()
                 ),
                 prefix: route.path.clone().unwrap_or_default(),
+                regex: route
+                    .path_regex
+                    .as_deref()
+                    .and_then(|pattern| regex::Regex::new(pattern).ok()),
                 target,
                 strip_prefix: route.strip_prefix,
                 add_headers: route

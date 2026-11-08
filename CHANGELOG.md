@@ -79,6 +79,7 @@
 - Дисковый кэш переживает перезапуск; метаданные и тела загружаются обратно.
 - sendfile обслуживает одиночные range, conditionals, auth/ACL и per-route
   заголовки; TLS, HTTP/2, сжатие и multi-range остаются в hyper.
+- Маршруты по регулярному выражению пути (`path_regex`) после префиксных.
 - Fuzz-цели для конфига, мигратора, заголовков и PROXY protocol; CI-джобы
   MSRV, `cargo-audit`, `cargo-deny`, musl и Docker; e2e-тесты mTLS и
   неудачного hot restart.

@@ -17,6 +17,7 @@ httpdate = { workspace = true }
 ipnet = { workspace = true }
 async-compression = { workspace = true }
 percent-encoding = { workspace = true }
+regex = { workspace = true }
 tokio-rustls = { workspace = true }
 tokio-util = { workspace = true }
 bytes = { workspace = true }
