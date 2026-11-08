@@ -1808,3 +1808,64 @@ upstream = "app"
         "expected 200, got {response}"
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn proxies_to_a_unix_socket_upstream() {
+    use tokio::net::UnixListener;
+
+    let dir = temp_root("unix-upstream");
+    let socket = dir.join("app.sock");
+    let listener = UnixListener::bind(&socket).expect("bind unix upstream");
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut chunk = [0u8; 2048];
+                loop {
+                    let Ok(read) = stream.read(&mut chunk).await else {
+                        return;
+                    };
+                    head.extend_from_slice(&chunk[..read]);
+                    if read == 0 || head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\
+                          Connection: close\r\n\r\nunix!",
+                    )
+                    .await;
+            });
+        }
+    });
+
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[upstreams]]
+name = "app"
+servers = ["unix:{socket}"]
+
+[[routes]]
+host = "*"
+upstream = "app"
+"#,
+        socket = socket.display()
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let response = roundtrip(
+        addr,
+        "GET /hello HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&response), "HTTP/1.1 200 OK");
+    assert!(response.ends_with("unix!"), "{response}");
+}

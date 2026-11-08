@@ -812,6 +812,18 @@ impl Config {
                     retries: up.retries,
                 });
             }
+            if up.tls && up.servers.iter().any(|addr| addr.starts_with("unix:")) {
+                return Err(Error::TlsOverUnix {
+                    name: up.name.clone(),
+                });
+            }
+            if let Some(path) = &up.health_path {
+                if !path.starts_with('/') {
+                    return Err(Error::BadUpstreamHealthPath {
+                        name: up.name.clone(),
+                    });
+                }
+            }
             for addr in &up.servers {
                 check_server(addr).map_err(|_| Error::BadServer {
                     upstream: up.name.clone(),
@@ -989,6 +1001,12 @@ fn parse_header_line(line: &str) -> Option<(HeaderName, HeaderValue)> {
 }
 
 fn check_server(addr: &str) -> Result<(), ()> {
+    if let Some(path) = addr.strip_prefix("unix:") {
+        if path.is_empty() || path.contains('\0') {
+            return Err(());
+        }
+        return Ok(());
+    }
     if addr.contains('@') || addr.contains('/') {
         return Err(());
     }
@@ -1086,6 +1104,12 @@ pub enum Error {
 
     #[error("upstream \"{name}\" has no servers")]
     EmptyUpstream { name: String },
+
+    #[error("upstream \"{name}\": TLS over a unix socket is not supported")]
+    TlsOverUnix { name: String },
+
+    #[error("upstream \"{name}\": health_path must start with /")]
+    BadUpstreamHealthPath { name: String },
 
     #[error("upstream \"{name}\" has {retries} retries, the maximum is 5")]
     TooManyRetries { name: String, retries: u32 },
@@ -1935,6 +1959,28 @@ requests_per_second = 0
         assert!(matches!(
             Config::parse(text),
             Err(Error::BadRouteRate { .. })
+        ));
+    }
+
+    #[test]
+    fn accepts_unix_upstreams_and_rejects_tls_over_them() {
+        let text = r#"
+listen = "127.0.0.1:8080"
+
+[[upstreams]]
+name = "app"
+servers = ["unix:/run/app.sock", "127.0.0.1:3000"]
+
+[[routes]]
+host = "*"
+upstream = "app"
+"#;
+        assert!(Config::parse(text).is_ok());
+
+        let tls = text.replace("name = \"app\"", "name = \"app\"\ntls = true");
+        assert!(matches!(
+            Config::parse(&tls),
+            Err(Error::TlsOverUnix { .. })
         ));
     }
 }

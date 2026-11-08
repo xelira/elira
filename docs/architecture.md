@@ -1,9 +1,9 @@
 # Архитектура Elira
 
-Документ описывает, как устроен текущий код: где живёт каждый шаг обработки
-запроса, какие данные переживают `SIGHUP`, а какие захвачены при старте.
-Конфигурация разбирается в `elira-config`, сетевой цикл и сборка `Runtime` —
-в `crates/elira/src/server.rs`, решения о маршруте, содержимом ответа и
+Документ описывает текущий код: где живёт каждый шаг обработки запроса, какие
+данные переживают `SIGHUP`, а какие захвачены при старте. Конфигурация
+разбирается в `elira-config`, сетевой цикл и сборка `Runtime` — в
+`crates/elira/src/server.rs`, решения о маршруте, содержимом ответа и
 upstream'ах — в `elira-proxy`.
 
 ## Поток запроса
@@ -19,24 +19,24 @@ TCP accept
   -> hyper service
        -> ArcSwap<Runtime> загружается на запрос
        -> Proxy::handle
-            -> rate limit по IP peer'а
+            -> глобальный rate limit по IP peer'а
             -> Proxy::forward
                  -> CONNECT (до маршрутизации)
-                 -> проверка Transfer-Encoding и Content-Length
+                 -> проверка Transfer-Encoding и глобального Content-Length
                  -> Host -> canonical_host
                  -> Router по host и path
-                 -> ACL, затем Basic auth
+                 -> per-route body limit, per-route rate limit, ACL, auth
                  -> cache lookup (GET)
                  -> Files / Redirect / Pool
-                 -> заголовки ответа, сжатие, тело
+                 -> error page, заголовки ответа, сжатие, тело
        -> метрики и access-лог
   -> graceful shutdown / idle watchdog
 
 UDP (QUIC)
   -> HTTP/3 listener на [http3].listen
   -> тот же Proxy::handle
-  -> access-лог через tracing::info (файл не используется)
-  -> метрики TCP-листенера не обновляются
+  -> access-лог через Runtime::write_log
+  -> метрики запросов обновляются, соединений — нет
 ```
 
 ## Приём TCP-соединения
@@ -61,6 +61,12 @@ UDP (QUIC)
 `graceful_shutdown` и до 5 секунд на дозавершение. `main` ждёт задачу
 `server::serve` до 15 секунд и пишет `warn`, если она не завершилась.
 
+После запуска accept-циклов `main::notify_ready` пишет pid в файл из
+`ELIRA_READY_FILE` и отправляет `READY=1`/`MAINPID` в `NOTIFY_SOCKET`
+(systemd, включая abstract namespace с `@`). Файл готовности использует
+`SIGUSR2`-рестарт. HTTP/3 bind выполняется в отдельной задаче и может
+завершиться уже после записи файла; при занятом порту он повторяется.
+
 ## PROXY protocol
 
 `server::serve_stream` вызывает `proxy_protocol::read_peer` до TLS, до ACME и
@@ -76,21 +82,20 @@ UDP (QUIC)
 для них нет.
 
 Адрес из заголовка заменяет адрес сокета и дальше используется в access-логе,
-rate limiter, ACL, `X-Forwarded-For` и в `peer` для статики. Включать
-`proxy_protocol` можно только на порту, доступном исключительно через
-балансировщик: иначе клиент подделает адрес.
+rate limiter, ACL и `X-Forwarded-For`. Включать `proxy_protocol` можно только
+на порту, доступном исключительно через балансировщик: иначе клиент подделает
+адрес.
 
-## TLS, ALPN и клиентские сертификаты
+## TLS, ALPN, SNI и клиентские сертификаты
 
 TLS-конфигурация лежит в `Runtime.tls` и загружается из `ArcSwap` при
 установке каждого нового соединения (`serve_stream`). Поэтому `SIGHUP`
 применяется к новым соединениям, уже установленные остаются на старом
 сертификате.
 
-`elira_tls::server_config_with_client_auth` собирает rustls `ServerConfig`:
+`Runtime::build` вызывает `elira_tls::server_config_with_options`:
 
-- ALPN предлагается в порядке `h2`, затем `http/1.1`
-  (`ALPN_PROTOCOLS` в `crates/elira-tls/src/lib.rs`). Клиент, приславший
+- ALPN предлагается в порядке `h2`, затем `http/1.1`. Клиент, приславший
   только неизвестный ALPN, получает ошибку handshake; клиент без ALPN
   обслуживается по HTTP/1.1.
 - HTTP/2 включается только при согласованном `h2`
@@ -99,8 +104,16 @@ TLS-конфигурация лежит в `Runtime.tls` и загружаетс
   строят `WebPkiClientVerifier`; `optional` добавляет
   `allow_unauthenticated`, то есть сертификат проверяется, если прислан, но
   его отсутствие не блокирует соединение.
-- Провайдер rustls выбирается явно (`aws_lc_rs`), потому что в процессе
-  слинкованы два бэкенда (quinn тянет свой набор).
+- `min_version = "tls13"` собирает rustls с одним TLS 1.3; по умолчанию
+  доступны TLS 1.2 и 1.3.
+- `[tls.certificates]` добавляет сертификаты, выбираемые по SNI. Записи
+  перебираются в порядке конфигурации; внутри записи точное имя проверяется
+  раньше `*.example.com`. Wildcard совпадает ровно с одним уровнем и не
+  совпадает с `example.com` или `a.b.example.com`, поэтому wildcard из более
+  ранней записи может перекрыть точное имя из более поздней. Если
+  `cert`/`key` заданы, клиент без SNI получает их; без пары handshake без
+  SNI завершится ошибкой. Провайдер rustls выбирается явно (`aws_lc_rs`),
+  потому что в процессе слинкованы два бэкенда (quinn тянет свой набор).
 
 Handshake ограничен 10 секундами. Клиент, который не прислал ClientHello, не
 держит permit и не блокирует accept. Ошибка или таймаут handshake пишутся в
@@ -110,16 +123,16 @@ Handshake ограничен 10 секундами. Клиент, который
 handshake через `rustls-acme`, ALPN там `h2`, `http/1.1`, `acme-tls/1`.
 TLS-ALPN-01 validation connection возвращается как
 `io::ErrorKind::ConnectionAborted` и просто закрывается. На этом пути нет
-10-секундного таймаута и нет mTLS: `Acme` строит конфигурацию с
-`with_no_client_auth()`. ACME и `[tls]` взаимоисключающие, это проверяет
+10-секундного таймаута, нет mTLS (`with_no_client_auth`) и не применяется
+`tls.min_version`; `rustls-acme` сам выбирает сертификат по SNI из
+настроенных доменов. ACME и `[tls]` взаимоисключающие, это проверяет
 `elira-config`.
 
-Статический `[tls]` строит `NamedResolver` из `elira-tls`: точное имя или
-`*.example.com` выбирает сертификат из `[[tls.certificates]]`, остальные
-клиенты получают сертификат по умолчанию. Wildcard совпадает ровно с одним
-уровнем. `client_ca` + `client_auth` включают проверку клиентских
-сертификатов через `WebPkiClientVerifier`. `[acme]` использует resolver
-`rustls-acme` для перечисленных доменов; mTLS на ACME-пути не включается.
+HTTP/3 собирает конфигурацию через
+`quic_server_config_with_client_auth`: ALPN только `h3`, всегда TLS 1.3,
+один сертификат `[http3].cert`/`key` без списка SNI. Клиентские сертификаты
+включаются полями `[http3].client_ca`/`client_auth`; `optional`/`required`
+означают то же, что на TCP.
 
 ## HTTP/1.1 и HTTP/2
 
@@ -146,6 +159,12 @@ Idle watchdog одинаков для h1 и h2: `idle_watch` ждёт запро
 (`idle.notify_one()` в service), а не после завершения ответа, поэтому
 долгий ответ не считается простоем.
 
+Тело запроса оборачивается `elira_proxy::timeout_body` с
+`limits.request_body_timeout_secs`, если значение не ноль. Обёртка
+`IdleBody` сбрасывает таймер на каждом кадре и возвращает ошибку
+`TimedOut`, если данных нет дольше лимита. Тот же приём применяется к телу
+ответа upstream'а с `limits.upstream_body_timeout_secs`.
+
 При остановке вызывается `graceful_shutdown`, затем `drain` с лимитом
 5 секунд. Счётчик `elira_connections_in_flight` увеличивается в
 `serve_conn` и уменьшается после завершения соединения.
@@ -154,37 +173,47 @@ Idle watchdog одинаков для h1 и h2: `idle_watch` ждёт запро
 
 HTTP/3 живёт на отдельном UDP-листенере (`[http3]`) и использует quinn и h3.
 `elira_h3::serve` собирает QUIC-конфигурацию через
-`elira_tls::quic_server_config`: ALPN только `h3`. Сокет создаётся через
-`socket2` с `SO_REUSEPORT` при `reuse_port = true`; при `AddrInUse` bind
-повторяется до 20 раз с интервалом 100 мс, потому что сокет освобождает
-driver-задача quinn, а не `Drop` эндпоинта.
+`elira_tls::quic_server_config_with_client_auth`: ALPN `h3`, TLS 1.3 и
+опциональные клиентские сертификаты. Сокет создаётся через `socket2` с
+`SO_REUSEPORT` при `reuse_port = true`; при `AddrInUse` bind повторяется до
+20 раз с интервалом 100 мс, потому что сокет освобождает driver-задача
+quinn, а не `Drop` эндпоинта.
 
 Peer берётся из `conn.remote_address()`. PROXY protocol на этом пути не
-разбирается. `[http3].client_auth` включает mTLS тем же verifier'ом, что и
-TCP; `certificates` (SNI) действует только на TCP. Тело запроса
-ограничено `limits.request_body_timeout_secs`, ответы учитываются в
-`Metrics` так же, как на TCP.
+разбирается.
 
 Тело запроса перекладывается из QUIC-потока в `StreamBody` через
 `mpsc::channel` ёмкостью 4: канал делает body `Send + Sync`, чего требует
 hyper-клиент на upstream-плече. Это потоковая передача, а не полная
-буферизация, вопреки doc-комментарию в начале `elira-h3`.
+буферизация. При `request_body_timeout_secs > 0` каждый `recv_data()`
+ограничен таймаутом; истёкший таймаут отправляется в тело как ошибка
+`TimedOut`.
 
 После этого вызывается тот же `Proxy::handle` со схемой `"https"`. Из ответа
 удаляются `Content-Length` и `Transfer-Encoding`: во фрейминге HTTP/3 длину
 задаёт поток. Trailers пересылаются.
 
+HTTP/3-путь получает `Arc<Metrics>` и обновляет:
+
+- `elira_requests_total` и глобальную гистограмму;
+- `elira_route_*` и `elira_upstream_*`, если ответ нёс `Labels`;
+- `elira_cache_requests_total` по `X-Cache`;
+- `elira_response_bytes_total`.
+
+Не обновляются `elira_connections_in_flight` и
+`elira_request_bytes_total`: h3 не вызывает соответствующие методы.
+Access-лог идёт через замыкание, которое на каждую строку загружает текущий
+`Runtime` и вызывает `Runtime::write_log`, поэтому `log.file`, шаблон и
+syslog работают и здесь.
+
 Отличия от TCP-пути:
 
-- access-лог идёт через замыкание, которое читает текущий `Runtime`, поэтому
-  `log.file`, шаблон и syslog работают и здесь;
-- `Metrics` передаётся в h3: общие счётчики, маршруты, upstream'ы, кэш и
-  размер тела ответа обновляются;
+- нет PROXY protocol;
 - `CONNECT` и `Upgrade` не работают: `Proxy` реализует их через
-  `hyper::upgrade::on`, а h3-соединение не даёт hyper upgrade-путь.
-  Формально запрос дойдёт до `connect`/`forward_upgrade`, туннель не
-  установится;
+  `hyper::upgrade::on`, а h3-соединение не даёт hyper upgrade-путь. Запрос
+  дойдёт до `connect`/`forward_upgrade`, туннель не установится;
 - `max_headers`/`max_header_bytes` из `[limits]` не применяются;
+- один сертификат на слушатель, списка SNI-сертификатов нет;
 - `Alt-Svc` на h3-ответах всё равно выставляется, потому что это делает тот
   же `Proxy::apply_route`.
 
@@ -192,15 +221,17 @@ hyper-клиент на upstream-плече. Это потоковая пере�
 
 `Runtime` (`crates/elira/src/server.rs`) содержит:
 
-- `Proxy` — маршруты, пулы, клиент к upstream'ам, лимитер, кэш, сжатие;
+- `Proxy` — маршруты, пулы, клиенты к upstream'ам, лимитеры, кэш, сжатие;
 - `Option<Arc<rustls::ServerConfig>>` — TLS статического `[tls]`;
-- `LogFormat`;
+- `LogFormat`, необязательный `Format` (шаблон) и `Arc<Syslog>`;
 - `Health`;
 - `Option<Http3>`;
 - `Option<Arc<AccessLog>>` — открытый файл access-лога.
 
-`Runtime::build` читает сертификаты, собирает `Proxy` и открывает файл лога.
-Если открыть файл не удалось, reload не применяется.
+`Runtime::build` читает сертификаты, собирает `Proxy`, открывает файл лога,
+разбирает `log.template` и подключает syslog. Ошибка любого шага отменяет
+reload: неизвестная переменная шаблона или недоступный syslog-сокет не
+применяются.
 
 Runtime лежит в `ArcSwap` и загружается на каждый запрос, поэтому `SIGHUP`
 применяется к следующему запросу на уже открытом keep-alive соединении.
@@ -213,8 +244,8 @@ Runtime лежит в `ArcSwap` и загружается на каждый за
 2. Сравниваются захваченные поля: `listen`, `metrics.listen`,
    `limits.max_connections`, `max_headers`, `max_header_bytes`. Расхождения
    дают `warn`; применяются они только после рестарта.
-3. `Runtime::build` собирает TLS, `Proxy`, формат лога и файл access-лога.
-   Ошибка сборки (например, битый PEM) отменяет весь reload.
+3. `Runtime::build` собирает TLS, `Proxy`, формат/шаблон/syslog лога и файл
+   access-лога. Ошибка сборки отменяет весь reload.
 4. Если `health.enabled`, все upstream'ы проверяются один раз до публикации,
    чтобы после reload не было интервала, в котором всё снова «здорово».
 5. Новый runtime публикуется через `ArcSwap::store`.
@@ -223,19 +254,22 @@ Runtime лежит в `ArcSwap` и загружается на каждый за
 
 Что не переживает reload и меняется только рестартом, часто без
 предупреждения: `listen`, `proxy_protocol`, `sendfile`, `reuse_port`,
-`limits.idle_timeout_secs`, наличие и адрес `[metrics]`, `[acme]`.
+`limits.idle_timeout_secs`, `limits.request_body_timeout_secs` (захвачен в
+`Options`), наличие и адрес `[metrics]`, `metrics.auth_file`, `[acme]`.
 `[acme]` создаётся один раз в `main::run` из стартового конфига и в
 `Runtime` не входит; reload его не перечитывает и не перезапускает.
 
 Пересборка `Proxy` означает новое состояние: пулы соединений к upstream'ам,
-кэш и token bucket лимитера создаются заново. Старые keep-alive соединения к
-бэкендам и накопленный кэш после reload не сохраняются.
+кэш, глобальный и per-route token bucket создаются заново. Старые keep-alive
+соединения к бэкендам и накопленный кэш после reload не сохраняются.
 
 `SIGUSR2` делает hot restart: `spawn_replacement` запускает тот же бинарник с
-теми же аргументами, текущий процесс ждёт 750 мс, отправляет stop и уходит в
-обычный drain. Требуется `reuse_port = true`; без него сигнал игнорируется с
-`warn`. Новый процесс биндит TCP, metrics и HTTP/3 через `SO_REUSEPORT`.
-`SIGINT` и `SIGTERM` просто останавливают процесс.
+теми же аргументами и с `ELIRA_READY_FILE`, затем до 15 секунд ждёт файл
+готовности. Если новый процесс завершился или не успел, старый остаётся
+работать, а дочерний убивается. Если файл появился, старый отправляет stop и
+уходит в обычный drain. Требуется `reuse_port = true`; без него сигнал
+игнорируется с `warn`. Новый процесс биндит TCP, metrics и HTTP/3 через
+`SO_REUSEPORT`. `SIGINT` и `SIGTERM` просто останавливают процесс.
 
 ## Маршрутизация
 
@@ -251,8 +285,8 @@ Runtime лежит в `ArcSwap` и загружается на каждый за
   пересылки: с портом, если он был, и в скобках для IPv6.
 
 Маршрут ищется по ключу без порта, в upstream уходит нормализованный Host с
-портом. Это исключает расхождение, когда `admin:80@example.com` маршрутизируется
-как `example.com`, а бэкенд видит исходную строку.
+портом. Это исключает расхождение, когда `admin:80@example.com`
+маршрутизируется как `example.com`, а бэкенд видит исходную строку.
 
 `Router` хранит три набора:
 
@@ -276,7 +310,7 @@ default. Внутри каждого списка маршруты отсорт�
 превращается в `/`, остаток без ведущего `/` получает его. `redirect`
 отвечает заданным статусом (`301`, `302`, `303`, `307`, `308`) с `Location`
 и не трогает upstream. И `root`, и `redirect` проходят через
-`apply_route`; upstream — через общий путь с кэшем и сжатием.
+`apply_route`; upstream — через общий путь с кэшем, error pages и сжатием.
 
 ## Upstream
 
@@ -286,7 +320,13 @@ default. Внутри каждого списка маршруты отсорт�
 - `health: Vec<AtomicBool>` — по флагу на сервер;
 - `active: Vec<AtomicUsize>` — счётчик активных запросов;
 - `next: AtomicUsize` — атомарный курсор;
-- `balance`, `retries`, `scheme` (`http` или `https` по флагу `tls`).
+- `balance`, `retries`, `scheme` (`http` или `https` по флагу `tls`);
+- собственный `Client<HttpsConnector<HttpConnector>, Body>` и `TlsOptions`.
+
+Отдельный клиент на пул нужен потому, что доверие и ALPN могут отличаться:
+`insecure`, `ca`, `sni` и `http2` берутся из upstream'а, а при отсутствии
+переопределения — из `[upstream_tls]`. `min_version` задаётся только
+глобально и превращается в `tls13_only`.
 
 Выбор сервера:
 
@@ -302,22 +342,27 @@ default. Внутри каждого списка маршруты отсорт�
   handshake.
 
 Соединение к upstream открывает `hyper-util` legacy `Client` с
-`HttpsConnector<HttpConnector>`:
+`HttpsConnector<HttpConnector>`; `pool_idle_timeout` 30 секунд. HTTPS-
+соединитель строится в `elira-upstream::https_connector`: системные корни,
+дополнительный PEM из `[upstream_tls].ca` или `[[upstreams]].tls_ca`,
+`insecure` с `NoCertificateVerification` (подпись handshake всё равно
+проверяется), `http2` добавляет `h2` в ALPN, `min_version = "tls13"`
+включает только TLS 1.3. SNI берётся из `sni`, если задан, иначе из
+authority URI.
 
-- `HttpConnector`: connect timeout 5 секунд, `nodelay`, `enforce_http(true)`;
-- `pool_idle_timeout` 30 секунд;
-- HTTPS-соединитель строится в `elira-upstream::https_connector`: системные
-  корни, дополнительный PEM из `[upstream_tls].ca`, `insecure` с
-  `NoCertificateVerification` (подпись handshake всё равно проверяется),
-  `http2` добавляет `h2` в ALPN. SNI берётся из authority URI; отдельного
-  `sni` в конфиге нет, хотя поле есть в `TlsOptions`.
+Отдельного connect-таймаута у клиента нет: блок `HttpConnector` с
+`set_connect_timeout` в `Proxy::new` создаётся, но не используется — клиент
+собирается из `https_connector`. Время установки соединения ограничено
+общим таймаутом запроса (`route.timeout_secs` или
+`limits.upstream_timeout_secs`), который оборачивает весь `client.request`.
 
 Запрос к upstream идёт по схеме пула. Для каждого запроса собирается
 `HeaderMap`:
 
 - удаляются hop-by-hop заголовки: `connection`, `keep-alive`,
   `proxy-authenticate`, `proxy-authorization`, `proxy-connection`, `te`,
-  `trailer`, `transfer-encoding`, `upgrade`;
+  `trailer`, `transfer-encoding`, `upgrade`. Исключение — `TE: trailers`:
+  он сохраняется, потому что нужен gRPC;
 - удаляются токены, перечисленные в `Connection`;
 - удаляются клиентские forwarding-заголовки: `Forwarded`, `X-Real-IP`, все
   `X-Forwarded-*`, `X-Original-URL`, `X-Rewrite-URL`, `Front-End-Https`,
@@ -344,30 +389,39 @@ default. Внутри каждого списка маршруты отсорт�
 - ошибка последней попытки — `502`, таймаут — `504`.
 
 Таймаут запроса — `route.timeout_secs` или `limits.upstream_timeout_secs`;
-он оборачивает `client.request`, то есть ожидание заголовков ответа.
-`CONNECT` использует только глобальный таймаут, потому что обрабатывается до
-маршрутизации.
+он оборачивает `pool.client.request`, то есть ожидание заголовков ответа.
+Тело ответа отдельно ограничено `limits.upstream_body_timeout_secs` через
+`timeout_body`. `CONNECT` использует только глобальный таймаут, потому что
+обрабатывается до маршрутизации.
 
 Health-проверки (`Proxy::check_health`) выполняются циклом
 `server::spawn_health_loop`:
 
 - при `health.enabled` интервал `health.interval_secs`, иначе 30 секунд;
-- каждый сервер получает обычный HTTP/1.1 `GET path` с `Connection: close`;
+- путь берётся из `[[upstreams]].health_path`, иначе из `health.path`;
+- каждый сервер получает HTTP/1.1 `GET path` с `Connection: close`;
+- для `tls = true` проба делает настоящий TLS-handshake с теми же
+  `TlsOptions`: доверие, `sni`, `tls13_only`; порт по умолчанию 443;
 - ответ `2xx`/`3xx` — жив, всё остальное, ошибка и таймаут — мёртв;
-- таймаут применяется отдельно к connect, записи и чтению;
-- пулы с `scheme == "https"` пропускаются целиком и остаются помеченными
-  живыми: пробник говорит по открытому HTTP;
+- таймаут применяется отдельно к connect, TLS-handshake, записи и чтению;
 - метрики `up`/`down` обновляются после каждого тика, включая тики с
   выключенными проверками.
 
 Reload при включённых проверках делает один внеочередной проход до
 публикации. Метрики после этого обновятся только на следующем тике.
 
+`health_path` у `[[upstreams]]` не проходит такую же проверку формата, как
+`health.path`: значение подставляется в строку `GET <path> HTTP/1.1` как
+есть. Опечатка или управляющий символ здесь не отсекаются при загрузке
+конфигурации.
+
 ## Статика
 
 Маршрут с `root` обслуживает `elira_proxy::files::Files`. Поля `Files`
 фиксируются при сборке `Proxy`: `root`, `index`, `spa`, `try_files`,
-`autoindex`, `compression.enabled`, `compression.min_bytes`.
+`autoindex`, `compression.enabled`, `compression.min_bytes`. Для error pages
+создаётся отдельный `Files` с выключенными `spa`, `try_files`, `autoindex` и
+сжатием.
 
 Порядок обработки `Files::serve`:
 
@@ -448,13 +502,13 @@ hyper уже владеет сокетом.
   `Upgrade`;
 - нет `Host` или заголовок не помещается в 16 КиБ;
 - `Proxy::static_file` вернул `None`: маршрут не статический, у маршрута
-  есть `add_headers`/`remove_headers`, `auth_file`, ACL, выключен
-  `server_header` или задан `Alt-Svc`;
+  есть `add_headers`/`remove_headers`, `auth_file`, ACL, per-route limiter,
+  `error_pages`, выключен `server_header` или задан `Alt-Svc`;
 - файл не существует или не является обычным файлом;
 - тип файла сжимаемый и клиент принимает `br`/`gzip`;
 - для принимаемого `br`/`gzip` существует предсжатый sibling;
-- rate limiter не разрешает запрос (тогда его обработает `Proxy::handle` и
-  вернёт `429`).
+- глобальный rate limiter не разрешает запрос (тогда его обработает
+  `Proxy::handle` и вернёт `429`).
 
 Если путь выбран, `try_serve` вычитывает ровно заголовок, пишет ответ сам:
 
@@ -470,21 +524,26 @@ connection: close
 и отдаёт файл через `sendfile(2)` (дубликат fd, `AsyncFd`, куски до 1 МиБ).
 `HEAD` получает заголовки без тела. После ответа соединение закрывается;
 keep-alive на быстром пути нет. В ответе нет `Server`, `Accept-Ranges`,
-`X-Content-Type-Options`, `X-Request-Id` и `Alt-Svc`; access-лог и метрики
-пишутся вручную. Ошибка открытия файла после отправки заголовков просто
-закрывает соединение.
+`X-Content-Type-Options`, `X-Request-Id` и `Alt-Svc`; access-лог пишется
+через `Runtime::write_log`, метрики — только глобальные
+`elira_requests_total`, гистограмма и счётчик соединений. Per-route,
+per-upstream и byte-метрики на этом пути не обновляются. Ошибка открытия
+файла после отправки заголовков просто закрывает соединение.
 
 На не-Linux `send_file` возвращает ошибку, но `try_serve` до неё не доходит:
 проверка платформы стоит первой.
 
 ## Кэш
 
-`elira-cache` — рабочий in-memory кэш, а не заготовка. `Proxy` создаёт его
-при `cache.enabled` и использует для GET-ответов upstream'ов; статика,
+`elira-cache` — рабочий in-memory кэш. `Proxy` создаёт его при
+`cache.enabled` и использует для GET-ответов upstream'ов; статика,
 redirect'ы и ответы самого прокси не кэшируются.
 
 Ключ — `canonical_host + path_and_query`: host без порта, путь с query.
-Заголовки запроса в ключ не входят.
+Заголовки запроса в ключ не входят, но `Vary` учитывается отдельно.
+
+Запрос не участвует в кэше вовсе, если содержит `Authorization` или
+`Cookie`: такие данные не должны переходить между клиентами.
 
 Ответ кэшируется, если одновременно:
 
@@ -493,46 +552,66 @@ redirect'ы и ответы самого прокси не кэшируются.
 - статус upstream'а `200`;
 - `Content-Length` известен и не больше `cache.max_item_bytes`;
 - нет `Set-Cookie`;
-- `Cache-Control` не содержит `no-store` и `private`.
+- `Cache-Control` не содержит `no-store`, `private`, `no-cache` и успешно
+  разбирается;
+- `Vary` не равен `*`.
 
 Тело такого ответа полностью буферизуется (`BodyExt::collect`) и кладётся
-в кэш вместе со статусом и заголовками без hop-by-hop и `Content-Length`.
-Ответы с chunked-телом или неизвестной длиной не кэшируются.
+в кэш вместе со статусом и заголовками без hop-by-hop, `Content-Length`,
+`Connection`-токенов и `Age`. Заголовки с не-UTF-8 значением в запись не
+попадают. Ответы с chunked-телом или неизвестной длиной не кэшируются.
 
-На HIT ответ собирается из записи, получает `X-Cache: HIT`, проходит
-`apply_route` и отдаётся без сжатия. На промахе — `X-Cache: MISS` и обычный
-путь. Заголовки на HIT берутся из записи, а `Server: elira` повторно не
-добавляется: в кэш попадает `Server` upstream'а, если тот его прислал, или
-ничего. При `server_header = false` `apply_route` удаляет `Server` и с
-HIT-ответа.
+TTL записи:
 
-Ограничения кэша:
+- `Cache-Control: s-maxage`, иначе `max-age`, ограничивают
+  `cache.ttl_secs` сверху;
+- без них действует `cache.ttl_secs`;
+- нулевой TTL означает «сразу протух» и не сохраняется.
 
+`Vary` создаёт отдельный вариант под тем же ключом. Значения полей
+сравниваются как объединённые значения заголовков запроса; отсутствующий
+заголовок совпадает только с отсутствующим. `Vary: *` не кэшируется.
+
+На HIT:
+
+- ответ собирается из записи, получает `X-Cache: HIT` и `Age` в секундах;
+- заголовки берутся из записи; `Server: elira` повторно не добавляется,
+  поэтому в кэше может оказаться `Server` upstream'а или ничего, а при
+  `server_header = false` `apply_route` удаляет его и с HIT-ответа;
+- сжатие не применяется;
+- ответ проходит `apply_route`;
+- в расширения ответа кладётся `Labels`, поэтому HIT учитывается в
+  per-route/per-upstream метриках.
+
+На промахе ставится `X-Cache: MISS`, даже если ответ не попал в кэш
+(например, из-за `Cache-Control` или неизвестной длины).
+
+Вытеснение:
+
+- при вставке сначала удаляются все протухшие варианты;
+- затем удаляется самый старый вариант по `stored_at`, при равенстве — по
+  номеру вставки;
+- тело больше `cache.max_bytes` не принимается;
 - бюджет считается только по телам, без заголовков;
-- запись живёт `cache.ttl_secs` от вставки, продления нет;
-- при вставке сначала удаляются протухшие записи, затем самые старые по
-  времени вставки (при равном времени — по номеру вставки);
-- тело больше `cache.max_bytes` не принимается вовсе;
-- `max_bytes = 0` отключает кэш даже при `enabled = true`;
-- `Vary` учитывается: под одним ключом хранится по записи на каждую
-  комбинацию значений, `Vary: *` не кэшируется;
-- запросы с `Authorization` или `Cookie` не читают и не пишут кэш, ответы с
-  `Set-Cookie`, `no-store`, `private` или `no-cache` не сохраняются;
-- `s-maxage`/`max-age` сокращают TTL, но не удлиняют его; на HIT
-  выставляется `Age`;
-- нет revalidation, инвалидации, `Range` и условных запросов;
-- кэш живёт в процессе и создаётся заново при `SIGHUP`, поэтому reload его
-  очищает.
+- `max_bytes = 0` отключает кэш даже при `enabled = true`.
+
+Кэш живёт в процессе. `POST /cache/purge` на admin-листенере очищает кэш
+текущего runtime; `SIGHUP` создаёт новый `Proxy` и тем самым новый пустой
+кэш. `/status` показывает `cache.bytes` и `cache.entries`, либо `null`.
 
 ## Аутентификация и ACL
 
 Проверки выполняются после выбора маршрута и до кэша, upstream'а и статики.
-Порядок жёсткий:
+Порядок:
 
-1. ACL (`IpAcl::allows`): `ip_deny` проверяется первым и всегда сильнее
+1. Глобальный rate limiter — в `Proxy::handle`.
+2. Глобальный `max_body_bytes` и `Transfer-Encoding` — до Host.
+3. Per-route `max_body_bytes`.
+4. Per-route rate limiter.
+5. ACL (`IpAcl::allows`): `ip_deny` проверяется первым и всегда сильнее
    `ip_allow`. Пустой `ip_allow` разрешает всё, что не попало в deny.
    Отказ — `403`.
-2. `auth_file`: HTTP Basic. Заголовок разбирается вручную, схема
+6. `auth_file`: HTTP Basic. Заголовок разбирается вручную, схема
    регистронезависима, пароль проверяется bcrypt по хэшу из htpasswd.
    Неудача — `401` с `WWW-Authenticate: Basic realm="elira"`.
 
@@ -543,14 +622,18 @@ htpasswd читается при сборке `Proxy`, то есть при ст
 
 ACL и auth работают и для статики, и для upstream'ов, и для redirect.
 Исключение — `CONNECT`: он обрабатывается до маршрутизации и не проходит ни
-ACL, ни auth, ни per-route timeout. Для `CONNECT` остаётся только общий rate
-limiter.
+ACL, ни auth, ни per-route timeout. Для `CONNECT` остаются глобальный rate
+limiter, список `connect.allow` и семафор туннелей.
 
-## Rate limit и лимит тела
+Admin-листенер использует тот же `BasicAuth`: если задан
+`metrics.auth_file`, аутентификация требуется для всех путей, включая
+`/metrics`. Файл читается один раз при старте; reload его не перечитывает.
+
+## Rate limit и лимиты тела
 
 Rate limiter — token bucket на IP peer'а (`elira-limit`):
 
-- `limits.requests_per_second = 0` отключает лимитер;
+- `limits.requests_per_second = 0` отключает глобальный лимитер;
 - `burst` — ёмкость ведра; при `0` `Proxy::new` берёт
   `max(burst, requests_per_second)`, то есть ведро равно rate;
 - новый клиент получает полное ведро;
@@ -560,12 +643,17 @@ Rate limiter — token bucket на IP peer'а (`elira-limit`):
   получает отказ;
 - время передаётся аргументом, поэтому алгоритм тестируется без sleep.
 
-Превышение — `429` с `Retry-After: 1`. Проверка стоит первой в
-`Proxy::handle`, раньше проверки тела, маршрута и ACL.
+Per-route limiter (`requests_per_second`/`burst`) — отдельный bucket,
+созданный для маршрута; он не заменяет глобальный, а проверяется после него.
+Оба отказа дают `429` с `Retry-After: 1`. Глобальная проверка стоит первой,
+поэтому исчерпанный глобальный bucket отвечает `429` даже на маршруте со
+своим лимитом.
 
-`limits.max_body_bytes` проверяет только `Content-Length`: если он больше
-лимита — `413`. Chunked-тело этим лимитом не ограничивается. Значение `0`
-выключает проверку.
+`limits.max_body_bytes` и `route.max_body_bytes` проверяют только
+`Content-Length`: если он больше лимита — `413`. `0` выключает
+соответствующий лимит. Chunked-тело этими лимитами не ограничивается;
+для него действует только `request_body_timeout_secs` (таймаут простоя, не
+размер).
 
 `Transfer-Encoding` допускается только в виде одного `chunked`. `gzip,
 chunked` и несколько значений дают `501` на запрос. На ответ upstream'а
@@ -583,25 +671,27 @@ chunked` и несколько значений дают `501` на запрос
   `limits.max_connections`; при исчерпании — `503`;
 - TCP-соединение открывается с таймаутом `limits.upstream_timeout_secs`;
   ошибка — `502`;
-- клиент получает `200`, затем задача ждёт `hyper::upgrade::on` и делает
-  `copy_bidirectional`.
+- клиент получает `200`, затем задача ждёт `hyper::upgrade::on` и запускает
+  `tunnel` с двусторонней копией.
 
 `CONNECT` не проходит через пул, не использует TLS к цели (это и есть
 открытый TCP-туннель), не учитывает `timeout_secs` маршрута и не пишет
 отдельных метрик. Работает только по HTTP/1.1: в HTTP/2 и HTTP/3 hyper не
 даёт upgrade-путь для такого туннеля.
+
 `Upgrade` (websockets и другие протоколы) определяется по наличию `Upgrade`
 и токена `upgrade` в `Connection`. Тело у такого запроса запрещено:
 `Content-Length != "0"` или наличие `Transfer-Encoding` дают `400`.
+Фактически это HTTP/1.1-механизм: в HTTP/2 и HTTP/3 нет ни такого
+заголовка, специфичного для соединения, ни hyper upgrade-пути.
 
 Туннель не идёт через пул соединений: `forward_upgrade` открывает отдельный
 `TcpStream` к `host:port` upstream'а, вручную сериализует заголовки в
 HTTP/1.1, пишет их, читает ответ до `\r\n\r\n` (лимит 64 КиБ), пропускает
 `1xx` кроме `101`. На `101` заголовки `Connection: upgrade` и `Upgrade`
 (значение upstream'а, если он его прислал) возвращаются клиенту, байты,
-пришедшие сразу после заголовков, отправляются клиенту до
-`copy_bidirectional`. На не-`101` ответ передаётся с пустым телом и
-`Server: elira`.
+пришедшие сразу после заголовков, отправляются клиенту до `tunnel`. На
+не-`101` ответ передаётся с пустым телом и `Server: elira`.
 
 `Upgrade` всегда открывает открытый TCP, независимо от `tls = true` у
 upstream'а: TLS к бэкенду на этом пути не устанавливается. Ответы upgrade
@@ -609,9 +699,12 @@ upstream'а: TLS к бэкенду на этом пути не устанавл�
 `remove_headers`, `X-Request-Id` и `Alt-Svc`; `Server: elira` в них
 вставляется безусловно, даже при `server_header = false`.
 
-Оба вида туннелей используют один и тот же семафор `tunnels` и не
-увеличивают `elira_connections_in_flight`: этот счётчик считает клиентские
-соединения, а не туннели внутри них.
+`CONNECT` и `Upgrade` используют `limits.websocket_idle_secs`: `tunnel`
+разбивает оба потока на направления и закрывает туннель, если в любом
+направлении нет данных дольше лимита. Ноль отключает проверку. Оба вида
+туннелей используют семафор `tunnels` и не увеличивают
+`elira_connections_in_flight`: этот счётчик считает клиентские соединения,
+а не туннели внутри них.
 
 ## Ответ
 
@@ -621,7 +714,8 @@ upstream'а: TLS к бэкенду на этом пути не устанавл�
 - `Content-Length` upstream'а не копируется: framing строит hyper;
 - `Server` заменяется на `elira` (заголовок upstream'а не сохраняется);
 - для `101` возвращаются `Connection: upgrade` и `Upgrade`;
-- при сжатии выставляются `Content-Encoding` и `Vary: accept-encoding`.
+- при сжатии выставляются `Content-Encoding` и `Vary: accept-encoding`;
+- тело оборачивается `timeout_body` с `upstream_body_timeout_secs`.
 
 Сжатие ответа upstream'а включается, если:
 
@@ -636,14 +730,29 @@ upstream'а: TLS к бэкенду на этом пути не устанавл�
 `gzip`, если `q(gzip) > 0`. `identity` и `*` не разбираются. Тело сжимается
 потоково через `async-compression`, поэтому длина ответа не сохраняется.
 
+Перед отправкой клиенту `apply_error_page` может заменить ответ, если для
+его статуса настроен `error_pages`. Страница берётся из `error_root` или
+`root` маршрута; это отдельный `Files`, который отдаёт файл по пути из
+конфигурации. Fallback на `root` в коде есть, но статический маршрут
+возвращается раньше `apply_error_page`, поэтому на практике для
+проксирующего маршрута нужен `error_root`. Если файл отдался успешно, статус
+исходного ответа сохраняется; если файл сам вернул ошибку, его статус
+остаётся как есть.
+Error pages применяются только к ответам, полученным от upstream, и только
+после обычной ветки проксирования: ответы, которые `forward` вернул как
+`Err` (`502`, `504`, `429` и т.п.), до `apply_error_page` не доходят, а
+статический маршрут (`root`) возвращается раньше и свои `error_pages` не
+использует. Подмена заменяет ответ целиком и теряет расширение `Labels`,
+поэтому такой ответ не попадёт в per-route/per-upstream метрики.
+
 `apply_route` для ответов, прошедших общий путь (upstream, статика,
 redirect, кэш):
 
 1. удаляет `remove_headers`;
 2. вставляет `add_headers` (после удаления, поэтому add побеждает);
 3. добавляет `X-Request-Id`, только если его ещё нет;
-4. удаляет `Server`, если `server_header = false`; этот шаг идёт после
-   `add_headers`, поэтому спрятать `Server` сильнее, чем добавить его
+4. удаляет `Server`, если `server_header = false`; шаг идёт после
+   `add_headers`, поэтому скрыть `Server` сильнее, чем добавить его
    маршрутом;
 5. вставляет `Alt-Svc`, если задан `[http3]`.
 
@@ -671,27 +780,53 @@ Request id:
 - быстрый путь `sendfile` id только логирует, в ответ заголовок не пишет.
 
 `Server: elira` вставляется только в проксированный ответ и в ответ
-`forward_upgrade`. Статика, redirect и ответы из кэша его не добавляют: в них
-остаётся только заголовок upstream'а, если он был скопирован, а при
-`server_header = false` `apply_route` его удаляет. На ответах ошибок и на
+`forward_upgrade`. Статика, redirect и ответы из кэша его не добавляют: в
+них остаётся только заголовок upstream'а, если он был скопирован, а при
+`server_header = false` `apply_route` его удаляет. Маршрутные
+`remove_headers` могут удалить `Server` независимо от флага, а
+`add_headers` — добавить или переопределить его. На ответах ошибок и на
 `sendfile` `Server` отсутствует.
+
+Для метрик в ответ вставляется расширение `Labels` с меткой маршрута
+(`host + path` из конфигурации) и именем upstream'а. Оно появляется на
+обычном upstream-ответе и на HIT кэша; статика, redirect и ответы самого
+прокси метку не получают, поэтому `elira_route_*` для них не растёт.
 
 ## Access-лог
 
 `elira-accesslog::Entry` содержит peer, метод, версию, Host, path, статус,
 число байт, длительность, User-Agent и request id. `line()` рендерит
-common-log-подобную строку, `json()` — плоский JSON. Оба экранируют
-управляющие символы, кавычки и обратный слэш, поэтому одна запись не может
-разорвать строку. Отсутствующий User-Agent в тексте — `-`, в JSON — `null`.
+common-log-подобную строку, `json()` — плоский JSON; оба экранируют
+управляющие символы, кавычки и обратный слэш. Отсутствующий User-Agent в
+тексте — `-`, в JSON — `null`.
+
+Дополнительно `Format` разбирает nginx-подобный шаблон из `log.template`:
+`$remote_addr`, `$remote_port`, `$host`, `$request`, `$request_method`,
+`$request_uri`, `$server_protocol`, `$status`, `$body_bytes_sent`,
+`$http_user_agent`, `$http_referer`, `$request_time`, `$request_id`,
+`$time_iso8601`, `$time_local`. `$$` — литеральный доллар, неизвестная
+переменная — ошибка сборки runtime. `$time_iso8601` и `$time_local` всегда
+в UTC. Шаблон сильнее `log.format`.
+
+`Runtime::write_log`:
+
+1. рендерит строку шаблоном или `text`/`json`;
+2. отправляет её в syslog, если задан `log.syslog` (датаграмма
+   `<14>elira: <line>`);
+3. пишет в `log.file`, если он задан, иначе в `tracing::info!(target:
+   "access", ...)`; `tracing_subscriber::fmt()` в `main` пишет это в stdout.
+
+`log.syslog` открывается при сборке runtime; недоступный сокет отменяет
+старт/reload. Ошибка отправки отдельной строки игнорируется.
 
 TCP-путь пишет запись после получения заголовков ответа. `bytes` берётся из
 `response.body().size_hint().exact()`, иначе `0`; у потоковых и сжатых тел
 точная длина обычно неизвестна, поэтому в логе будет `0`. `duration` — время
-до готовности заголовков, а не до конца передачи тела.
-
-Формат берётся из `Runtime.log` на каждый запрос. Если `log.file` задан,
-`Runtime::build` открывает `AccessLog`; иначе строка идёт через
-`tracing::info!(target: "access", ...)`.
+до готовности заголовков, а не до конца передачи тела; исключение —
+`sendfile`, где запись пишется после передачи файла и `duration` включает
+саму передачу. HTTP/3 считает так же и логирует через замыкание, которое
+загружает текущий runtime, поэтому `log.file`, шаблон и syslog применяются и
+к h3.
 
 `AccessLog`:
 
@@ -704,62 +839,81 @@ TCP-путь пишет запись после получения заголо�
   `Runtime` и тем самым открывает новый дескриптор. Это же позволяет
   использовать внешний logrotate: переименовать файл и послать `SIGHUP`.
 
-HTTP/3 пишет только через `tracing`, `log.file` на этом пути игнорируется.
+## Метрики, status и admin-листенер
 
-## Метрики и health
+`Metrics` хранит глобальные атомики и две таблицы меток:
 
-`Metrics` хранит атомики для глобальных счётчиков и `Mutex<BTreeMap>` для
-маршрутов и upstream'ов (не больше 200 меток каждого вида):
-
-- `elira_requests_total{class}` и `elira_request_duration_seconds`;
-- `elira_route_requests_total` / `elira_route_duration_seconds_*`;
-- `elira_upstream_requests_total` / `elira_upstream_duration_seconds_*`;
+- `elira_requests_total{class="1xx".."5xx","other"}`;
+- `elira_request_duration_seconds` — гистограмма с границами от 1 мс до
+  10 с и `+Inf`;
+- `elira_connections_in_flight`;
+- `elira_upstreams{state="up"|"down"}`;
+- `elira_route_requests_total{route,class}` и
+  `elira_route_duration_seconds_{sum,count}{route}`;
+- `elira_upstream_requests_total{upstream,class}` и
+  `elira_upstream_duration_seconds_{sum,count}{upstream}`;
 - `elira_cache_requests_total{result="hit"|"miss"}`;
 - `elira_request_bytes_total`, `elira_response_bytes_total`;
-- `elira_reloads_total{result="ok"|"failed"}`;
-- `elira_connections_in_flight`, `elira_upstreams{state}`.
+- `elira_reloads_total{result="ok"|"failed"}`.
 
-`Proxy` кладёт `Labels` (маршрут и имя пула) в extensions ответа, а
-листенер снимает их и записывает метрики. TCP-путь делает это в
-`serve_conn` и `sendfile`, h3 — в `elira-h3::request`. Счётчик соединений
-увеличивается в `serve_conn` и `sendfile`, уменьшается при завершении.
-`render()` не сбрасывает состояние и печатает фиксированный порядок серий.
+Метки маршрутов и upstream'ов ограничены `MAX_LABELS = 200`: после
+переполнения новые имена отбрасываются. `elira_reloads_total{result="ok"}`
+увеличивается после успешной публикации runtime, а
+`elira_reloads_total{result="failed"}` — только когда `Config::load` не смог
+разобрать или провалидировать файл. Ошибка `Runtime::build` (например,
+битый PEM, шаблон лога или syslog) reload отменяет, но счётчик `failed` при
+этом не увеличивается. Байтовые счётчики зависят от `size_hint().exact()` и
+часто получают `0` для потоковых тел.
 
-Отдельный листенер `[metrics]` создаётся в `main::run` через
-`server::bind_tcp` (с тем же `reuse_port`) и `spawn_metrics`:
+`observe` вызывается на TCP-пути (включая `sendfile`) после получения
+ответа; h3 вызывает `record_request`, route/upstream/cache/response-bytes,
+но не `request_bytes`. Счётчик соединений увеличивается в `serve_conn` и
+`sendfile`, уменьшается при завершении; h3 его не трогает. `render()` не
+сбрасывает состояние и печатает фиксированный порядок серий.
 
-- `GET /metrics` — Prometheus text (`text/plain; version=0.0.4`);
-- `GET /status` — JSON с пулами, серверами, health-флагами, активными
-  запросами и статистикой кэша;
-- `POST /reload` — тот же путь, что `SIGHUP`;
-- `POST /drain` — graceful shutdown;
-- `POST /cache/purge` — очистка кэша;
-- всё остальное — `404`.
+Admin-листенер `[metrics]` создаётся в `main::run` через `server::bind_tcp`
+(с тем же `reuse_port`) и `spawn_metrics`:
 
-`/status` и `purge` загружают текущий `Runtime` на каждый запрос, поэтому
-видят новый набор пулов после `SIGHUP`. `metrics.auth_file` включает Basic
-auth для всех путей. У листенера нет TLS, семафора соединений и таймаутов
-из `[limits]`; его соединения не дожидаются остановки. Порт фиксируется при
-старте, изменение `metrics.listen` или наличие секции требуют рестарта.
+| Метод и путь | Ответ |
+| --- | --- |
+| `GET /metrics` | Prometheus text, `text/plain; version=0.0.4; charset=utf-8` |
+| `GET /status` | JSON: upstream'ы, серверы, `healthy`, `active`, `balance`, `retries`, `cache` |
+| `POST /reload` | `202 {"reload":"queued"}`; то же, что `SIGHUP` |
+| `POST /drain` | `202 {"drain":"started"}`; graceful shutdown |
+| `POST /cache/purge` | `200 {"purged":true\|false}` для текущего runtime |
+
+Всё остальное — `404`. Если задан `metrics.auth_file`, любой путь требует
+Basic-аутентификацию; ошибка — `401` с `WWW-Authenticate` и JSON-телом.
+`/status` загружает текущий `Runtime` на каждый запрос, поэтому видит новый
+набор пулов после `SIGHUP`. `/reload` отправляет новое значение в watch-
+канал сигналов; `/drain` взводит общий stop; `/cache/purge` вызывает
+`Proxy::purge_cache`.
+
+У листенера нет TLS, семафора соединений, таймаутов из `[limits]` и
+отдельного счётчика соединений; его задачи не дожидаются остановки. Порт и
+`auth_file` фиксируются при старте: изменение `metrics.listen`, добавление
+или удаление секции и смена `auth_file` требуют рестарта (reload пишет
+`warn` только про адрес/наличие).
 
 Health-цикл описан в разделе «Upstream». Он читает `Runtime` на каждом
-тике, поэтому смена `health.*` применяется без перезапуска задачи.
+тике, поэтому смена `health.*` и `health_path` применяется без перезапуска
+задачи.
 
 ## Крейты
 
 | Крейт | Ответственность |
 | --- | --- |
-| `elira` | Бинарник и библиотека: команды `run`/`check`/`migrate`, сигналы, `Runtime` в `ArcSwap`, TCP-листенер, HTTP/1.1 и HTTP/2, PROXY protocol, `sendfile`, файл access-лога, metrics-листенер, graceful shutdown |
-| `elira-config` | Типы TOML с `deny_unknown_fields`, значения по умолчанию, валидация, ошибки загрузки; сокетов не открывает |
-| `elira-proxy` | `Proxy`, `Router`, `Pool`, пересылка запросов, гигиена заголовков, retries, таймауты, `CONNECT` и `Upgrade`, кэш и сжатие, health-пробы, статика, JSON для `/status` |
-| `elira-tls` | Чтение PEM, сборка rustls `ServerConfig`, ALPN `h2`/`http/1.1`, `h3` для QUIC, verifier клиентских сертификатов |
-| `elira-upstream` | HTTPS-коннектор к upstream'ам: системные и дополнительные корни, `insecure`, опциональный `h2` в ALPN |
-| `elira-auth` | HTTP Basic по htpasswd с bcrypt, `IpAcl` по CIDR |
+| `elira` | Бинарник и библиотека: команды `run`/`check`/`migrate`, сигналы, `Runtime` в `ArcSwap`, TCP-листенер, HTTP/1.1 и HTTP/2, PROXY protocol, `sendfile`, файл/шаблон/syslog access-лога, admin-листенер, graceful shutdown, readiness |
+| `elira-config` | Типы TOML с `deny_unknown_fields`, значения по умолчанию, валидация (включая SNI-имена, error pages, TLS-версии), ошибки загрузки; сокетов не открывает |
+| `elira-proxy` | `Proxy`, `Router`, `Pool`, пересылка запросов, гигиена заголовков, retries, таймауты, per-route лимиты, `CONNECT` и `Upgrade`, кэш, error pages, сжатие, health-пробы, статика, JSON для `/status` |
+| `elira-tls` | Чтение PEM, сборка rustls `ServerConfig`, ALPN `h2`/`http/1.1`, SNI-resolver, `h3` для QUIC, минимальная версия TLS, verifier клиентских сертификатов |
+| `elira-upstream` | HTTPS-коннектор к upstream'ам: системные и дополнительные корни, `insecure`, SNI, опциональный `h2`, `tls13_only`, общий `client_config` для health-проб |
+| `elira-auth` | HTTP Basic по htpasswd с bcrypt, `IpAcl` по CIDR; используется и admin-листенером |
 | `elira-limit` | Token bucket на IP, ограничение таблицы и очистка по idle |
-| `elira-cache` | In-memory кэш ответов с бюджетом по байтам, TTL и вытеснением |
-| `elira-accesslog` | `Entry`, текстовый и JSON-формат, экранирование, генерация request id |
-| `elira-metrics` | Атомарные счётчики, гистограмма, рендер Prometheus |
-| `elira-h3` | QUIC-эндпоинт, h3-сервер, мост тела запроса, access-лог |
+| `elira-cache` | In-memory кэш с бюджетом по байтам, TTL из `Cache-Control`, `Vary`, проверкой credentials и вытеснением |
+| `elira-accesslog` | `Entry`, text/JSON, nginx-подобные шаблоны, экранирование, syslog, генерация request id |
+| `elira-metrics` | Атомарные счётчики, гистограмма, метки route/upstream, cache/bytes/reload счётчики, рендер Prometheus |
+| `elira-h3` | QUIC-эндпоинт, h3-сервер, мост тела запроса, метрики, mTLS, access-лог через runtime |
 | `elira-acme` | TLS-ALPN-01 через `rustls-acme`, кэш сертификатов и аккаунта, фоновое продление |
 | `elira-migrate` | Конвертация подмножества nginx-конфига в TOML с предупреждениями |
 
@@ -771,62 +925,87 @@ gzip и brotli; socket2 для `SO_REUSEPORT`; ipnet для CIDR; httpdate дл�
 
 ## Известные ограничения
 
-- `[tls]` — один статический сертификат на листенер. `with_single_cert` не
-  использует SNI, поэтому разные сертификаты для разных имён требуют
-  отдельных процессов или портов. `[acme]` использует resolver
-  `rustls-acme` и умеет несколько доменов, но против реального CA не
-  проверялся; проверен только разбор конфигурации и сборка состояния.
+- HTTP/3 использует один сертификат `[http3].cert`/`key`; списка
+  SNI-сертификатов, как в `[tls.certificates]`, у QUIC нет. `tls.min_version`
+  к ACME и QUIC не применяется: QUIC всегда TLS 1.3, ACME собирает свою
+  конфигурацию.
+- SNI-сертификаты `[tls]` перебираются в порядке массива: wildcard из
+  ранней записи может перекрыть точное имя из поздней. Если `cert`/`key` не
+  заданы, клиент без SNI не получит сертификат, и handshake завершится
+  ошибкой.
 - ACME поддерживает только TLS-ALPN-01: порт 443 должен быть доступен
   извне. `Acme` создаётся один раз при старте, `SIGHUP` его не перечитывает
   и не перезапускает. На ACME-ветке нет 10-секундного таймаута handshake и
-  нет mTLS.
+  нет mTLS. Против реального CA ACME не проверялся.
 - `sendfile` работает только на Linux, только на открытом HTTP/1.1, только
   для первого запроса на соединении и только при отсутствии диапазонов,
   условий, `Upgrade`, сжатия, предсжатого sibling'а, route-заголовков, auth,
-  ACL, скрытого `Server` и `Alt-Svc`. Ответ закрывает соединение и не
-  содержит части обычных заголовков.
-- Кэш — не полноценный HTTP-кэш: ключ не учитывает заголовки запроса
-  (включая `Authorization`, `Cookie` и `Vary`), нет revalidation,
-  инвалидации, `Range`, ответов с chunked-телом; кэш живёт в одном процессе
-  и очищается при reload. HIT-ответ отдаётся без сжатия.
-- Метрики покрывают только TCP-путь. HTTP/3 не обновляет ни счётчики
-  запросов, ни гистограмму, ни `connections_in_flight`. HTTP/3 также
-  игнорирует `log.file` и пишет access-лог только в `tracing`.
-- HTTP/3 не поддерживает PROXY protocol, mTLS, `CONNECT` и `Upgrade`.
+  ACL, per-route limiter, `error_pages`, скрытого `Server` и `Alt-Svc`.
+  Ответ закрывает соединение, не содержит `Server`, `Accept-Ranges`,
+  `X-Content-Type-Options`, `X-Request-Id`, `Alt-Svc` и не обновляет
+  route/upstream/byte-метрики.
+- Кэш — не полноценный HTTP-кэш: нет revalidation (`If-None-Match`,
+  `If-Modified-Since`), нет `Range`, нет stale-while-revalidate, нет общего
+  кэша между процессами; запросы с `Authorization`/`Cookie` обходят кэш
+  целиком; HIT-ответ отдаётся без сжатия. Кэш очищается при reload и по
+  `POST /cache/purge`. Ключ не учитывает порт Host: `example.com` и
+  `example.com:8443` с одним путём попадут в один ключ, если оба дошли до
+  upstream-ветки. Ответ, который буферизуется для кэша, читается через
+  `BodyExt::collect` до обёртки `upstream_body_timeout_secs`, поэтому
+  таймаут простоя тела к нему не применяется.
+- Метрики per-route и per-upstream считают только проксированные ответы:
+  статика и redirect не получают `Labels`. `sendfile` обновляет только
+  глобальные счётчики и гистограмму. HTTP/3 не обновляет
+  `elira_connections_in_flight` и `elira_request_bytes_total`.
+  `elira_reloads_total{result="failed"}` не считает ошибки `Runtime::build`
+  (битый PEM, шаблон или syslog): такие reload отменяются, но счётчик
+  остаётся прежним. Байтовые счётчики часто равны нулю для потоковых тел.
+- HTTP/3 не поддерживает PROXY protocol, `CONNECT` и `Upgrade`.
   `max_headers`/`max_header_bytes` к нему не применяются. Reload
   перезапускает слушатель и рвёт живые QUIC-соединения.
-- Health-проверки не умеют TLS: пулы с `tls = true` пропускаются и всегда
-  считаются живыми. Пассивной проверки по ответам `5xx` нет. Проверка — один
-  HTTP/1.1 GET, путь общий для всех серверов.
+- Health-проверки активные, без пассивной проверки по ответам `5xx`;
+  проверка — один HTTP/1.1 GET, путь общий или per-upstream. Если все
+  серверы помечены мёртвыми, трафик всё равно идёт (fail-open).
 - Повторы не покрывают ответы `5xx` и запросы с телом. Тело повторной
   попытки не переигрывается.
-- `limits.max_body_bytes` проверяет только `Content-Length`; chunked-тело
-  не ограничено. `Transfer-Encoding`, отличный от одного `chunked`, даёт
-  `501` на запрос и `502` на ответ upstream'а.
+- `max_body_bytes` и `route.max_body_bytes` проверяют только
+  `Content-Length`; chunked-тело не ограничено размером.
+  `request_body_timeout_secs`/`upstream_body_timeout_secs` ограничивают
+  простой, а не объём.
 - `Upgrade` к upstream'у всегда открывает открытый TCP и игнорирует
   `tls = true`; TLS-бэкенд за websocket не поддерживается. Ответы upgrade не
   проходят `apply_route` и не получают route-заголовки, `X-Request-Id` и
   `Alt-Svc`.
 - `CONNECT` обрабатывается до маршрутизации и не подчиняется route ACL,
-  auth и `timeout_secs`; ограничение — только `connect.allow`, общий rate
-  limiter и семафор туннелей. По HTTP/2 и HTTP/3 туннель не устанавливается.
+  auth и `timeout_secs`; ограничение — только `connect.allow`, глобальный
+  rate limiter и семафор туннелей. По HTTP/2 и HTTP/3 туннель не
+  устанавливается.
 - Статика поддерживает один диапазон; несколько диапазонов отдаются целиком
   с `200`, `If-Range` не реализован, `If-None-Match` сравнивает строки без
   weak-семантики.
+- Error pages применяются только к ответам upstream'а: ответы самого прокси
+  (`502`, `504`, `429` и т.п.) до них не доходят, а статический маршрут
+  возвращается раньше и свои `error_pages` не использует. Для проксирующего
+  маршрута без `error_root` список `error_pages` молча не используется;
+  `root` в этой ветке недоступен, потому что маршрут не может иметь
+  одновременно `upstream` и `root`.
 - Ответы, сгенерированные самим прокси (включая `401`, `403`, `404`, `413`,
   `429`, `502`, `503`, `504`), не проходят `apply_route`: в них нет
   `Server`, `X-Request-Id`, `Alt-Svc`, `add_headers` и `remove_headers`.
 - `Server: elira` добавляется только к обычному проксированному ответу и к
   ответу `forward_upgrade`. Статика, redirect и HIT-ответы кэша заголовок не
-  добавляют: в статике его нет вовсе, а в кэш попадает только `Server`
-  upstream'а, если тот его прислал.
+  добавляют.
 - `bytes` в access-логе равен `0`, когда точная длина тела неизвестна
-  (потоковые и сжатые ответы), а `duration` измеряется до заголовков, а не
-  до конца передачи тела.
+  (потоковые и сжатые ответы), а `duration` обычно измеряется до заголовков,
+  а не до конца передачи тела. Исключение — `sendfile`: он логирует после
+  передачи и включает её время в `duration`.
 - `listen`, `proxy_protocol`, `sendfile`, `reuse_port`,
-  `limits.idle_timeout_secs`, `metrics.listen` и `[acme]` меняются только
+  `limits.idle_timeout_secs`, `limits.request_body_timeout_secs`,
+  `metrics.listen`, `metrics.auth_file` и `[acme]` меняются только
   рестартом. Reload предупреждает лишь о части из них.
 - Reload пересобирает пулы, кэш и rate limiter: keep-alive соединения к
   upstream'ам, кэшированные ответы и накопленные токены не сохраняются.
 - `SIGUSR2` требует `reuse_port = true`; без него сигнал игнорируется.
-  На не-Unix платформах reload и hot restart недоступны.
+  Новый процесс должен успеть создать файл готовности за 15 секунд, иначе
+  старый процесс его убивает и продолжает работать. На не-Unix платформах
+  reload и hot restart недоступны.

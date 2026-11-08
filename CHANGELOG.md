@@ -45,6 +45,8 @@
 - SNI-сертификаты через `[[tls.certificates]]`, минимальная версия TLS.
 - Свои `sni`, `health_path`, `tls_insecure`, `tls_ca` и `http2` у upstream'а;
   health-проба для TLS-бэкенда делает настоящее рукопожатие.
+- Unix-сокеты как адреса upstream'ов (`unix:/run/app.sock`), включая
+  upgrade, health-пробу и `CONNECT`-независимую передачу тела.
 - HTTP/2 до upstream'а по `[upstream_tls] http2 = true`.
 - Prometheus-метрики на отдельном листенере: запросы по классам статусов,
   гистограмма задержки, число соединений в работе и состояние upstream'ов.
@@ -63,6 +65,7 @@
   завершение соединений.
 - Команда `elira check` для разбора и валидации конфигурации без открытия
   сокетов и `elira migrate` для конвертации подмножества nginx-конфига.
+- ACME проверен против Let's Encrypt staging на реальном домене и порту 443.
 - Fuzz-цели для конфига, мигратора, заголовков и PROXY protocol; CI-джобы
   MSRV, `cargo-audit`, `cargo-deny`, musl и Docker; e2e-тесты mTLS и
   неудачного hot restart.

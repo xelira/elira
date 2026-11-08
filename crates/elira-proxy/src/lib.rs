@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -32,7 +33,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::io::BufReader;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UnixStream};
 use tokio::sync::Semaphore;
 use tokio::time::Sleep;
 use tokio_util::io::{ReaderStream, StreamReader};
@@ -160,9 +161,48 @@ fn parse_header_line(line: &str) -> Option<(HeaderName, HeaderValue)> {
     Some((name, value))
 }
 
+/// A configured backend: TCP authority or a filesystem unix socket.
+#[derive(Clone, Debug)]
+enum ServerAddr {
+    Tcp(Authority),
+    Unix(PathBuf),
+}
+
+impl std::fmt::Display for ServerAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Tcp(authority) => authority.fmt(f),
+            Self::Unix(path) => write!(f, "unix:{}", path.display()),
+        }
+    }
+}
+
+impl ServerAddr {
+    fn parse(value: &str) -> Option<Self> {
+        if let Some(path) = value.strip_prefix("unix:") {
+            return Some(Self::Unix(PathBuf::from(path)));
+        }
+        value.parse::<Authority>().ok().map(Self::Tcp)
+    }
+
+    fn tcp(&self) -> Option<&Authority> {
+        match self {
+            Self::Tcp(authority) => Some(authority),
+            Self::Unix(_) => None,
+        }
+    }
+
+    fn unix(&self) -> Option<&Path> {
+        match self {
+            Self::Unix(path) => Some(path),
+            Self::Tcp(_) => None,
+        }
+    }
+}
+
 struct Pool {
     name: String,
-    servers: Vec<Authority>,
+    servers: Vec<ServerAddr>,
     health: Vec<AtomicBool>,
     active: Vec<AtomicUsize>,
     next: AtomicUsize,
@@ -298,11 +338,11 @@ impl Proxy {
         for up in &cfg.upstreams {
             let mut servers = Vec::with_capacity(up.servers.len());
             for addr in &up.servers {
-                let authority = addr.parse::<Authority>().map_err(|_| Error::BadServer {
+                let server = ServerAddr::parse(addr).ok_or_else(|| Error::BadServer {
                     upstream: up.name.clone(),
                     addr: addr.clone(),
                 })?;
-                servers.push(authority);
+                servers.push(server);
             }
             let health = (0..servers.len()).map(|_| AtomicBool::new(true)).collect();
             let active = (0..servers.len()).map(|_| AtomicUsize::new(0)).collect();
@@ -1038,18 +1078,18 @@ impl Proxy {
                 .map_err(|_| text(StatusCode::BAD_GATEWAY, "bad request"))?;
             *upstream.headers_mut() = template.clone();
 
-            match tokio::time::timeout(route_timeout, pool.client.request(upstream)).await {
-                Ok(Ok(answer)) => {
+            match send_request(pool, &server, upstream, route_timeout).await {
+                Ok(answer) => {
                     response = Some(answer);
                     break;
                 }
-                Ok(Err(err)) => {
+                Err(SendError::Failed(err)) => {
                     tracing::warn!(upstream = %server, error = %err, "upstream request failed");
                     if attempt + 1 == attempts {
                         return Err(text(StatusCode::BAD_GATEWAY, "bad gateway"));
                     }
                 }
-                Err(_) => {
+                Err(SendError::Timeout) => {
                     tracing::warn!(upstream = %server, "upstream timed out");
                     if attempt + 1 == attempts {
                         return Err(text(StatusCode::GATEWAY_TIMEOUT, "gateway timeout"));
@@ -1161,7 +1201,7 @@ impl Proxy {
 
             Full::new(collected).map_err(|never| match never {}).boxed()
         } else {
-            BodyExt::map_err(body, |err| -> BoxError { Box::new(err) }).boxed()
+            body
         };
 
         // Buffer small complete responses so the upstream socket is free
@@ -1277,7 +1317,7 @@ impl Proxy {
         upstream: Request<Body>,
         client_upgrade: hyper::upgrade::OnUpgrade,
         upgrade: HeaderValue,
-        server: Authority,
+        server: ServerAddr,
         timeout: Duration,
     ) -> Result<Response<Body>, Response<Body>> {
         // Tunnels outlive the connection task that the accept loop tracks,
@@ -1287,13 +1327,9 @@ impl Proxy {
             Err(_) => return Err(text(StatusCode::SERVICE_UNAVAILABLE, "too many tunnels")),
         };
 
-        let host = server.host().trim_start_matches('[').trim_end_matches(']');
-        let port = server.port_u16().unwrap_or(80);
-
-        let mut stream = match tokio::time::timeout(timeout, TcpStream::connect((host, port))).await
-        {
-            Ok(Ok(stream)) => stream,
-            _ => return Err(text(StatusCode::BAD_GATEWAY, "bad gateway")),
+        let mut stream = match connect_server(&server, timeout).await {
+            Some(stream) => stream,
+            None => return Err(text(StatusCode::BAD_GATEWAY, "bad gateway")),
         };
 
         let head = serialize_head(&upstream);
@@ -1382,10 +1418,13 @@ fn serialize_head(req: &Request<Body>) -> String {
     out
 }
 
-async fn read_head(
-    stream: &mut TcpStream,
+async fn read_head<S>(
+    stream: &mut S,
     timeout: Duration,
-) -> Result<(StatusCode, HeaderMap, Option<HeaderValue>, Vec<u8>), Response<Body>> {
+) -> Result<(StatusCode, HeaderMap, Option<HeaderValue>, Vec<u8>), Response<Body>>
+where
+    S: AsyncRead + Unpin,
+{
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];
 
@@ -1454,21 +1493,44 @@ async fn read_head(
 /// One health probe: a plain HTTP/1.1 GET with `Connection: close`.
 /// Anything 2xx or 3xx counts as up.
 async fn probe(
-    server: &Authority,
+    server: &ServerAddr,
     path: &str,
     timeout: Duration,
     tls: bool,
     options: &TlsOptions,
 ) -> bool {
-    let host = server.host().trim_start_matches('[').trim_end_matches(']');
-    let port = server.port_u16().unwrap_or(if tls { 443 } else { 80 });
+    if let Some(socket) = server.unix() {
+        let mut stream = match tokio::time::timeout(timeout, UnixStream::connect(socket)).await {
+            Ok(Ok(stream)) => stream,
+            _ => return false,
+        };
+        let request =
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        if tokio::time::timeout(timeout, stream.write_all(request.as_bytes()))
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        return probe_response(&mut stream, timeout).await;
+    }
+
+    let authority = match server.tcp() {
+        Some(authority) => authority,
+        None => return false,
+    };
+    let host = authority
+        .host()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    let port = authority.port_u16().unwrap_or(if tls { 443 } else { 80 });
 
     let stream = match tokio::time::timeout(timeout, TcpStream::connect((host, port))).await {
         Ok(Ok(stream)) => stream,
         _ => return false,
     };
 
-    let request = format!("GET {path} HTTP/1.1\r\nHost: {server}\r\nConnection: close\r\n\r\n");
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
     if tls {
         let config = match elira_upstream::client_config(options) {
             Ok(config) => config,
@@ -1658,10 +1720,15 @@ fn cache_response(entry: elira_cache::Entry) -> Response<Body> {
         .unwrap_or_else(|_| text(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"))
 }
 
-fn upstream_uri(server: &Authority, path: &str, scheme: &'static str) -> Option<Uri> {
+fn upstream_uri(server: &ServerAddr, path: &str, scheme: &'static str) -> Option<Uri> {
+    let (scheme, authority) = match server {
+        ServerAddr::Tcp(authority) => (scheme, authority.as_str()),
+        // TLS over a unix socket is rejected by config validation.
+        ServerAddr::Unix(_) => ("http", "localhost"),
+    };
     Uri::builder()
         .scheme(scheme)
-        .authority(server.as_str())
+        .authority(authority)
         .path_and_query(path)
         .build()
         .ok()
@@ -1824,6 +1891,114 @@ pub enum Error {
 
     #[error("route for \"{host}\": {reason}")]
     RouteConfig { host: String, reason: String },
+}
+
+/// Transport used by the raw upgrade path. Both variants behave the same for
+/// the handshake and the tunnel.
+enum EitherStream {
+    Tcp(TcpStream),
+    Unix(UnixStream),
+}
+
+impl AsyncRead for EitherStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(stream) => Pin::new(stream).poll_read(cx, buf),
+            Self::Unix(stream) => Pin::new(stream).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for EitherStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Tcp(stream) => Pin::new(stream).poll_write(cx, buf),
+            Self::Unix(stream) => Pin::new(stream).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(stream) => Pin::new(stream).poll_flush(cx),
+            Self::Unix(stream) => Pin::new(stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(stream) => Pin::new(stream).poll_shutdown(cx),
+            Self::Unix(stream) => Pin::new(stream).poll_shutdown(cx),
+        }
+    }
+}
+
+async fn connect_server(server: &ServerAddr, timeout: Duration) -> Option<EitherStream> {
+    match server {
+        ServerAddr::Tcp(authority) => {
+            let host = authority
+                .host()
+                .trim_start_matches('[')
+                .trim_end_matches(']');
+            let port = authority.port_u16().unwrap_or(80);
+            match tokio::time::timeout(timeout, TcpStream::connect((host, port))).await {
+                Ok(Ok(stream)) => Some(EitherStream::Tcp(stream)),
+                _ => None,
+            }
+        }
+        ServerAddr::Unix(path) => {
+            match tokio::time::timeout(timeout, UnixStream::connect(path)).await {
+                Ok(Ok(stream)) => Some(EitherStream::Unix(stream)),
+                _ => None,
+            }
+        }
+    }
+}
+
+enum SendError {
+    Timeout,
+    Failed(String),
+}
+
+async fn send_request(
+    pool: &Pool,
+    server: &ServerAddr,
+    request: Request<Body>,
+    timeout: Duration,
+) -> Result<Response<Body>, SendError> {
+    let Some(path) = server.unix() else {
+        return match tokio::time::timeout(timeout, pool.client.request(request)).await {
+            Ok(Ok(response)) => Ok(response
+                .map(|body| BodyExt::map_err(body, |err| -> BoxError { Box::new(err) }).boxed())),
+            Ok(Err(err)) => Err(SendError::Failed(err.to_string())),
+            Err(_) => Err(SendError::Timeout),
+        };
+    };
+
+    let work = async {
+        let stream = UnixStream::connect(path).await?;
+        let (mut sender, connection) =
+            hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let response = sender.send_request(request).await?;
+        Ok::<_, BoxError>(response)
+    };
+
+    match tokio::time::timeout(timeout, work).await {
+        Ok(Ok(response)) => Ok(response
+            .map(|body| BodyExt::map_err(body, |err| -> BoxError { Box::new(err) }).boxed())),
+        Ok(Err(err)) => Err(SendError::Failed(err.to_string())),
+        Err(_) => Err(SendError::Timeout),
+    }
 }
 
 /// A body that fails when it makes no progress for `idle`. Used for both
@@ -2008,8 +2183,8 @@ mod tests {
         let pool = Pool {
             name: "test".to_owned(),
             servers: vec![
-                "127.0.0.1:1".parse().unwrap(),
-                "127.0.0.1:2".parse().unwrap(),
+                ServerAddr::Tcp("127.0.0.1:1".parse().unwrap()),
+                ServerAddr::Tcp("127.0.0.1:2".parse().unwrap()),
             ],
             health: vec![AtomicBool::new(true), AtomicBool::new(true)],
             active: vec![AtomicUsize::new(0), AtomicUsize::new(5)],
