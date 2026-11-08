@@ -128,6 +128,7 @@ remove_headers = ["X-Powered-By"]
 - body progress timeouts, tunnel idle timeouts, and buffered small responses
 - SIGUSR2 handoff that waits for the replacement to bind before draining
 - `elira migrate` for a subset of nginx configuration
+- unix sockets on both sides: `listen_unix` and `unix:/path` upstreams
 - `try_files` and generated directory listings (`autoindex`)
 - TLS to upstreams, with a custom CA or an explicit insecure mode
 - ACME (Let's Encrypt, TLS-ALPN-01) instead of a static `[tls]` block

@@ -1869,3 +1869,60 @@ upstream = "app"
     assert_eq!(status(&response), "HTTP/1.1 200 OK");
     assert!(response.ends_with("unix!"), "{response}");
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unix_listener_serves_http() {
+    use tokio::net::{UnixListener, UnixStream};
+
+    let dir = temp_root("unix-listen");
+    let path = dir.join("elira.sock");
+    let listener = UnixListener::bind(&path).expect("bind unix listener");
+
+    let cfg = Config::parse(&format!(
+        r#"
+listen = "127.0.0.1:0"
+listen_unix = "{}"
+
+[[routes]]
+host = "*"
+root = "{}"
+"#,
+        path.display(),
+        dir.display()
+    ))
+    .expect("config");
+    std::fs::write(dir.join("index.html"), "via unix").unwrap();
+
+    let runtime = Arc::new(ArcSwap::from_pointee(
+        Runtime::build(&cfg).expect("runtime"),
+    ));
+    let metrics = Arc::new(Metrics::new());
+    let (stop_tx, stop_rx) = watch::channel(false);
+    tokio::spawn(server::serve_unix(
+        listener,
+        runtime,
+        Options::from_config(&cfg),
+        metrics,
+        stop_rx,
+    ));
+
+    let mut stream = UnixStream::connect(&path).await.expect("connect unix");
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("write");
+    let mut response = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        match tokio::time::timeout(Duration::from_secs(3), stream.read(&mut chunk)).await {
+            Ok(Ok(0)) | Err(_) => break,
+            Ok(Ok(read)) => response.extend_from_slice(&chunk[..read]),
+            Ok(Err(_)) => break,
+        }
+    }
+    let response = String::from_utf8_lossy(&response).to_string();
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.ends_with("via unix"), "{response}");
+    let _ = stop_tx.send(true);
+}

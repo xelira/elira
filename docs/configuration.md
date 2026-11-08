@@ -35,6 +35,11 @@ elira migrate --output elira.toml nginx.conf
 пишется ошибка, а старый конфиг продолжает работать. Что применяется сразу, а что
 требует рестарта, разобрано в разделе «Ограничения и поведение».
 
+`listen_unix` поднимает второй слушатель на файловом сокете. TLS, PROXY
+protocol и `sendfile` на нём не применяются; peer для логов и ACL —
+`127.0.0.1`. Сокет не удаляется при старте: существующий файл означает
+ошибку, а не молчаливую замену чужого сокета.
+
 Адреса везде имеют вид `IP:порт` (тип `SocketAddr` в TOML-строке), поэтому
 `localhost:8080` не подходит — нужен `127.0.0.1:8080` или `[::1]:8080`.
 Исключение — `servers` у upstream'ов и `allow` у `connect`: там допустимы
@@ -45,6 +50,7 @@ elira migrate --output elira.toml nginx.conf
 | Поле | Тип | По умолчанию | Что делает |
 | --- | --- | --- | --- |
 | `listen` | `IP:порт` | нет, обязательно | TCP-адрес основного HTTP-листенера |
+| `listen_unix` | путь | нет | дополнительный HTTP/1.1 на unix-сокете |
 | `proxy_protocol` | bool | `false` | ждать PROXY protocol (v1/v2) на каждом соединении |
 | `reuse_port` | bool | `false` | SO_REUSEPORT; нужен для hot restart по SIGUSR2 |
 | `sendfile` | bool | `true` | zero-copy статика на Linux через `sendfile(2)` |

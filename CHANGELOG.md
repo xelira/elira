@@ -46,7 +46,7 @@
 - Свои `sni`, `health_path`, `tls_insecure`, `tls_ca` и `http2` у upstream'а;
   health-проба для TLS-бэкенда делает настоящее рукопожатие.
 - Unix-сокеты как адреса upstream'ов (`unix:/run/app.sock`), включая
-  upgrade, health-пробу и `CONNECT`-независимую передачу тела.
+  upgrade и health-пробу, и дополнительный HTTP/1.1-листенер `listen_unix`.
 - HTTP/2 до upstream'а по `[upstream_tls] http2 = true`.
 - Prometheus-метрики на отдельном листенере: запросы по классам статусов,
   гистограмма задержки, число соединений в работе и состояние upstream'ов.

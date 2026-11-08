@@ -67,6 +67,15 @@ UDP (QUIC)
 `SIGUSR2`-рестарт. HTTP/3 bind выполняется в отдельной задаче и может
 завершиться уже после записи файла; при занятом порту он повторяется.
 
+## Unix-листенер
+
+`listen_unix` поднимает отдельный `server::serve_unix`: `UnixListener`
+принимает только открытый HTTP/1.1, TLS и PROXY protocol не применяются,
+peer для логов и ACL — `127.0.0.1`. Каждое соединение проходит тот же
+`serve_conn`, поэтому маршруты, кэш, auth и лимиты работают одинаково.
+Семафор `max_connections` у листенера свой. Файл сокета при старте не
+удаляется.
+
 ## PROXY protocol
 
 `server::serve_stream` вызывает `proxy_protocol::read_peer` до TLS, до ACME и

@@ -15,6 +15,10 @@ use thiserror::Error;
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub listen: SocketAddr,
+
+    /// Optional HTTP/1.1 listener on a unix socket. TLS is not applied here.
+    #[serde(default)]
+    pub listen_unix: Option<PathBuf>,
     #[serde(default)]
     pub limits: Limits,
     /// Send our `Server: elira` header and keep the upstream one.
@@ -654,6 +658,11 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), Error> {
+        if let Some(path) = &self.listen_unix {
+            if path.as_os_str().is_empty() {
+                return Err(Error::EmptyUnixListen);
+            }
+        }
         if self.limits.max_header_bytes < 8192 {
             return Err(Error::MaxHeaderBytesTooSmall);
         }
@@ -1038,6 +1047,9 @@ pub enum Error {
 
     #[error("no routes configured")]
     NoRoutes,
+
+    #[error("listen_unix must not be empty")]
+    EmptyUnixListen,
 
     #[error("limits.max_header_bytes must be at least 8192, hyper refuses smaller buffers")]
     MaxHeaderBytesTooSmall,

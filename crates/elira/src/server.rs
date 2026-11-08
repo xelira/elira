@@ -15,7 +15,7 @@ use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UnixListener};
 use tokio::sync::{watch, Semaphore};
 use tokio_rustls::TlsAcceptor;
 
@@ -259,6 +259,56 @@ pub async fn serve(
         tracing::warn!("some connections did not finish in time");
     }
 
+    Ok(())
+}
+
+/// Bind a unix listener. An existing path is not removed: silently replacing
+/// another process's socket would be worse than refusing to start.
+pub fn bind_unix(path: &std::path::Path) -> std::io::Result<UnixListener> {
+    UnixListener::bind(path)
+}
+
+/// Accept plain HTTP/1.1 on a unix socket. There is no TLS and no PROXY
+/// protocol; the peer address is localhost for logs and ACLs.
+pub async fn serve_unix(
+    listener: UnixListener,
+    runtime: Arc<ArcSwap<Runtime>>,
+    options: Options,
+    metrics: Arc<Metrics>,
+    stop: watch::Receiver<bool>,
+) -> std::io::Result<()> {
+    let permits = Arc::new(Semaphore::new(options.max_connections));
+    let mut stop = stop;
+    let mut connections = tokio::task::JoinSet::new();
+
+    loop {
+        tokio::select! {
+            _ = stop.changed() => break,
+            accepted = listener.accept() => {
+                let Ok((stream, _)) = accepted else { continue };
+                let Ok(permit) = permits.clone().try_acquire_owned() else {
+                    continue;
+                };
+                let runtime = runtime.clone();
+                let metrics = metrics.clone();
+                let mut stop = stop.clone();
+                let conn = ConnOptions {
+                    max_headers: options.max_headers,
+                    max_buf_size: options.max_buf_size,
+                    idle_timeout: options.idle_timeout,
+                    body_timeout: options.body_timeout,
+                    h2: false,
+                    secure: false,
+                };
+                connections.spawn(async move {
+                    let _permit = permit;
+                    serve_conn(stream, "127.0.0.1:0".parse().expect("loopback"), runtime, conn, metrics, &mut stop).await;
+                });
+            }
+        }
+    }
+
+    while connections.join_next().await.is_some() {}
     Ok(())
 }
 

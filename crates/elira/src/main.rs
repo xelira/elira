@@ -148,6 +148,22 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
     );
     let mut stop_wait = stop_rx.clone();
 
+    let unix_serving = match &cfg.listen_unix {
+        Some(path) => {
+            let listener = server::bind_unix(path)
+                .with_context(|| format!("cannot bind unix socket {}", path.display()))?;
+            tracing::info!(path = %path.display(), "listening on a unix socket");
+            Some(tokio::spawn(server::serve_unix(
+                listener,
+                runtime.clone(),
+                options.clone(),
+                metrics.clone(),
+                stop_rx.clone(),
+            )))
+        }
+        None => None,
+    };
+
     let serving = tokio::spawn(server::serve(
         listener,
         runtime.clone(),
@@ -214,6 +230,14 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
         .is_err()
     {
         tracing::warn!("server did not stop in time");
+    }
+    if let Some(task) = unix_serving {
+        if tokio::time::timeout(Duration::from_secs(15), task)
+            .await
+            .is_err()
+        {
+            tracing::warn!("unix listener did not stop in time");
+        }
     }
 
     // The listener got the stop signal and closed its endpoint on its own;
