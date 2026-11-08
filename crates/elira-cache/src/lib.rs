@@ -461,6 +461,32 @@ impl Cache {
         store.total_bytes = 0;
     }
 
+    /// Removes every entry whose host and path key starts with `prefix`, along
+    /// with all of its `Vary` variants and their disk bodies.
+    ///
+    /// An empty prefix removes everything, which is equivalent to [`purge`].
+    /// Returns the number of removed variants, not the number of keys.
+    ///
+    /// [`purge`]: Cache::purge
+    pub fn purge_prefix(&self, prefix: &str) -> usize {
+        let mut store = self.lock();
+        let mut removed = 0;
+        let mut freed = 0;
+        store.entries.retain(|key, records| {
+            if !key.starts_with(prefix) {
+                return true;
+            }
+            removed += records.len();
+            for record in records.iter() {
+                record.drop_body();
+                freed += record.size;
+            }
+            false
+        });
+        store.total_bytes = store.total_bytes.saturating_sub(freed);
+        removed
+    }
+
     /// Total body bytes and entry count currently held. Both are zero when the
     /// cache is disabled.
     pub fn stats(&self) -> (usize, usize) {
@@ -1364,6 +1390,148 @@ mod tests {
         assert_eq!(cache.stats(), (0, 0));
         assert!(cache.get("a", &request, t0).is_none());
         assert!(cache.get("b", &request, t0).is_none());
+    }
+
+    #[test]
+    fn purge_prefix_removes_matching_keys_only() {
+        let cache = Cache::new(1024, Duration::from_secs(60));
+        let t0 = Instant::now();
+        let request = HeaderMap::new();
+        let response = response(Some("max-age=60"));
+
+        assert!(store(
+            &cache,
+            "example.com/api/one",
+            &request,
+            &response,
+            b"one",
+            t0
+        ));
+        assert!(store(
+            &cache,
+            "example.com/api/two",
+            &request,
+            &response,
+            b"two",
+            t0
+        ));
+        assert!(store(
+            &cache,
+            "example.com/static/logo",
+            &request,
+            &response,
+            b"png",
+            t0
+        ));
+
+        assert_eq!(cache.purge_prefix("example.com/api/"), 2);
+        assert_eq!(cache.stats(), (3, 1));
+        assert!(cache.get("example.com/api/one", &request, t0).is_none());
+        assert!(cache.get("example.com/api/two", &request, t0).is_none());
+        assert!(cache.get("example.com/static/logo", &request, t0).is_some());
+    }
+
+    #[test]
+    fn purge_prefix_counts_every_variant() {
+        let cache = Cache::new(1024, Duration::from_secs(60));
+        let now = Instant::now();
+
+        let request = |language: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("accept-language", language.parse().unwrap());
+            headers
+        };
+        let response = {
+            let mut headers = HeaderMap::new();
+            headers.insert("vary", "accept-language".parse().unwrap());
+            headers
+        };
+
+        for (key, language, body) in [
+            ("example.com/api/", "en", b"hello".as_slice()),
+            ("example.com/api/", "de", b"hallo".as_slice()),
+            ("example.com/api/item", "en", b"item".as_slice()),
+            ("example.com/other", "en", b"other".as_slice()),
+        ] {
+            assert!(cache.insert(key, &request(language), &response, 200, body.to_vec(), now));
+        }
+        assert_eq!(cache.stats(), (5 + 5 + 4 + 5, 4));
+
+        // Three variants live under the two matching keys; the key outside the
+        // prefix stays.
+        assert_eq!(cache.purge_prefix("example.com/api/"), 3);
+        assert_eq!(cache.stats(), (5, 1));
+        assert!(cache.get("example.com/api/", &request("en"), now).is_none());
+        assert!(cache.get("example.com/api/", &request("de"), now).is_none());
+        assert!(cache
+            .get("example.com/api/item", &request("en"), now)
+            .is_none());
+        assert!(cache
+            .get("example.com/other", &request("en"), now)
+            .is_some());
+    }
+
+    #[test]
+    fn purge_prefix_removes_disk_bodies() {
+        let dir = temp_dir("prefix");
+        let cache = Cache::with_disk(
+            1024,
+            Duration::from_secs(60),
+            Some(dir.clone()),
+            Duration::ZERO,
+        );
+        let request = HeaderMap::new();
+        let response = HeaderMap::new();
+        let now = Instant::now();
+
+        assert!(cache.insert(
+            "example.com/drop",
+            &request,
+            &response,
+            200,
+            b"drop".to_vec(),
+            now
+        ));
+        assert!(cache.insert(
+            "example.com/keep",
+            &request,
+            &response,
+            200,
+            b"keep".to_vec(),
+            now
+        ));
+        assert_eq!(fs::read_dir(&dir).expect("dir").count(), 2);
+
+        assert_eq!(cache.purge_prefix("example.com/drop"), 1);
+        assert_eq!(cache.stats(), (4, 1));
+        assert_eq!(
+            fs::read_dir(&dir).expect("dir").count(),
+            1,
+            "only the surviving body should remain on disk"
+        );
+        assert!(cache.get("example.com/drop", &request, now).is_none());
+        assert!(cache.get("example.com/keep", &request, now).is_some());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_prefix_purges_everything() {
+        let cache = Cache::new(1024, Duration::from_secs(60));
+        let t0 = Instant::now();
+        let request = HeaderMap::new();
+        let response = response(Some("max-age=60"));
+
+        assert!(store(&cache, "a", &request, &response, b"one", t0));
+        assert!(store(&cache, "b", &request, &response, b"two", t0));
+        assert!(store(&cache, "c", &request, &response, b"sixsix", t0));
+        assert_eq!(cache.stats(), (12, 3));
+
+        assert_eq!(cache.purge_prefix(""), 3);
+        assert_eq!(cache.stats(), (0, 0));
+        assert!(cache.get("a", &request, t0).is_none());
+        assert!(cache.get("b", &request, t0).is_none());
+        assert!(cache.get("c", &request, t0).is_none());
     }
 
     #[test]

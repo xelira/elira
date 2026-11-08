@@ -96,6 +96,7 @@
 - `ocsp_hook` с периодическим обновлением OCSP-файла и reload.
 - `module_sandbox`: изоляция `.so` в дочернем процессе через JSON-протокол.
 - `POST /reload` и `/drain` на агрегированном админ-листенере воркеров.
+- `POST /cache/purge?prefix=` и prefix-инвалидация кэша во всех воркерах.
 - `dns_cleanup_hook` для удаления TXT после DNS-01 и OCSP hook в режиме
   воркеров.
 - `elira migrate` переносит `try_files`, `add_header`, `allow`/`deny`,

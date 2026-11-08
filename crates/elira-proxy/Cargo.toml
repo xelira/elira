@@ -18,6 +18,7 @@ elira-limit = { path = "../elira-limit" }
 futures-util = { workspace = true }
 httpdate = { workspace = true }
 ipnet = { workspace = true }
+libc = { workspace = true }
 async-compression = { workspace = true }
 percent-encoding = { workspace = true }
 regex = { workspace = true }

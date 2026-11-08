@@ -185,6 +185,10 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
             index.parse().unwrap_or(0),
         );
     }
+    if let Ok(path) = std::env::var("ELIRA_CONTROL_SOCKET") {
+        spawn_control_socket(PathBuf::from(path), runtime.clone());
+    }
+
     let (stop_tx, stop_rx) = watch::channel(false);
     let (reload_tx, mut reload_rx) = watch::channel(0u64);
     let (restart_tx, mut restart_rx) = watch::channel(0u64);
@@ -516,6 +520,7 @@ async fn reload(
 struct WorkerSlot {
     pid: u32,
     ready: PathBuf,
+    control: PathBuf,
 }
 
 type StatusMap = Arc<std::sync::Mutex<std::collections::HashMap<usize, String>>>;
@@ -627,6 +632,21 @@ async fn supervise(config: PathBuf, workers: usize) -> anyhow::Result<()> {
                     }
                     tracing::info!("admin reload sent SIGHUP to every worker");
                 }
+                server::AdminCommand::Purge(prefix) => {
+                    let socket = tokio::net::UnixDatagram::unbound();
+                    if let Ok(socket) = socket {
+                        let message = serde_json::json!({ "purge": prefix }).to_string();
+                        for slot in &slots {
+                            if socket
+                                .send_to(message.as_bytes(), &slot.control)
+                                .await
+                                .is_err()
+                            {
+                                tracing::warn!(worker = slot.pid, "cache purge was not delivered");
+                            }
+                        }
+                    }
+                }
             },
             _ = sighup.recv() => {
                 for slot in &slots {
@@ -698,6 +718,10 @@ async fn supervise(config: PathBuf, workers: usize) -> anyhow::Result<()> {
         let _ = std::fs::remove_file(path);
     }
 
+    for slot in &slots {
+        let _ = std::fs::remove_file(&slot.control);
+    }
+
     tracing::info!("stopping workers");
     for slot in &slots {
         kill(slot.pid, libc::SIGTERM);
@@ -719,6 +743,30 @@ async fn supervise(config: PathBuf, workers: usize) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn spawn_control_socket(path: PathBuf, runtime: Arc<ArcSwap<Runtime>>) {
+    tokio::spawn(async move {
+        let _ = std::fs::remove_file(&path);
+        let Ok(socket) = tokio::net::UnixDatagram::bind(&path) else {
+            tracing::warn!(path = %path.display(), "cannot bind the control socket");
+            return;
+        };
+        let mut buffer = [0u8; 4096];
+        loop {
+            let Ok(read) = socket.recv(&mut buffer).await else {
+                break;
+            };
+            let Ok(value) = serde_json::from_slice::<serde_json::Value>(&buffer[..read]) else {
+                continue;
+            };
+            if let Some(prefix) = value.get("purge").and_then(|value| value.as_str()) {
+                let removed = runtime.load().proxy().purge_cache_prefix(prefix);
+                tracing::info!(removed, "purged the cache prefix");
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    });
 }
 
 fn spawn_metrics_sender(
@@ -823,13 +871,17 @@ fn remove_worker_gauges(aggregate: &Metrics, gauges: &WorkerGauges, index: usize
 
 fn spawn_worker(index: usize, config: &Path) -> anyhow::Result<WorkerSlot> {
     let exe = std::env::current_exe().context("cannot find the executable")?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|delta| delta.as_nanos())
+        .unwrap_or(0);
     let ready = std::env::temp_dir().join(format!(
-        "elira-worker-{}-{index}-{}.ready",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|delta| delta.as_nanos())
-            .unwrap_or(0)
+        "elira-worker-{}-{index}-{stamp}.ready",
+        std::process::id()
+    ));
+    let control = std::env::temp_dir().join(format!(
+        "elira-control-{}-{index}-{stamp}.sock",
+        std::process::id()
     ));
 
     let child = tokio::process::Command::new(exe)
@@ -837,6 +889,7 @@ fn spawn_worker(index: usize, config: &Path) -> anyhow::Result<WorkerSlot> {
         .arg(config)
         .env("ELIRA_WORKER", "1")
         .env("ELIRA_WORKER_INDEX", index.to_string())
+        .env("ELIRA_CONTROL_SOCKET", &control)
         .env("ELIRA_READY_FILE", &ready)
         .spawn()
         .with_context(|| format!("cannot start worker {index}"))?;
@@ -844,6 +897,7 @@ fn spawn_worker(index: usize, config: &Path) -> anyhow::Result<WorkerSlot> {
     Ok(WorkerSlot {
         pid: child.id().context("worker has no pid")?,
         ready,
+        control,
     })
 }
 

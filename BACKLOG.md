@@ -22,12 +22,14 @@ Living list for the self-improvement loop. One item per session.
 
 ## A — security and operations
 
-- [ ] Reject module files owned by a user other than the server user when
+- [x] Reject module files owned by a user other than the server user when
   sandboxing is off.
 - [x] Per-route `max_response_bytes`.
-- [ ] Per-route FastCGI pool size.
+- [x] Per-route FastCGI pool size.
+- [ ] Purge tests through the admin listener in both single and worker mode.
 - [ ] Configurable FastCGI pool size per upstream instead of a global limit.
 - [ ] `/status` per-worker snapshots instead of the last worker's snapshot.
+- [x] Wire prefix cache purge into the admin API and per-worker broadcast.
 
 ## B — performance and compatibility
 
@@ -37,6 +39,7 @@ Living list for the self-improvement loop. One item per session.
 - [ ] Upstream HTTP/2 connection pool metrics.
 - [ ] `cache.purge` by host/path prefix through the admin API.
 - [x] Expand parser fuzz targets.
+- [x] Cache prefix invalidation API.
 
 ## C — large projects
 

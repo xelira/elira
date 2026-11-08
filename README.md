@@ -284,7 +284,7 @@ The listener has no TLS. Put it on loopback or set `auth_file`.
   worker; SIGUSR2 rolls the workers one by one. Increasing `workers` on SIGHUP
   adds processes, decreasing needs a restart. In worker mode `/metrics` and
   `/status` are aggregated by the supervisor; `POST /reload` and `/drain` are
-  handled there, while `/cache/purge` is not.
+  handled there; `/cache/purge?prefix=` is broadcast to workers.
 - DNS resolution uses the system resolver. `dns_ttl_secs` bounds how long a
   pooled connection may outlive a DNS change.
 

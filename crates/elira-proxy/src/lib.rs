@@ -136,6 +136,7 @@ struct RouteEntry {
     error_pages: Vec<(StatusCode, String, Arc<Files>)>,
     app_permits: Option<Arc<Semaphore>>,
     max_response: Option<usize>,
+    fastcgi_pool: Option<Arc<elira_fastcgi::Pool>>,
 }
 
 struct Router {
@@ -329,6 +330,14 @@ impl Proxy {
         }
     }
 
+    /// Drop cached responses whose host+path starts with `prefix`.
+    pub fn purge_cache_prefix(&self, prefix: &str) -> usize {
+        match &self.inner.cache {
+            Some(cache) => cache.purge_prefix(prefix),
+            None => 0,
+        }
+    }
+
     pub fn cache_stats(&self) -> Option<(usize, usize)> {
         self.inner.cache.as_ref().map(|cache| cache.stats())
     }
@@ -479,6 +488,17 @@ impl Proxy {
                             reason: format!("module {} is world-writable", path.display()),
                         });
                     }
+                    let owner = std::os::unix::fs::MetadataExt::uid(&meta);
+                    let server = unsafe { libc::geteuid() };
+                    if !route.module_sandbox && !module_owner_allowed(owner, server) {
+                        return Err(Error::RouteConfig {
+                            host: route.host.clone(),
+                            reason: format!(
+                                "module {} is owned by uid {owner}, not root or the server user",
+                                path.display()
+                            ),
+                        });
+                    }
                 }
                 if route.module_sandbox {
                     let runner = std::env::var_os("ELIRA_MODULE_RUNNER")
@@ -615,6 +635,12 @@ impl Proxy {
                 error_pages,
                 app_permits,
                 max_response: route.max_response_bytes,
+                fastcgi_pool: route.fastcgi_pool_idle.map(|idle| {
+                    Arc::new(elira_fastcgi::Pool::new(
+                        idle,
+                        Duration::from_secs(cfg.limits.fastcgi_pool_idle_secs),
+                    ))
+                }),
             };
 
             let host = route.host.trim().to_ascii_lowercase();
@@ -1678,9 +1704,11 @@ impl Proxy {
         let request_body = limit_body(request_body, limit).boxed();
         let timeout = entry.timeout.unwrap_or(self.inner.timeout);
 
-        let response = match self
-            .inner
+        let fastcgi_pool = entry
             .fastcgi_pool
+            .as_deref()
+            .unwrap_or(&self.inner.fastcgi_pool);
+        let response = match fastcgi_pool
             .execute_stream(
                 target,
                 params,
@@ -2755,6 +2783,10 @@ async fn send_request(
     }
 }
 
+fn module_owner_allowed(owner: u32, server: u32) -> bool {
+    owner == 0 || owner == server
+}
+
 fn validators_from_entry(entry: &elira_cache::Entry) -> HeaderMap {
     let mut validators = HeaderMap::new();
     for (name, value) in &entry.headers {
@@ -3076,6 +3108,13 @@ mod tests {
         assert_eq!(pool.pick(), 0);
         pool.active[0].store(10, Ordering::Relaxed);
         assert_eq!(pool.pick(), 1);
+    }
+
+    #[test]
+    fn module_owner_must_be_root_or_the_server_user() {
+        assert!(super::module_owner_allowed(0, 1000));
+        assert!(super::module_owner_allowed(1000, 1000));
+        assert!(!super::module_owner_allowed(1001, 1000));
     }
 
     #[test]

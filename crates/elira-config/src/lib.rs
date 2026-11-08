@@ -553,6 +553,10 @@ pub struct Route {
     #[serde(default)]
     pub max_response_bytes: Option<usize>,
 
+    /// Idle FastCGI connections kept for this route's backend.
+    #[serde(default)]
+    pub fastcgi_pool_idle: Option<usize>,
+
     /// Error pages as `STATUS /path.html`, served from `error_root` or `root`.
     #[serde(default)]
     pub error_pages: Vec<String>,
@@ -1277,6 +1281,10 @@ impl Config {
                 return Err(Error::RouteHasTwoTargets { index });
             }
 
+            if route.fastcgi_pool_idle.is_some() && route.fastcgi_pass.is_none() {
+                return Err(Error::PoolWithoutFastCgi { index });
+            }
+
             if let Some(target) = &route.fastcgi_pass {
                 if target.trim().is_empty() {
                     return Err(Error::EmptyFastCgiTarget { index });
@@ -1678,6 +1686,9 @@ pub enum Error {
 
     #[error("route {index}: max_response_bytes must be greater than zero")]
     BadResponseCap { index: usize },
+
+    #[error("route {index}: fastcgi_pool_idle is only valid on fastcgi routes")]
+    PoolWithoutFastCgi { index: usize },
 
     #[error("route {index}: `autoindex` needs a root")]
     AutoindexWithoutRoot { index: usize },
@@ -2853,6 +2864,26 @@ max_response_bytes = 1024
         assert!(matches!(
             Config::parse(&zero),
             Err(Error::BadResponseCap { .. })
+        ));
+    }
+
+    #[test]
+    fn per_route_fastcgi_pool_only_applies_to_fastcgi() {
+        let base = r#"
+listen = "127.0.0.1:8080"
+[[routes]]
+host = "*"
+fastcgi_pass = "127.0.0.1:9000"
+fastcgi_root = "/srv"
+fastcgi_pool_idle = 4
+"#;
+        let cfg = Config::parse(base).expect("valid");
+        assert_eq!(cfg.routes[0].fastcgi_pool_idle, Some(4));
+
+        let wrong = base.replace("fastcgi_pass = \"127.0.0.1:9000\"", "root = \"/srv\"");
+        assert!(matches!(
+            Config::parse(&wrong),
+            Err(Error::PoolWithoutFastCgi { .. }) | Err(Error::RouteHasTwoTargets { .. })
         ));
     }
 }

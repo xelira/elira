@@ -708,10 +708,11 @@ pub fn spawn_http01(
 }
 
 /// Commands accepted by the supervisor's admin listener.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum AdminCommand {
     Reload,
     Drain,
+    Purge(String),
 }
 
 /// Aggregate metrics and status reported by worker processes.
@@ -771,6 +772,11 @@ pub fn spawn_metrics_aggregate(
                             (&hyper::Method::POST, "/drain") => {
                                 let _ = control.try_send(AdminCommand::Drain);
                                 json(hyper::StatusCode::ACCEPTED, "{\"drain\":\"started\"}")
+                            }
+                            (&hyper::Method::POST, "/cache/purge") => {
+                                let prefix = query_prefix(req.uri().query()).unwrap_or_default();
+                                let _ = control.try_send(AdminCommand::Purge(prefix));
+                                json(hyper::StatusCode::ACCEPTED, "{\"purge\":\"queued\"}")
                             }
                             (&hyper::Method::GET, "/status") => {
                                 let statuses = statuses
@@ -885,7 +891,12 @@ pub fn spawn_metrics(
                                         json(hyper::StatusCode::ACCEPTED, "{\"drain\":\"started\"}")
                                     }
                                     (&hyper::Method::POST, "/cache/purge") => {
-                                        let purged = runtime.load().proxy().purge_cache();
+                                        let prefix =
+                                            query_prefix(req.uri().query()).unwrap_or_default();
+                                        let purged = runtime
+                                            .load()
+                                            .proxy()
+                                            .purge_cache_prefix(&prefix);
                                         let body = format!("{{\"purged\":{purged}}}");
                                         json(hyper::StatusCode::OK, &body)
                                     }
@@ -908,6 +919,13 @@ pub fn spawn_metrics(
             }
         }
     });
+}
+
+fn query_prefix(query: Option<&str>) -> Option<String> {
+    query?.split('&').find_map(|pair| {
+        let (name, value) = pair.split_once('=')?;
+        (name == "prefix").then(|| value.to_owned())
+    })
 }
 
 fn text_response(
