@@ -531,7 +531,7 @@ advisory-lock `.elira-cache.lock`, а `max_bytes` считается по все
 | `cgi_pass` | путь | нет | абсолютный путь к CGI-скрипту |
 | `module` | путь | нет | абсолютный путь к `.so`-модулю |
 | `module_sandbox` | bool | `false` | запускать модуль в дочернем процессе |
-| `wasm` | путь | нет | WebAssembly-модуль как цель маршрута |
+| `wasm` | путь | нет | WebAssembly-модуль как цель маршрута (fuel-бюджет на вызов) |
 | `upstream` | строка | нет | имя upstream'а для проксирования |
 | `root` | путь | нет | каталог со статикой |
 | `redirect` | таблица | нет | `{ to, status }`; вместо upstream и root |

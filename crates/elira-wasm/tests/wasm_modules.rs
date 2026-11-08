@@ -455,3 +455,24 @@ fn malformed_wasm_is_a_compile_error() {
     let err = WasmModule::load_bytes(b"not a wasm module").unwrap_err();
     assert!(matches!(err, Error::Compile { .. }), "error was {err}");
 }
+
+#[test]
+fn an_infinite_loop_runs_out_of_fuel() {
+    let wasm = wat::parse_str(
+        r#"
+        (module
+          (memory (export "memory") 1)
+          (func (export "elira_alloc") (param i32) (result i32) i32.const 0)
+          (func (export "elira_handle") (param i32 i32) (result i64)
+            (loop $forever br $forever)
+            i64.const 0))
+        "#,
+    )
+    .expect("wat");
+    let module = elira_wasm::WasmModule::load_bytes(&wasm).expect("load");
+    let error = module
+        .call(&elira_module::Request::default())
+        .expect_err("infinite loop must trap");
+    let text = format!("{error}");
+    assert!(text.contains("fuel") || text.contains("trap"), "{text}");
+}

@@ -66,8 +66,7 @@ Living list for the self-improvement loop. One item per session.
 - [x] Worker socket handoff: not implemented by design; a worker drains on
   SIGTERM and in-flight connections are not transferred.
 
-- [x] WASM module runtime beside the native `.so` ABI. Slices: crate ABI,
-  route integration, example module, docs.
+- [x] WASM module runtime beside the native `.so` ABI, including a fuel budget.
 - [ ] Upstream HTTP/3.
 - [ ] DNS-01 against a real production CA: blocked on an externally managed
   zone for TXT records.

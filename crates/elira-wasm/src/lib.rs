@@ -85,9 +85,9 @@
 //!
 //! A module is still untrusted code: it can consume CPU indefinitely if it
 //! loops inside `elira_handle`, and it can use up to its memory limit. There is
-//! no wall-clock timeout or fuel budget in this crate, so run untrusted modules
-//! on a worker that has a request timeout or isolate them further if CPU
-//! exhaustion matters. A trap, a bad pointer, a malformed response or an
+//! each call has a fixed fuel budget ([`MAX_FUEL`]), so an infinite loop traps;
+//! a wall-clock timeout is still the caller's responsibility for long but
+//! finite modules. A trap, a bad pointer, a malformed response or an
 //! oversized response becomes an [`Error`]; none of them unwind into the host.
 //!
 //! [`WasmModule`] is `Send + Sync`. One loaded instance is serialized behind a
@@ -161,6 +161,10 @@ pub const MAX_MEMORY_BYTES: usize = 256 * 1024 * 1024;
 /// table declaration from reserving a large array.
 pub const MAX_TABLE_ELEMENTS: usize = 1_000_000;
 
+/// Fuel budget for one `elira_handle` call. Enough for normal modules, low
+/// enough that an infinite loop traps instead of pinning a worker thread.
+pub const MAX_FUEL: u64 = 5_000_000;
+
 const MEMORY_EXPORT: &str = "memory";
 const ALLOC_EXPORT: &str = "elira_alloc";
 const HANDLE_EXPORT: &str = "elira_handle";
@@ -208,7 +212,9 @@ impl WasmModule {
             });
         }
 
-        let engine = Engine::new(&Config::default());
+        let mut config = Config::default();
+        config.consume_fuel(true);
+        let engine = Engine::new(&config);
         let module = Module::new(&engine, bytes).map_err(|source| Error::Compile { source })?;
 
         // No imports means no filesystem, network, WASI, clock or host-function
@@ -387,6 +393,13 @@ impl WasmModule {
     pub fn call(&self, request: &Request) -> Result<Response, Error> {
         let request = encode_request(request)?;
         let mut state = self.state.lock().map_err(|_| Error::Poisoned)?;
+        state
+            .store
+            .set_fuel(MAX_FUEL)
+            .map_err(|source| Error::Trap {
+                operation: "set fuel",
+                source,
+            })?;
 
         let req_len = i32::try_from(request.len()).map_err(|_| Error::RequestTooLarge {
             len: request.len(),
