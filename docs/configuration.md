@@ -528,6 +528,7 @@ HTTP/3 живёт на отдельном UDP-порту и не делит со
 | `requests_per_second` | целое > 0 | глобальный лимит | свой token bucket для маршрута |
 | `burst` | целое ≥ 0 | равен rate | глубина bucket'а маршрута |
 | `max_body_bytes` | целое ≥ 0 | глобальный лимит | свой предел `Content-Length` |
+| `max_response_bytes` | целое > 0 | `limits.max_response_bytes` | свой предел потокового ответа |
 | `max_concurrent` | целое > 0 | `16` | одновременные FastCGI/CGI/module запросы |
 | `error_pages` | массив строк | `[]` | `"404 /404.html"` |
 | `error_root` | путь | `root` | каталог для страниц ошибок проксирующего маршрута |

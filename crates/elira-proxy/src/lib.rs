@@ -135,6 +135,7 @@ struct RouteEntry {
     body_limit: Option<usize>,
     error_pages: Vec<(StatusCode, String, Arc<Files>)>,
     app_permits: Option<Arc<Semaphore>>,
+    max_response: Option<usize>,
 }
 
 struct Router {
@@ -613,6 +614,7 @@ impl Proxy {
                 body_limit: route.max_body_bytes,
                 error_pages,
                 app_permits,
+                max_response: route.max_response_bytes,
             };
 
             let host = route.host.trim().to_ascii_lowercase();
@@ -1684,7 +1686,7 @@ impl Proxy {
                 params,
                 request_body,
                 timeout,
-                self.inner.max_app_response,
+                entry.max_response.unwrap_or(self.inner.max_app_response),
             )
             .await
         {
@@ -1811,7 +1813,7 @@ impl Proxy {
                 body: request_body,
                 timeout,
             },
-            self.inner.max_app_response,
+            entry.max_response.unwrap_or(self.inner.max_app_response),
         )
         .await
         {

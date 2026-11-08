@@ -17,15 +17,16 @@ Living list for the self-improvement loop. One item per session.
 
 - [x] OCSP hook when `workers > 1`: run it in the supervisor and SIGHUP workers.
 - [x] DNS-01 cleanup hook: remove the TXT record after validation.
-- [ ] Worker exit during a streaming app response: ensure the client gets a
-  clean error instead of a truncated chunked body.
+- [ ] Worker exit during a streaming app response: document that an incomplete
+  chunked body is the only observable outcome, or move the client socket into
+  the supervisor.
 - [ ] Admin `/drain` in worker mode: parent stops workers in order.
 
 ## A — security and operations
 
 - [ ] Reject module files owned by a user other than the server user when
   sandboxing is off.
-- [ ] Per-route `max_response_bytes`.
+- [x] Per-route `max_response_bytes`.
 - [ ] Per-route FastCGI pool size.
 - [ ] Configurable FastCGI pool size per upstream instead of a global limit.
 - [ ] `/status` per-worker snapshots instead of the last worker's snapshot.
@@ -33,15 +34,18 @@ Living list for the self-improvement loop. One item per session.
 ## B — performance and compatibility
 
 - [ ] QUIC idle timeout and 0-RTT configuration.
+- [ ] Per-route FastCGI pool size.
 - [ ] TLS session ticket and resumption settings.
 - [ ] Upstream HTTP/2 connection pool metrics.
 - [ ] `cache.purge` by host/path prefix through the admin API.
+- [x] Expand parser fuzz targets.
 
 ## C — large projects
 
 - [ ] WASM module runtime beside the native `.so` ABI.
 - [ ] Upstream HTTP/3.
 - [ ] DNS-01 against a real production CA with a controlled zone.
+- [ ] Fuzz the FastCGI/CGI streaming state machines with a scripted peer.
 
 ## Done
 

@@ -549,6 +549,10 @@ pub struct Route {
     #[serde(default)]
     pub max_body_bytes: Option<usize>,
 
+    /// Overrides `limits.max_response_bytes` for streamed app responses.
+    #[serde(default)]
+    pub max_response_bytes: Option<usize>,
+
     /// Error pages as `STATUS /path.html`, served from `error_root` or `root`.
     #[serde(default)]
     pub error_pages: Vec<String>,
@@ -1304,6 +1308,9 @@ impl Config {
             if route.max_concurrent == Some(0) {
                 return Err(Error::BadConcurrency { index });
             }
+            if route.max_response_bytes == Some(0) {
+                return Err(Error::BadResponseCap { index });
+            }
 
             if let Some(path) = &route.path {
                 if !path.starts_with('/') || path.chars().any(char::is_control) {
@@ -1668,6 +1675,9 @@ pub enum Error {
 
     #[error("route {index}: max_concurrent must be greater than zero")]
     BadConcurrency { index: usize },
+
+    #[error("route {index}: max_response_bytes must be greater than zero")]
+    BadResponseCap { index: usize },
 
     #[error("route {index}: `autoindex` needs a root")]
     AutoindexWithoutRoot { index: usize },
@@ -2825,5 +2835,24 @@ root = "/srv/www"
         );
         let cfg = Config::parse(&with_file).expect("valid");
         assert_eq!(cfg.tls.expect("tls").ocsp_refresh_secs, 86400);
+    }
+
+    #[test]
+    fn per_route_response_cap_is_validated() {
+        let text = r#"
+listen = "127.0.0.1:8080"
+[[routes]]
+host = "*"
+cgi_pass = "/srv/cgi/app"
+max_response_bytes = 1024
+"#;
+        let cfg = Config::parse(text).expect("valid");
+        assert_eq!(cfg.routes[0].max_response_bytes, Some(1024));
+
+        let zero = text.replace("max_response_bytes = 1024", "max_response_bytes = 0");
+        assert!(matches!(
+            Config::parse(&zero),
+            Err(Error::BadResponseCap { .. })
+        ));
     }
 }
