@@ -8,25 +8,30 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use async_compression::tokio::bufread::GzipEncoder;
 use bytes::Bytes;
+use futures_util::TryStreamExt;
 use http::header::{
-    HeaderName, HeaderValue, CACHE_CONTROL, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, SERVER,
-    TRANSFER_ENCODING, UPGRADE,
+    HeaderName, HeaderValue, ACCEPT_ENCODING, CACHE_CONTROL, CONNECTION, CONTENT_ENCODING,
+    CONTENT_LENGTH, CONTENT_TYPE, HOST, SERVER, TRANSFER_ENCODING, UPGRADE, VARY,
 };
 use http::uri::Authority;
 use http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
 use http_body_util::combinators::BoxBody;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, StreamBody};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use tokio::io::BufReader;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
+use tokio_util::io::{ReaderStream, StreamReader};
 
-use elira_config::{Config, Health};
+use elira_config::{Compression, Config, Health};
+use elira_limit::RateLimiter;
 
 mod files;
 
@@ -46,6 +51,10 @@ struct Inner {
     client: Client<HttpConnector, Body>,
     tunnels: Arc<Semaphore>,
     connect: Option<Vec<Authority>>,
+    compression: Compression,
+    max_body_bytes: usize,
+    limiter: Option<Arc<RateLimiter>>,
+    trusted_proxies: Vec<ipnet::IpNet>,
     timeout: Duration,
 }
 
@@ -170,6 +179,22 @@ impl Proxy {
         connector.set_nodelay(true);
         connector.enforce_http(true);
 
+        let mut trusted_proxies = Vec::with_capacity(cfg.limits.trusted_proxies.len());
+        for cidr in &cfg.limits.trusted_proxies {
+            if let Ok(net) = cidr.parse::<ipnet::IpNet>() {
+                trusted_proxies.push(net);
+            }
+        }
+
+        let limiter = if cfg.limits.requests_per_second > 0 {
+            Some(Arc::new(RateLimiter::new(
+                cfg.limits.requests_per_second,
+                cfg.limits.burst.max(cfg.limits.requests_per_second),
+            )))
+        } else {
+            None
+        };
+
         let client = Client::builder(TokioExecutor::new())
             .pool_idle_timeout(Some(Duration::from_secs(30)))
             .build(connector);
@@ -181,6 +206,10 @@ impl Proxy {
                 client,
                 tunnels: Arc::new(Semaphore::new(cfg.limits.max_connections)),
                 connect,
+                compression: cfg.compression.clone(),
+                max_body_bytes: cfg.limits.max_body_bytes,
+                limiter,
+                trusted_proxies,
                 timeout: Duration::from_secs(cfg.limits.upstream_timeout_secs),
             }),
         })
@@ -224,9 +253,40 @@ impl Proxy {
         peer: SocketAddr,
         scheme: &'static str,
     ) -> Response<Body> {
+        if let Some(limiter) = &self.inner.limiter {
+            if !limiter.check(peer.ip(), Instant::now()) {
+                let mut response = text(StatusCode::TOO_MANY_REQUESTS, "too many requests");
+                response
+                    .headers_mut()
+                    .insert(http::header::RETRY_AFTER, HeaderValue::from_static("1"));
+                return response;
+            }
+        }
+
         self.forward(req, peer, scheme)
             .await
             .unwrap_or_else(|err| err)
+    }
+
+    /// Only a trusted peer may extend the chain; everyone else starts a new
+    /// one, otherwise a client could pick its own address in the logs.
+    fn forwarded_for(&self, req: &Request<Body>, peer: SocketAddr) -> String {
+        if self
+            .inner
+            .trusted_proxies
+            .iter()
+            .any(|net| net.contains(&peer.ip()))
+        {
+            if let Some(existing) = req
+                .headers()
+                .get("x-forwarded-for")
+                .and_then(|value| value.to_str().ok())
+            {
+                return format!("{existing}, {}", peer.ip());
+            }
+        }
+
+        peer.ip().to_string()
     }
 
     /// CONNECT is only useful when the target is already trusted; anything
@@ -309,6 +369,26 @@ impl Proxy {
                 "only chunked transfer encoding is supported",
             ));
         }
+
+        if self.inner.max_body_bytes > 0 {
+            if let Some(length) = req
+                .headers()
+                .get(CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+            {
+                if length > self.inner.max_body_bytes as u64 {
+                    return Err(text(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "request body too large",
+                    ));
+                }
+            }
+        }
+
+        let accepts_gzip = accepts_gzip(req.headers());
+        let is_head = req.method() == Method::HEAD;
+        let forwarded_for = self.forwarded_for(&req, peer);
 
         let requested_upgrade = wants_upgrade(req.headers());
         let client_upgrade = requested_upgrade
@@ -393,7 +473,7 @@ impl Proxy {
         // Everything below is set by us. A client that sent its own copies
         // had them dropped above.
         headers.insert(HOST, header(&forward_host));
-        headers.insert("x-forwarded-for", header(&peer.ip().to_string()));
+        headers.insert("x-forwarded-for", header(&forwarded_for));
         headers.insert("x-forwarded-proto", HeaderValue::from_static(scheme));
         headers.insert("x-forwarded-host", header(&forward_host));
         headers.insert("via", HeaderValue::from_static("1.1 elira"));
@@ -437,6 +517,27 @@ impl Proxy {
         }
 
         let (parts, body) = response.into_parts();
+
+        let upstream_len = parts
+            .headers
+            .get(CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok());
+        let content_type = parts
+            .headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        let compress = self.inner.compression.enabled
+            && parts.status == StatusCode::OK
+            && !is_head
+            && accepts_gzip
+            && !parts.headers.contains_key(CONTENT_ENCODING)
+            && compressible(content_type)
+            && upstream_len
+                .map(|length| length >= self.inner.compression.min_bytes)
+                .unwrap_or(true);
+
         let drop = connection_tokens(&parts.headers);
         let mut builder = Response::builder().status(parts.status);
         {
@@ -457,6 +558,11 @@ impl Proxy {
             }
             headers.insert(SERVER, HeaderValue::from_static("elira"));
 
+            if compress {
+                headers.insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+                headers.append(VARY, HeaderValue::from_static("accept-encoding"));
+            }
+
             // A 101 without these two headers is a 101 the client cannot
             // act on. They are hop-by-hop, so they were stripped above.
             if parts.status == StatusCode::SWITCHING_PROTOCOLS {
@@ -467,7 +573,8 @@ impl Proxy {
             }
         }
 
-        let body = body.map_err(|err| -> BoxError { Box::new(err) }).boxed();
+        let body = BodyExt::map_err(body, |err| -> BoxError { Box::new(err) }).boxed();
+        let body = if compress { gzip(body) } else { body };
 
         builder
             .body(body)
@@ -707,6 +814,53 @@ fn wants_upgrade(headers: &HeaderMap) -> Option<HeaderValue> {
         .split(',')
         .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
         .then_some(upgrade)
+}
+
+fn accepts_gzip(headers: &HeaderMap) -> bool {
+    let Some(value) = headers.get(ACCEPT_ENCODING).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+
+    value.split(',').any(|part| {
+        let mut pieces = part.trim().split(';');
+        let name = pieces.next().unwrap_or_default().trim();
+        let quality = pieces
+            .next()
+            .and_then(|piece| piece.trim().strip_prefix("q="))
+            .and_then(|value| value.parse::<f32>().ok())
+            .unwrap_or(1.0);
+
+        name.eq_ignore_ascii_case("gzip") && quality > 0.0
+    })
+}
+
+fn compressible(content_type: &str) -> bool {
+    let kind = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+
+    kind.starts_with("text/")
+        || matches!(
+            kind.as_str(),
+            "application/json"
+                | "application/javascript"
+                | "application/xml"
+                | "application/rss+xml"
+                | "application/atom+xml"
+                | "image/svg+xml"
+        )
+}
+
+fn gzip(body: Body) -> Body {
+    let stream = TryStreamExt::map_err(body.into_data_stream(), std::io::Error::other);
+    let reader = StreamReader::new(stream);
+    let encoder = GzipEncoder::new(BufReader::new(reader));
+    let stream = ReaderStream::new(encoder).map_ok(hyper::body::Frame::data);
+
+    BodyExt::map_err(StreamBody::new(stream), |err| -> BoxError { Box::new(err) }).boxed()
 }
 
 fn canonical_host(raw: &str) -> Option<(String, String)> {

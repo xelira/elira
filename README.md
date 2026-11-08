@@ -26,6 +26,14 @@ max_header_bytes = 16384
 upstream_timeout_secs = 30
 max_connections = 1024
 idle_timeout_secs = 60
+max_body_bytes = 8388608
+requests_per_second = 100
+burst = 200
+trusted_proxies = ["10.0.0.0/8"]
+
+[compression]
+enabled = true
+min_bytes = 1024
 
 [tls]
 cert = "/etc/elira/cert.pem"
@@ -80,6 +88,9 @@ spa = false              # true serves index.html for client-side routes
   `If-Modified-Since`, single byte ranges, `HEAD`, optional SPA fallback
 - Prometheus metrics on a separate listener: requests by status class,
   latency histogram, in-flight connections, healthy upstreams
+- gzip for compressible responses when the client asks, with `Vary`
+- per-IP token-bucket rate limiting and a `Content-Length` body cap
+- `trusted_proxies` so `X-Forwarded-For` is only extended by peers you name
 - access log in text or JSON, with a request id per line
 - active health checks: a server that stops answering 2xx/3xx stops receiving
   traffic, and comes back on its own

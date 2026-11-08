@@ -7,8 +7,11 @@ repository.workspace = true
 
 [dependencies]
 elira-config = { path = "../elira-config" }
+elira-limit = { path = "../elira-limit" }
 futures-util = { workspace = true }
 httpdate = { workspace = true }
+ipnet = { workspace = true }
+async-compression = { workspace = true }
 percent-encoding = { workspace = true }
 tokio-util = { workspace = true }
 bytes = { workspace = true }

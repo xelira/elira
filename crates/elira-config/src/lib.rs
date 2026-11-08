@@ -25,6 +25,8 @@ pub struct Config {
     #[serde(default)]
     pub connect: Connect,
     #[serde(default)]
+    pub compression: Compression,
+    #[serde(default)]
     pub http3: Option<Http3>,
     #[serde(default)]
     pub metrics: Option<MetricsConfig>,
@@ -56,6 +58,24 @@ pub struct Limits {
     /// request. Zero disables the timer.
     #[serde(default = "Limits::default_idle_timeout_secs")]
     pub idle_timeout_secs: u64,
+
+    /// Reject a request whose Content-Length exceeds this. Zero means no limit.
+    /// A chunked body is not checked here.
+    #[serde(default)]
+    pub max_body_bytes: usize,
+
+    /// Token bucket per client IP. Zero disables the limiter.
+    #[serde(default)]
+    pub requests_per_second: u32,
+
+    /// Bucket depth. Zero means the same as `requests_per_second`.
+    #[serde(default)]
+    pub burst: u32,
+
+    /// Peers allowed to supply X-Forwarded-For. Anything else has its
+    /// forwarding headers replaced.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
 }
 
 impl Default for Limits {
@@ -66,6 +86,10 @@ impl Default for Limits {
             upstream_timeout_secs: Self::default_upstream_timeout_secs(),
             max_connections: Self::default_max_connections(),
             idle_timeout_secs: Self::default_idle_timeout_secs(),
+            max_body_bytes: 0,
+            requests_per_second: 0,
+            burst: 0,
+            trusted_proxies: Vec::new(),
         }
     }
 }
@@ -130,6 +154,36 @@ impl Health {
 
     fn default_timeout_secs() -> u64 {
         2
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Compression {
+    #[serde(default = "Compression::default_enabled")]
+    pub enabled: bool,
+
+    /// Do not bother compressing bodies smaller than this.
+    #[serde(default = "Compression::default_min_bytes")]
+    pub min_bytes: usize,
+}
+
+impl Default for Compression {
+    fn default() -> Self {
+        Self {
+            enabled: Self::default_enabled(),
+            min_bytes: Self::default_min_bytes(),
+        }
+    }
+}
+
+impl Compression {
+    fn default_enabled() -> bool {
+        true
+    }
+
+    fn default_min_bytes() -> usize {
+        1024
     }
 }
 
@@ -306,6 +360,11 @@ impl Config {
             }
         }
 
+        for cidr in &self.limits.trusted_proxies {
+            cidr.parse::<ipnet::IpNet>()
+                .map_err(|_| Error::BadTrustedProxy { cidr: cidr.clone() })?;
+        }
+
         if self.routes.is_empty() {
             return Err(Error::NoRoutes);
         }
@@ -453,6 +512,9 @@ pub enum Error {
 
     #[error("connect.enabled requires a non-empty connect.allow list")]
     ConnectEmptyAllow,
+
+    #[error("limits.trusted_proxies: \"{cidr}\" is not a CIDR block")]
+    BadTrustedProxy { cidr: String },
 
     #[error("connect target \"{target}\" is not host:port")]
     BadConnectTarget { target: String },
@@ -670,6 +732,22 @@ upstream = "app"
             Config::parse(&text),
             Err(Error::BadConnectTarget { .. })
         ));
+    }
+
+    #[test]
+    fn rejects_a_bad_trusted_proxy_cidr() {
+        let text = format!("{MINIMAL}\n[limits]\ntrusted_proxies = [\"10.0.0.0/8\", \"nope\"]\n");
+        assert!(matches!(
+            Config::parse(&text),
+            Err(Error::BadTrustedProxy { .. })
+        ));
+    }
+
+    #[test]
+    fn compression_is_on_by_default() {
+        let cfg = Config::parse(MINIMAL).expect("valid config");
+        assert!(cfg.compression.enabled);
+        assert_eq!(cfg.compression.min_bytes, 1024);
     }
 
     #[test]

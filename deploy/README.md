@@ -2,8 +2,8 @@
 
 The server reads its configuration from `/etc/elira/elira.toml`; the image and
 the systemd unit both start it with `elira run --config /etc/elira/elira.toml`.
-The file has no defaults for certificates and upstreams, so mount or install a
-real config before starting.
+The image does not contain that file, so mount or install a real config before
+starting.
 
 ## Docker
 

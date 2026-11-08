@@ -1,12 +1,18 @@
 # elira
 
-HTTP server and reverse proxy.
+Launcher for the native `elira` binary. The npm package does not contain the
+server itself; it finds an installed binary and runs it.
 
-**Status:** name reservation, implementation in progress.
-Source: <https://github.com/xelira/elira>
+Lookup order:
+
+1. `ELIRA_BIN` — path to an executable
+2. `@elira/<platform>-<arch>` — a platform package, when one is published
+3. `elira` on `PATH`
+
+When nothing is found, the launcher prints the install options and exits 1.
 
 ```
-npx elira --version
+ELIRA_BIN=/usr/local/bin/elira npx elira run --config elira.toml
 ```
 
-`Elira` — pronounced *eh-LEE-rah*.
+Source and releases: <https://github.com/xelira/elira>

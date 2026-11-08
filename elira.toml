@@ -25,6 +25,10 @@ format = "text"   # or "json"
 # [metrics]
 # listen = "127.0.0.1:9090"
 
+[compression]
+enabled = true
+min_bytes = 1024
+
 [[upstreams]]
 name = "app"
 servers = ["127.0.0.1:3000"]

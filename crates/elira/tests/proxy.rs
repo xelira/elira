@@ -67,11 +67,16 @@ async fn upstream() -> SocketAddr {
                     }
                 }
 
+                let body = if text.starts_with("GET /big ") {
+                    "x".repeat(4096)
+                } else {
+                    text.clone()
+                };
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\
                      Connection: close\r\n\r\n{}",
-                    text.len(),
-                    text
+                    body.len(),
+                    body
                 );
                 let _ = stream.write_all(response.as_bytes()).await;
             });
@@ -504,4 +509,89 @@ async fn metrics_listener_reports_requests() {
         "{body}"
     );
     assert!(body.contains("elira_connections_in_flight"), "{body}");
+}
+
+#[tokio::test]
+async fn compresses_large_text_for_clients_that_ask() {
+    let upstream = upstream().await;
+    let config = NO_DEFAULT.replace("{upstream}", &upstream.to_string());
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let plain = roundtrip(
+        addr,
+        "GET /big HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(!plain.to_ascii_lowercase().contains("content-encoding"));
+    assert!(plain.ends_with(&"x".repeat(4096)));
+
+    let gz = roundtrip(
+        addr,
+        "GET /big HTTP/1.1\r\nHost: example.com\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(
+        gz.to_ascii_lowercase().contains("content-encoding: gzip"),
+        "{gz}"
+    );
+    assert!(
+        gz.to_ascii_lowercase().contains("vary: accept-encoding"),
+        "{gz}"
+    );
+    assert!(!gz.contains(&"x".repeat(4096)));
+}
+
+#[tokio::test]
+async fn rejects_bodies_over_the_limit() {
+    let upstream = upstream().await;
+    let mut config = NO_DEFAULT.replace("{upstream}", &upstream.to_string());
+    config.push_str("\n[limits]\nmax_body_bytes = 10\n");
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let response = roundtrip(
+        addr,
+        "POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 100\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&response), "HTTP/1.1 413 Payload Too Large");
+}
+
+#[tokio::test]
+async fn rate_limits_per_client() {
+    let upstream = upstream().await;
+    let mut config = NO_DEFAULT.replace("{upstream}", &upstream.to_string());
+    config.push_str("\n[limits]\nrequests_per_second = 1\nburst = 1\n");
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let first = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&first), "HTTP/1.1 200 OK");
+
+    let second = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&second), "HTTP/1.1 429 Too Many Requests");
+}
+
+#[tokio::test]
+async fn trusted_proxies_extend_the_forwarded_chain() {
+    let upstream = upstream().await;
+    let mut config = NO_DEFAULT.replace("{upstream}", &upstream.to_string());
+    config.push_str("\n[limits]\ntrusted_proxies = [\"127.0.0.1/32\"]\n");
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let response = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nX-Forwarded-For: 9.9.9.9\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(
+        response.contains("x-forwarded-for: 9.9.9.9, 127.0.0.1"),
+        "{response}"
+    );
 }

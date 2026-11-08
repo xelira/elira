@@ -8,6 +8,7 @@ members = [
     "crates/elira-accesslog",
     "crates/elira-h3",
     "crates/elira-metrics",
+    "crates/elira-limit",
 ]
 
 [workspace.package]
@@ -43,3 +44,5 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = { version = "0.7", features = ["io"] }
 percent-encoding = "2"
 httpdate = "1"
+ipnet = "2"
+async-compression = { version = "0.4", features = ["tokio", "gzip"] }
