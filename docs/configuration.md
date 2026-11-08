@@ -122,6 +122,8 @@ HTTP/1.1-соединении подглядывается до hyper, и про
 | `upstream_body_timeout_secs` | целое, секунды | `30` | прервать upstream, который перестал отдавать тело |
 | `websocket_idle_secs` | целое, секунды | `3600` | закрыть websocket/CONNECT после простоя; `0` выключает |
 | `max_response_bytes` | целое > 0 | `67108864` | предел потокового ответа FastCGI/CGI |
+| `connection_drain_secs` | целое > 0 | `5` | сколько ждать дозавершения соединения при остановке |
+| `shutdown_timeout_secs` | целое > 0 | `15` | общий предел остановки листенера |
 | `fastcgi_pool_idle` | целое ≥ 0 | `16` | idle-соединений FastCGI на бэкенд |
 | `fastcgi_pool_idle_secs` | целое | `30` | TTL idle-соединения FastCGI |
 | `response_buffer_bytes` | целое ≥ 0 | `0` | буферизовать ответ upstream до этого размера; `0` — потоком |

@@ -327,14 +327,17 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
     tracing::info!("shutting down");
     let _ = stop_tx.send(true);
 
-    if tokio::time::timeout(Duration::from_secs(15), serving)
-        .await
-        .is_err()
+    if tokio::time::timeout(
+        Duration::from_secs(cfg.limits.shutdown_timeout_secs),
+        serving,
+    )
+    .await
+    .is_err()
     {
         tracing::warn!("server did not stop in time");
     }
     if let Some(task) = unix_serving {
-        if tokio::time::timeout(Duration::from_secs(15), task)
+        if tokio::time::timeout(Duration::from_secs(cfg.limits.shutdown_timeout_secs), task)
             .await
             .is_err()
         {

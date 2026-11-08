@@ -161,6 +161,8 @@ pub struct Options {
     pub sendfile: bool,
     pub h2c: bool,
     pub body_timeout: Option<Duration>,
+    pub drain_timeout: Duration,
+    pub shutdown_timeout: Duration,
     pub acme: Option<Arc<elira_acme::Acme>>,
 }
 
@@ -178,6 +180,8 @@ impl Options {
                 0 => None,
                 secs => Some(Duration::from_secs(secs)),
             },
+            drain_timeout: Duration::from_secs(cfg.limits.connection_drain_secs),
+            shutdown_timeout: Duration::from_secs(cfg.limits.shutdown_timeout_secs),
             acme: None,
         }
     }
@@ -258,7 +262,7 @@ pub async fn serve(
     drop(listener);
 
     let drain = async { while connections.join_next().await.is_some() {} };
-    if tokio::time::timeout(Duration::from_secs(10), drain)
+    if tokio::time::timeout(options.shutdown_timeout, drain)
         .await
         .is_err()
     {
@@ -303,6 +307,7 @@ pub async fn serve_unix(
                     max_buf_size: options.max_buf_size,
                     idle_timeout: options.idle_timeout,
                     body_timeout: options.body_timeout,
+                    drain_timeout: options.drain_timeout,
                     h2: false,
                     secure: false,
                 };
@@ -370,6 +375,7 @@ struct ConnOptions {
     max_buf_size: usize,
     idle_timeout: Duration,
     body_timeout: Option<Duration>,
+    drain_timeout: Duration,
     h2: bool,
     secure: bool,
 }
@@ -397,6 +403,7 @@ async fn serve_stream(
         max_buf_size: options.max_buf_size,
         idle_timeout: options.idle_timeout,
         body_timeout: options.body_timeout,
+        drain_timeout: options.drain_timeout,
         h2: false,
         secure: false,
     };
@@ -646,11 +653,11 @@ async fn serve_conn<I>(
             }
             _ = stop.changed() => {
                 conn.as_mut().graceful_shutdown();
-                drain(conn.as_mut(), peer).await;
+                drain(conn.as_mut(), peer, opts.drain_timeout).await;
             }
             _ = idle_watch(idle.clone(), opts.idle_timeout) => {
                 conn.as_mut().graceful_shutdown();
-                drain(conn.as_mut(), peer).await;
+                drain(conn.as_mut(), peer, opts.drain_timeout).await;
             }
         }
     } else {
@@ -674,11 +681,11 @@ async fn serve_conn<I>(
             }
             _ = stop.changed() => {
                 conn.as_mut().graceful_shutdown();
-                drain(conn.as_mut(), peer).await;
+                drain(conn.as_mut(), peer, opts.drain_timeout).await;
             }
             _ = idle_watch(idle.clone(), opts.idle_timeout) => {
                 conn.as_mut().graceful_shutdown();
-                drain(conn.as_mut(), peer).await;
+                drain(conn.as_mut(), peer, opts.drain_timeout).await;
             }
         }
     }
@@ -985,14 +992,11 @@ fn rand_counter() -> u64 {
 
 /// Let the current request finish, but do not wait forever: a client that
 /// trickles a body would otherwise pin the permit until the process dies.
-async fn drain<C>(conn: std::pin::Pin<&mut C>, peer: SocketAddr)
+async fn drain<C>(conn: std::pin::Pin<&mut C>, peer: SocketAddr, limit: Duration)
 where
     C: std::future::Future<Output = Result<(), hyper::Error>>,
 {
-    if tokio::time::timeout(Duration::from_secs(5), conn)
-        .await
-        .is_err()
-    {
+    if tokio::time::timeout(limit, conn).await.is_err() {
         tracing::debug!(%peer, "connection did not drain in time");
     }
 }

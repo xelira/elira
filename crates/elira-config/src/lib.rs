@@ -120,6 +120,14 @@ pub struct Limits {
     #[serde(default = "Limits::default_body_timeout_secs")]
     pub upstream_body_timeout_secs: u64,
 
+    /// Let an in-flight connection finish during shutdown.
+    #[serde(default = "Limits::default_drain_timeout_secs")]
+    pub connection_drain_secs: u64,
+
+    /// Overall wait for the listener to stop before logging a warning.
+    #[serde(default = "Limits::default_shutdown_timeout_secs")]
+    pub shutdown_timeout_secs: u64,
+
     /// Close an idle websocket or CONNECT tunnel. Zero disables the check.
     #[serde(default = "Limits::default_websocket_idle_secs")]
     pub websocket_idle_secs: u64,
@@ -158,6 +166,8 @@ impl Default for Limits {
             request_body_timeout_secs: Self::default_body_timeout_secs(),
             upstream_body_timeout_secs: Self::default_body_timeout_secs(),
             websocket_idle_secs: Self::default_websocket_idle_secs(),
+            connection_drain_secs: Self::default_drain_timeout_secs(),
+            shutdown_timeout_secs: Self::default_shutdown_timeout_secs(),
             response_buffer_bytes: 0,
             max_response_bytes: Self::default_max_response_bytes(),
             fastcgi_pool_idle: Self::default_fastcgi_pool_idle(),
@@ -193,6 +203,14 @@ impl Limits {
 
     fn default_websocket_idle_secs() -> u64 {
         3600
+    }
+
+    fn default_drain_timeout_secs() -> u64 {
+        5
+    }
+
+    fn default_shutdown_timeout_secs() -> u64 {
+        15
     }
 
     fn default_max_response_bytes() -> usize {
@@ -1054,6 +1072,12 @@ impl Config {
         if self.limits.max_connections == 0 {
             return Err(Error::MaxConnectionsZero);
         }
+        if self.limits.connection_drain_secs == 0 {
+            return Err(Error::DrainTimeoutZero);
+        }
+        if self.limits.shutdown_timeout_secs == 0 {
+            return Err(Error::ShutdownTimeoutZero);
+        }
         if self.workers == 0 || self.workers > 64 {
             return Err(Error::BadWorkers);
         }
@@ -1588,6 +1612,12 @@ pub enum Error {
 
     #[error("limits.max_connections must be greater than zero")]
     MaxConnectionsZero,
+
+    #[error("limits.connection_drain_secs must be greater than zero")]
+    DrainTimeoutZero,
+
+    #[error("limits.shutdown_timeout_secs must be greater than zero")]
+    ShutdownTimeoutZero,
 
     #[error("workers must be between 1 and 64")]
     BadWorkers,
@@ -3034,5 +3064,24 @@ root = "/srv/www"
             Config::parse(text),
             Err(Error::SharedCacheWithoutDir)
         ));
+    }
+
+    #[test]
+    fn drain_timeouts_are_configurable_and_positive() {
+        let text = r#"
+listen = "127.0.0.1:8080"
+[limits]
+connection_drain_secs = 3
+shutdown_timeout_secs = 20
+[[routes]]
+host = "*"
+root = "/srv/www"
+"#;
+        let cfg = Config::parse(text).expect("valid");
+        assert_eq!(cfg.limits.connection_drain_secs, 3);
+        assert_eq!(cfg.limits.shutdown_timeout_secs, 20);
+
+        let zero = text.replace("connection_drain_secs = 3", "connection_drain_secs = 0");
+        assert!(matches!(Config::parse(&zero), Err(Error::DrainTimeoutZero)));
     }
 }
