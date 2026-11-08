@@ -5,7 +5,7 @@ URL ?= http://127.0.0.1:8080/
 FUZZ_TARGET ?= config
 FUZZ_TIME ?= 60
 
-.PHONY: build fmt lint test check config-check audit deny fuzz load run docker
+.PHONY: build fmt lint test check config-check audit deny fuzz load bench run docker
 
 build:
 	$(CARGO) build --workspace --locked
@@ -42,6 +42,9 @@ fuzz:
 
 load:
 	./scripts/load.sh "$(URL)"
+
+bench:
+	$(CARGO) bench --workspace
 
 run:
 	$(CARGO) run -p elira -- run --config $(CONFIG)

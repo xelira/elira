@@ -7,3 +7,7 @@ repository.workspace = true
 
 [dependencies]
 http = { workspace = true }
+
+[[bench]]
+name = "cache"
+harness = false

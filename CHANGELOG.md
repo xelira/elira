@@ -40,7 +40,12 @@
   буферизация небольших ответов upstream'а.
 - Свой token bucket, предел тела и `error_pages` на маршруте.
 - Кэш учитывает `Vary`, `Cache-Control`, `Authorization` и `Cookie`; не
-  смешивает ответы разных пользователей и выставляет `Age`.
+  смешивает ответы разных пользователей и выставляет `Age`. Тела можно
+  хранить на диске (`cache.dir`), а `stale_secs` включает
+  stale-while-revalidate с фоновым обновлением.
+- `dns_ttl_secs` ограничивает жизнь соединения в пуле, чтобы смена DNS
+  подхватывалась за предсказуемое время.
+- Микробенчмарки кэша и разбора конфига (`cargo bench`).
 - mTLS на TCP- и QUIC-листенерах: `client_auth` и `client_ca`.
 - SNI-сертификаты через `[[tls.certificates]]`, минимальная версия TLS.
 - Свои `sni`, `health_path`, `tls_insecure`, `tls_ca` и `http2` у upstream'а;

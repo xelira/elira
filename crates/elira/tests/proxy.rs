@@ -1926,3 +1926,83 @@ root = "{}"
     assert!(response.ends_with("via unix"), "{response}");
     let _ = stop_tx.send(true);
 }
+
+#[tokio::test]
+async fn stale_cache_entry_is_served_while_it_refreshes() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = hits.clone();
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind varying upstream");
+    let upstream = listener.local_addr().expect("addr");
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let counter = counter.clone();
+            tokio::spawn(async move {
+                let mut head = [0u8; 2048];
+                let _ = stream.read(&mut head).await;
+                let body = format!("v{}", counter.fetch_add(1, Ordering::SeqCst) + 1);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nCache-Control: max-age=1\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[cache]
+enabled = true
+ttl_secs = 1
+stale_secs = 5
+max_item_bytes = 65536
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "*"
+upstream = "app"
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let first = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(first.ends_with("v1"), "{first}");
+
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    let stale = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(stale.contains("x-cache: STALE"), "{stale}");
+    assert!(stale.ends_with("v1"), "{stale}");
+
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let fresh = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(fresh.ends_with("v2"), "{fresh}");
+}

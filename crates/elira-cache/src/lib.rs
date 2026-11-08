@@ -1,4 +1,4 @@
-//! In-memory response cache shared by every client of the proxy.
+//! Response cache shared by every client of the proxy.
 //!
 //! The cache is keyed by host and path. Because several users can read the
 //! same stored response, anything user-specific must be kept out: requests
@@ -15,6 +15,9 @@
 //! released.
 
 use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -58,6 +61,10 @@ impl Entry {
         now.saturating_duration_since(self.stored_at) < self.ttl
     }
 
+    fn is_usable(&self, now: Instant, stale: Duration) -> bool {
+        now.saturating_duration_since(self.stored_at) < self.ttl + stale
+    }
+
     fn matches(&self, request: &HeaderMap) -> bool {
         self.vary
             .iter()
@@ -65,12 +72,29 @@ impl Entry {
     }
 }
 
+/// Where the body lives. The entry itself never carries a disk body, so the
+/// memory budget reflects what is really resident.
+enum Location {
+    Memory,
+    Disk(PathBuf),
+}
+
 struct Record {
     entry: Entry,
+    location: Location,
+    size: usize,
     /// Tie-breaker for entries inserted at the same `Instant`. Without it,
     /// eviction between equal timestamps would follow hash order and depend
     /// on the hasher seed.
     seq: u64,
+}
+
+impl Record {
+    fn drop_body(&self) {
+        if let Location::Disk(path) = &self.location {
+            let _ = fs::remove_file(path);
+        }
+    }
 }
 
 struct Store {
@@ -92,7 +116,8 @@ impl Store {
                 if record.entry.is_fresh(now) {
                     true
                 } else {
-                    freed += record.entry.body.len();
+                    record.drop_body();
+                    freed += record.size;
                     false
                 }
             });
@@ -128,6 +153,9 @@ impl Store {
 pub struct Cache {
     max_bytes: usize,
     default_ttl: Duration,
+    stale: Duration,
+    disk: Option<PathBuf>,
+    files: AtomicU64,
     store: Mutex<Store>,
 }
 
@@ -136,9 +164,28 @@ impl Cache {
     /// response may live up to `default_ttl`; its own `Cache-Control` can
     /// only shorten that.
     pub fn new(max_bytes: usize, default_ttl: Duration) -> Self {
+        Self::with_disk(max_bytes, default_ttl, None, Duration::ZERO)
+    }
+
+    /// Same cache, optionally with bodies on disk and a stale window.
+    ///
+    /// The directory is cleaned on construction: entries do not survive a
+    /// restart, so orphaned bodies would only waste space.
+    pub fn with_disk(
+        max_bytes: usize,
+        default_ttl: Duration,
+        disk: Option<PathBuf>,
+        stale: Duration,
+    ) -> Self {
+        if let Some(dir) = &disk {
+            clean_dir(dir);
+        }
         Self {
             max_bytes,
             default_ttl,
+            stale,
+            disk,
+            files: AtomicU64::new(0),
             store: Mutex::new(Store {
                 entries: HashMap::new(),
                 total_bytes: 0,
@@ -147,48 +194,84 @@ impl Cache {
         }
     }
 
-    /// Looks up a stored response. `key` is host plus path; `request` supplies
-    /// the header values that the stored `Vary` fields are checked against.
-    ///
-    /// Returns `None` for a stale entry, a `Vary` mismatch, or a request that
-    /// must not share a cache at all.
+    /// Looks up a stored, unexpired response.
     pub fn get(&self, key: &str, request: &HeaderMap, now: Instant) -> Option<Entry> {
+        self.lookup(key, request, now, false)
+            .map(|(entry, _)| entry)
+    }
+
+    /// Looks up a response that may be stale. The boolean says whether it is
+    /// past its TTL and should be refreshed in the background.
+    pub fn get_stale(&self, key: &str, request: &HeaderMap, now: Instant) -> Option<(Entry, bool)> {
+        self.lookup(key, request, now, true)
+    }
+
+    fn lookup(
+        &self,
+        key: &str,
+        request: &HeaderMap,
+        now: Instant,
+        allow_stale: bool,
+    ) -> Option<(Entry, bool)> {
         if self.max_bytes == 0 || is_sensitive(request) {
             return None;
         }
 
         let mut store = self.lock();
-
-        // Take the variants out so the borrow ends before the accounting
-        // update and before the entry may be put back.
         let mut records = store.entries.remove(key)?;
-        let mut stale_bytes = 0;
+
+        let mut candidate: Option<(usize, bool)> = None;
+        for (index, record) in records.iter().enumerate() {
+            let fresh = record.entry.is_fresh(now);
+            if !record.entry.matches(request) {
+                continue;
+            }
+            if fresh {
+                candidate = Some((index, false));
+                break;
+            }
+            if allow_stale && record.entry.is_usable(now, self.stale) && candidate.is_none() {
+                candidate = Some((index, true));
+            }
+        }
+
+        let chosen = candidate.and_then(|(index, stale)| {
+            let record = &records[index];
+            let mut entry = record.entry.clone();
+            match &record.location {
+                Location::Memory => Some((entry, stale)),
+                Location::Disk(path) => match fs::read(path) {
+                    Ok(body) => {
+                        entry.body = body;
+                        Some((entry, stale))
+                    }
+                    Err(_) => None,
+                },
+            }
+        });
+
+        // Drop entries that are no longer usable, including their disk files.
+        let mut freed = 0;
         records.retain(|record| {
-            if record.entry.is_fresh(now) {
+            // Even a fresh-only lookup keeps entries inside the stale window:
+            // another request may still ask for them with `get_stale`.
+            if record.entry.is_usable(now, self.stale) {
                 true
             } else {
-                stale_bytes += record.entry.body.len();
+                record.drop_body();
+                freed += record.size;
                 false
             }
         });
-        store.total_bytes = store.total_bytes.saturating_sub(stale_bytes);
-
-        let found = records
-            .iter()
-            .find(|record| record.entry.matches(request))
-            .map(|record| record.entry.clone());
+        store.total_bytes = store.total_bytes.saturating_sub(freed);
 
         if !records.is_empty() {
             store.entries.insert(key.to_owned(), records);
         }
-        found
+        chosen
     }
 
     /// Stores a response when its headers allow sharing.
-    ///
-    /// `key` is host plus path. Returns `true` when the response was stored.
-    /// A response that is already stale, cannot be shared, or is larger than
-    /// the whole budget is rejected.
     pub fn insert(
         &self,
         key: &str,
@@ -220,7 +303,9 @@ impl Cache {
                 (name, value)
             })
             .collect();
-        let entry = Entry {
+
+        let size = body.len();
+        let mut entry = Entry {
             status,
             headers: stored_headers(response),
             body,
@@ -228,36 +313,48 @@ impl Cache {
             ttl,
             vary,
         };
-        let body_len = entry.body.len();
+
+        let location = match &self.disk {
+            Some(dir) => {
+                let index = self.files.fetch_add(1, Ordering::Relaxed);
+                let path = dir.join(format!("elira-cache-{}-{index}.body", std::process::id()));
+                if fs::write(&path, &entry.body).is_err() {
+                    return false;
+                }
+                entry.body.clear();
+                Location::Disk(path)
+            }
+            None => Location::Memory,
+        };
 
         let mut store = self.lock();
         store.purge_expired(now);
 
-        // Replace only the variant with the same Vary signature. Other
-        // languages or encodings stay valid.
+        // Replace only the variant with the same Vary signature.
         if let Some(records) = store.entries.get_mut(key) {
             if let Some(index) = records
                 .iter()
                 .position(|record| record.entry.vary == entry.vary)
             {
                 let previous = records.remove(index);
-                store.total_bytes -= previous.entry.body.len();
+                previous.drop_body();
+                store.total_bytes -= previous.size;
             }
         }
 
-        // Evict oldest first until the new body fits. The strict comparison
-        // keeps a body that exactly fills the budget.
-        while store.total_bytes.saturating_add(body_len) > self.max_bytes {
+        while store.total_bytes.saturating_add(size) > self.max_bytes {
             let Some((key, index)) = store.oldest() else {
-                // Unreachable while the size check above accepts the body, but
-                // returning beats panicking on an accounting bug.
+                if let Location::Disk(path) = &location {
+                    let _ = fs::remove_file(path);
+                }
                 return false;
             };
             let victim = match store.entries.get_mut(&key) {
                 Some(records) if index < records.len() => records.remove(index),
                 _ => continue,
             };
-            store.total_bytes -= victim.entry.body.len();
+            victim.drop_body();
+            store.total_bytes -= victim.size;
             if store
                 .entries
                 .get(&key)
@@ -270,18 +367,28 @@ impl Cache {
 
         let seq = store.next_seq;
         store.next_seq = store.next_seq.wrapping_add(1);
-        store.total_bytes += body_len;
+        store.total_bytes += size;
         store
             .entries
             .entry(key.to_owned())
             .or_default()
-            .push(Record { entry, seq });
+            .push(Record {
+                entry,
+                location,
+                size,
+                seq,
+            });
         true
     }
 
-    /// Drops every stored response.
+    /// Drops every stored response and its disk body.
     pub fn purge(&self) {
         let mut store = self.lock();
+        for records in store.entries.values() {
+            for record in records {
+                record.drop_body();
+            }
+        }
         store.entries.clear();
         store.total_bytes = 0;
     }
@@ -315,6 +422,22 @@ impl std::fmt::Debug for Cache {
             .field("bytes", &bytes)
             .field("entries", &entries)
             .finish()
+    }
+}
+
+fn clean_dir(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        let _ = fs::create_dir_all(dir);
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("elira-cache-")
+        {
+            let _ = fs::remove_file(entry.path());
+        }
     }
 }
 
@@ -1113,5 +1236,102 @@ mod tests {
             Some(b"hallo".to_vec())
         );
         assert_eq!(cache.stats(), (10, 2));
+    }
+
+    fn temp_dir(label: &str) -> PathBuf {
+        use std::sync::atomic::AtomicUsize;
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "elira-cache-{}-{label}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).expect("temp dir");
+        path
+    }
+
+    #[test]
+    fn disk_cache_round_trips_and_cleans_up() {
+        let dir = temp_dir("disk");
+        let cache = Cache::with_disk(
+            1024,
+            Duration::from_secs(60),
+            Some(dir.clone()),
+            Duration::ZERO,
+        );
+        let request = HeaderMap::new();
+        let response = HeaderMap::new();
+        let now = Instant::now();
+
+        assert!(cache.insert(
+            "example.com/",
+            &request,
+            &response,
+            200,
+            b"disk body".to_vec(),
+            now
+        ));
+        assert_eq!(
+            cache
+                .get("example.com/", &request, now)
+                .map(|entry| entry.body),
+            Some(b"disk body".to_vec())
+        );
+
+        let files: Vec<_> = fs::read_dir(&dir)
+            .expect("dir")
+            .flatten()
+            .map(|entry| entry.path())
+            .collect();
+        assert_eq!(files.len(), 1, "body should be on disk");
+
+        cache.purge();
+        assert!(fs::read_dir(&dir).expect("dir").next().is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disk_cache_removes_orphans_on_start() {
+        let dir = temp_dir("orphan");
+        fs::write(dir.join("elira-cache-leftover.body"), b"old").expect("orphan");
+
+        let _cache = Cache::with_disk(
+            1024,
+            Duration::from_secs(60),
+            Some(dir.clone()),
+            Duration::ZERO,
+        );
+        assert!(fs::read_dir(&dir).expect("dir").next().is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_entries_are_served_inside_the_window() {
+        let cache = Cache::with_disk(1024, Duration::from_secs(1), None, Duration::from_secs(5));
+        let request = HeaderMap::new();
+        let response = HeaderMap::new();
+        let now = Instant::now();
+        assert!(cache.insert(
+            "example.com/",
+            &request,
+            &response,
+            200,
+            b"old".to_vec(),
+            now
+        ));
+
+        let after_ttl = now + Duration::from_secs(2);
+        assert!(cache.get("example.com/", &request, after_ttl).is_none());
+        let (entry, stale) = cache
+            .get_stale("example.com/", &request, after_ttl)
+            .expect("stale hit");
+        assert_eq!(entry.body, b"old");
+        assert!(stale);
+
+        let after_window = now + Duration::from_secs(7);
+        assert!(cache
+            .get_stale("example.com/", &request, after_window)
+            .is_none());
     }
 }

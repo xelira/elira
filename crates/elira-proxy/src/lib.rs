@@ -4,13 +4,13 @@
 //! headers from the client, never forward hop-by-hop headers, and pick an
 //! upstream before touching the body.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -82,6 +82,7 @@ struct Inner {
     body_timeout: Option<Duration>,
     tunnel_idle: Option<Duration>,
     buffer_bytes: usize,
+    refreshing: Arc<Mutex<HashSet<String>>>,
 }
 
 enum Target {
@@ -360,7 +361,9 @@ impl Proxy {
                 reason: err.to_string(),
             })?;
             let client = Client::builder(TokioExecutor::new())
-                .pool_idle_timeout(Some(Duration::from_secs(30)))
+                // Hyper resolves the name for each new connection, so the
+                // pool lifetime is the upper bound on DNS staleness.
+                .pool_idle_timeout(Some(Duration::from_secs(up.dns_ttl_secs.unwrap_or(30))))
                 .build(connector);
 
             pools.insert(
@@ -542,9 +545,11 @@ impl Proxy {
             };
 
         let cache = if cfg.cache.enabled {
-            Some(Arc::new(Cache::new(
+            Some(Arc::new(Cache::with_disk(
                 cfg.cache.max_bytes,
                 Duration::from_secs(cfg.cache.ttl_secs),
+                cfg.cache.dir.clone(),
+                Duration::from_secs(cfg.cache.stale_secs),
             )))
         } else {
             None
@@ -603,6 +608,7 @@ impl Proxy {
                     secs => Some(Duration::from_secs(secs)),
                 },
                 buffer_bytes: cfg.limits.response_buffer_bytes,
+                refreshing: Arc::new(Mutex::new(HashSet::new())),
             }),
         })
     }
@@ -1012,19 +1018,31 @@ impl Proxy {
         if is_get && requested_upgrade.is_none() {
             if let Some(cache) = &self.inner.cache {
                 let now = Instant::now();
-                if let Some(hit) = cache.get(&cache_key, &request_headers, now) {
+                if let Some((hit, stale)) = cache.get_stale(&cache_key, &request_headers, now) {
                     let age = hit.age(now);
                     let mut response = cache_response(hit);
                     if let Ok(value) = HeaderValue::from_str(&age.to_string()) {
                         response.headers_mut().insert("age", value);
                     }
-                    response
-                        .headers_mut()
-                        .insert("x-cache", HeaderValue::from_static("HIT"));
+                    response.headers_mut().insert(
+                        "x-cache",
+                        HeaderValue::from_static(if stale { "STALE" } else { "HIT" }),
+                    );
                     response.extensions_mut().insert(Labels {
                         route: entry.label.clone(),
                         upstream: Some(pool.name.clone()),
                     });
+                    if stale {
+                        self.refresh(
+                            cache.clone(),
+                            cache_key.clone(),
+                            template.clone(),
+                            request_headers.clone(),
+                            upstream_path.clone(),
+                            pool.clone(),
+                            route_timeout,
+                        );
+                    }
                     self.apply_route(&mut response, entry, &request_id);
                     return Ok(response);
                 }
@@ -1253,6 +1271,92 @@ impl Proxy {
         self.apply_error_page(&mut response, entry, peer).await;
         self.apply_route(&mut response, entry, &request_id);
         Ok(response)
+    }
+
+    /// Fetch a fresh copy in the background after serving a stale entry.
+    #[allow(clippy::too_many_arguments)]
+    fn refresh(
+        &self,
+        cache: Arc<Cache>,
+        key: String,
+        headers: HeaderMap,
+        request_headers: HeaderMap,
+        path: String,
+        pool: Arc<Pool>,
+        timeout: Duration,
+    ) {
+        {
+            let mut refreshing = self
+                .inner
+                .refreshing
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !refreshing.insert(key.clone()) {
+                return;
+            }
+        }
+
+        let inflight = self.inner.refreshing.clone();
+        let max_item = self.inner.cache_max_item;
+        tokio::spawn(async move {
+            let index = pool.pick();
+            let server = pool.servers[index].clone();
+            let _active = pool.enter(index);
+            let uri = match upstream_uri(&server, &path, pool.scheme) {
+                Some(uri) => uri,
+                None => {
+                    inflight
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(&key);
+                    return;
+                }
+            };
+
+            let fetched = async {
+                let mut request = Request::builder()
+                    .method(Method::GET)
+                    .uri(uri)
+                    .body(empty())
+                    .ok()?;
+                *request.headers_mut() = headers;
+                let response = send_request(&pool, &server, request, timeout).await.ok()?;
+                if response.status() != StatusCode::OK {
+                    return None;
+                }
+                let length = response
+                    .headers()
+                    .get(CONTENT_LENGTH)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<usize>().ok())?;
+                if length > max_item {
+                    return None;
+                }
+                let response_headers = response.headers().clone();
+                let body = BodyExt::collect(response.into_body())
+                    .await
+                    .ok()?
+                    .to_bytes();
+                Some((response_headers, body))
+            }
+            .await;
+
+            if let Some((response_headers, body)) = fetched {
+                cache.insert(
+                    &key,
+                    &request_headers,
+                    &response_headers,
+                    StatusCode::OK.as_u16(),
+                    body.to_vec(),
+                    Instant::now(),
+                );
+            }
+
+            inflight
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&key);
+        });
     }
 
     /// Replace a configured error response with a file from the route root.

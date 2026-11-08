@@ -321,6 +321,11 @@ pub struct Upstream {
     /// Overrides `[upstream_tls] http2` for this upstream.
     #[serde(default)]
     pub http2: Option<bool>,
+
+    /// Cap the lifetime of pooled connections so a DNS change is picked up
+    /// within this many seconds. Defaults to 30.
+    #[serde(default)]
+    pub dns_ttl_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -479,6 +484,15 @@ pub struct Cache {
     pub max_bytes: usize,
     #[serde(default = "Cache::default_max_item_bytes")]
     pub max_item_bytes: usize,
+
+    /// Keep response bodies on disk here instead of in memory.
+    #[serde(default)]
+    pub dir: Option<PathBuf>,
+
+    /// Serve an expired entry for this long while a refresh runs in the
+    /// background. Zero disables stale serving.
+    #[serde(default)]
+    pub stale_secs: u64,
 }
 
 impl Default for Cache {
@@ -488,6 +502,8 @@ impl Default for Cache {
             ttl_secs: Self::default_ttl_secs(),
             max_bytes: Self::default_max_bytes(),
             max_item_bytes: Self::default_max_item_bytes(),
+            dir: None,
+            stale_secs: 0,
         }
     }
 }
@@ -702,6 +718,12 @@ impl Config {
             }
         }
 
+        if let Some(dir) = &self.cache.dir {
+            if dir.as_os_str().is_empty() {
+                return Err(Error::EmptyCacheDir);
+            }
+        }
+
         if let Some(file) = &self.log.file {
             if file.as_os_str().is_empty() {
                 return Err(Error::EmptyLogFile);
@@ -712,6 +734,13 @@ impl Config {
         }
 
         if let Some(http3) = &self.http3 {
+            // QUIC cannot consume a PROXY header without a custom UDP socket
+            // and a way to keep the real client separate from the transport
+            // peer. Refuse a public QUIC listener when PROXY is required,
+            // otherwise clients could bypass the header entirely.
+            if self.proxy_protocol && !http3.listen.ip().is_loopback() {
+                return Err(Error::Http3ProxyProtocolUnsupported);
+            }
             if http3.cert.as_os_str().is_empty() {
                 return Err(Error::Http3MissingCert);
             }
@@ -819,6 +848,11 @@ impl Config {
                 return Err(Error::TooManyRetries {
                     name: up.name.clone(),
                     retries: up.retries,
+                });
+            }
+            if up.dns_ttl_secs == Some(0) {
+                return Err(Error::BadDnsTtl {
+                    name: up.name.clone(),
                 });
             }
             if up.tls && up.servers.iter().any(|addr| addr.starts_with("unix:")) {
@@ -1069,6 +1103,9 @@ pub enum Error {
     #[error("health.timeout_secs must be greater than zero")]
     BadHealthTimeout,
 
+    #[error("http3 on a non-loopback address cannot be combined with proxy_protocol")]
+    Http3ProxyProtocolUnsupported,
+
     #[error("http3.cert must not be empty")]
     Http3MissingCert,
 
@@ -1116,6 +1153,9 @@ pub enum Error {
 
     #[error("upstream \"{name}\" has no servers")]
     EmptyUpstream { name: String },
+
+    #[error("upstream \"{name}\": dns_ttl_secs must be greater than zero")]
+    BadDnsTtl { name: String },
 
     #[error("upstream \"{name}\": TLS over a unix socket is not supported")]
     TlsOverUnix { name: String },
@@ -1191,6 +1231,9 @@ pub enum Error {
 
     #[error("acme.cache_dir must not be empty")]
     AcmeNoCacheDir,
+
+    #[error("cache.dir must not be empty")]
+    EmptyCacheDir,
 
     #[error("log.file must not be empty")]
     EmptyLogFile,
@@ -1993,6 +2036,67 @@ upstream = "app"
         assert!(matches!(
             Config::parse(&tls),
             Err(Error::TlsOverUnix { .. })
+        ));
+    }
+
+    #[test]
+    fn parses_disk_cache_and_stale_window() {
+        let text = r#"
+listen = "127.0.0.1:8080"
+
+[cache]
+enabled = true
+ttl_secs = 30
+stale_secs = 120
+dir = "/var/cache/elira"
+
+[[routes]]
+host = "*"
+root = "/srv/www"
+"#;
+        let cfg = Config::parse(text).expect("valid config");
+        assert_eq!(cfg.cache.stale_secs, 120);
+        assert_eq!(
+            cfg.cache.dir.as_deref().map(|p| p.to_str().unwrap()),
+            Some("/var/cache/elira")
+        );
+    }
+
+    #[test]
+    fn rejects_a_zero_dns_ttl() {
+        let text = r#"
+listen = "127.0.0.1:8080"
+
+[[upstreams]]
+name = "app"
+servers = ["127.0.0.1:3000"]
+dns_ttl_secs = 0
+
+[[routes]]
+host = "*"
+upstream = "app"
+"#;
+        assert!(matches!(Config::parse(text), Err(Error::BadDnsTtl { .. })));
+    }
+
+    #[test]
+    fn rejects_public_http3_when_proxy_protocol_is_required() {
+        let text = r#"
+listen = "127.0.0.1:8080"
+proxy_protocol = true
+
+[http3]
+listen = "0.0.0.0:443"
+cert = "/tmp/cert.pem"
+key = "/tmp/key.pem"
+
+[[routes]]
+host = "*"
+root = "/srv/www"
+"#;
+        assert!(matches!(
+            Config::parse(text),
+            Err(Error::Http3ProxyProtocolUnsupported)
         ));
     }
 }
