@@ -51,8 +51,8 @@ Living list for the self-improvement loop. One item per session.
   expose pool internals; needs a custom connector or client.
 
 - [x] Shared disk cache read-through (`cache.shared`).
-- [ ] Global eviction and locking for the shared cache; today `max_bytes` is
-  per process and duplicate files are possible.
+- [x] Global eviction and locking for the shared cache.
+- [ ] Deduplicate concurrent writes of the same key in the shared cache.
 
 - [ ] Worker exit during a streaming app response: document that an incomplete
   chunked body is the only observable outcome, or move the client socket into

@@ -214,7 +214,20 @@ impl Cache {
             }),
         };
         cache.trim_to_budget();
+        if cache.shared {
+            cache.trim_shared();
+        }
         cache
+    }
+
+    fn trim_shared(&self) {
+        let Some(dir) = &self.disk else {
+            return;
+        };
+        let Some(_lock) = DirLock::acquire(dir) else {
+            return;
+        };
+        trim_shared_dir(dir, self.max_bytes);
     }
 
     fn trim_to_budget(&self) {
@@ -537,6 +550,10 @@ impl Cache {
                 size,
                 seq,
             });
+        drop(store);
+        if self.shared {
+            self.trim_shared();
+        }
         true
     }
 
@@ -567,6 +584,13 @@ impl Cache {
         }
         store.entries.clear();
         store.total_bytes = 0;
+        drop(store);
+        if self.shared {
+            if let Some(dir) = &self.disk {
+                let _lock = DirLock::acquire(dir);
+                let _ = remove_shared_entries(dir, None);
+            }
+        }
     }
 
     /// Removes every entry whose host and path key starts with `prefix`, along
@@ -577,6 +601,13 @@ impl Cache {
     ///
     /// [`purge`]: Cache::purge
     pub fn purge_prefix(&self, prefix: &str) -> usize {
+        if self.shared {
+            if let Some(dir) = &self.disk {
+                if let Some(_lock) = DirLock::acquire(dir) {
+                    remove_shared_entries(dir, Some(prefix));
+                }
+            }
+        }
         let mut store = self.lock();
         let mut removed = 0;
         let mut freed = 0;
@@ -624,6 +655,94 @@ impl std::fmt::Debug for Cache {
             .field("bytes", &bytes)
             .field("entries", &entries)
             .finish()
+    }
+}
+
+struct DirLock {
+    fd: std::os::fd::RawFd,
+}
+
+impl DirLock {
+    fn acquire(dir: &Path) -> Option<Self> {
+        use std::os::fd::AsRawFd;
+        let path = dir.join(".elira-cache.lock");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)
+            .ok()?;
+        let fd = file.as_raw_fd();
+        // Keep the descriptor alive in the guard; `flock` is advisory, but
+        // every Elira process uses it for shared-cache mutations.
+        let result = unsafe { libc::flock(fd, libc::LOCK_EX) };
+        if result != 0 {
+            return None;
+        }
+        std::mem::forget(file);
+        Some(Self { fd })
+    }
+}
+
+impl Drop for DirLock {
+    fn drop(&mut self) {
+        unsafe {
+            libc::flock(self.fd, libc::LOCK_UN);
+            libc::close(self.fd);
+        }
+    }
+}
+
+fn shared_entries(dir: &Path) -> Vec<(PathBuf, std::time::SystemTime, u64)> {
+    let Ok(files) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    files
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with("elira-cache-") || !name.ends_with(".entry") {
+                return None;
+            }
+            let meta = entry.metadata().ok()?;
+            let modified = meta.modified().unwrap_or(UNIX_EPOCH);
+            Some((entry.path(), modified, meta.len()))
+        })
+        .collect()
+}
+
+fn remove_shared_entries(dir: &Path, prefix: Option<&str>) -> usize {
+    let mut removed = 0;
+    for (path, _, _) in shared_entries(dir) {
+        let remove = match prefix {
+            Some(prefix) => match fs::read(&path) {
+                Ok(data) => decode(&data)
+                    .map(|(key, _, _, _)| key.starts_with(prefix))
+                    .unwrap_or(true),
+                Err(_) => true,
+            },
+            None => true,
+        };
+        if remove && fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+fn trim_shared_dir(dir: &Path, max_bytes: usize) {
+    let mut entries = shared_entries(dir);
+    let mut total: u64 = entries.iter().map(|(_, _, len)| *len).sum();
+    entries.sort_by_key(|(_, modified, _)| *modified);
+    for (path, _, len) in entries {
+        if total <= max_bytes as u64 {
+            break;
+        }
+        if fs::remove_file(&path).is_ok() {
+            total = total.saturating_sub(len);
+        }
     }
 }
 
@@ -1969,6 +2088,69 @@ mod tests {
         assert!(isolated
             .get("example.com/x", &request, Instant::now())
             .is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shared_budget_is_enforced_across_instances() {
+        let dir = temp_dir("shared-budget");
+        let request = HeaderMap::new();
+        let response = HeaderMap::new();
+        let body = vec![b'x'; 100];
+        let writer = Cache::with_shared_disk(
+            300,
+            Duration::from_secs(60),
+            Some(dir.clone()),
+            Duration::ZERO,
+            true,
+        );
+        let now = Instant::now();
+        for index in 0..10 {
+            let key = format!("example.com/{index}");
+            writer.insert(&key, &request, &response, 200, body.clone(), now);
+        }
+
+        let total: u64 = fs::read_dir(&dir)
+            .expect("dir")
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".entry"))
+            .filter_map(|entry| entry.metadata().ok())
+            .map(|meta| meta.len())
+            .sum();
+        assert!(total <= 300, "shared cache used {total} bytes");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shared_prefix_purge_deletes_other_instances_files() {
+        let dir = temp_dir("shared-purge");
+        let request = HeaderMap::new();
+        let response = HeaderMap::new();
+        let now = Instant::now();
+        let writer = Cache::with_shared_disk(
+            1024,
+            Duration::from_secs(60),
+            Some(dir.clone()),
+            Duration::ZERO,
+            true,
+        );
+        assert!(writer.insert("a.example/x", &request, &response, 200, b"a".to_vec(), now));
+        assert!(writer.insert("b.example/x", &request, &response, 200, b"b".to_vec(), now));
+
+        let cleaner = Cache::with_shared_disk(
+            1024,
+            Duration::from_secs(60),
+            Some(dir.clone()),
+            Duration::ZERO,
+            true,
+        );
+        assert_eq!(cleaner.purge_prefix("a.example"), 1);
+        let files: Vec<_> = fs::read_dir(&dir)
+            .expect("dir")
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".entry"))
+            .collect();
+        assert_eq!(files.len(), 1, "only the b.example entry should remain");
         let _ = fs::remove_dir_all(&dir);
     }
 }
