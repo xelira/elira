@@ -103,6 +103,11 @@ fn init_tracing() {
 
 async fn run(path: PathBuf) -> anyhow::Result<()> {
     let cfg = Config::load(&path)?;
+    if std::env::var_os("ELIRA_WORKER").is_none() {
+        if let Some(hook) = cfg.tls.as_ref().and_then(|tls| tls.ocsp_hook.as_ref()) {
+            run_ocsp_hook(hook).await;
+        }
+    }
     let runtime = Arc::new(ArcSwap::from_pointee(Runtime::build(&cfg)?));
 
     let listener = server::bind_tcp(cfg.listen, cfg.reuse_port)
@@ -151,6 +156,13 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
     let (restart_tx, mut restart_rx) = watch::channel(0u64);
 
     spawn_signal_task(stop_tx.clone(), reload_tx.clone(), restart_tx)?;
+    if std::env::var_os("ELIRA_WORKER").is_none() {
+        if let Some(tls) = &cfg.tls {
+            if let (Some(hook), Some(_)) = (&tls.ocsp_hook, &tls.ocsp) {
+                spawn_ocsp_refresh(hook.clone(), tls.ocsp_refresh_secs, reload_tx.clone());
+            }
+        }
+    }
     server::spawn_health_loop(runtime.clone(), metrics.clone(), stop_rx.clone());
 
     if let (Some(acme), Some(listen)) = (
@@ -299,6 +311,32 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn reload_counter() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|delta| delta.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+async fn run_ocsp_hook(hook: &Path) {
+    match tokio::process::Command::new(hook).status().await {
+        Ok(status) if status.success() => {}
+        Ok(status) => tracing::warn!(%status, "ocsp hook failed"),
+        Err(error) => tracing::warn!(%error, "cannot run the ocsp hook"),
+    }
+}
+
+fn spawn_ocsp_refresh(hook: PathBuf, interval_secs: u64, reload: watch::Sender<u64>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(interval_secs)).await;
+            run_ocsp_hook(&hook).await;
+            let _ = reload.send(reload_counter());
+            tracing::info!("ocsp hook finished, reloading");
+        }
+    });
 }
 
 fn spawn_h3(
@@ -462,6 +500,7 @@ async fn supervise(config: PathBuf, workers: usize) -> anyhow::Result<()> {
     // Workers send their counters here; the supervisor owns the public
     // metrics listener in multi-process mode.
     let mut metrics_socket = None;
+    let mut gauge_state: Option<(Arc<Metrics>, WorkerGauges)> = None;
     if let Some(metrics_cfg) = cfg.metrics.as_ref() {
         let listener = server::bind_tcp(metrics_cfg.listen, cfg.reuse_port)
             .with_context(|| format!("cannot bind metrics on {}", metrics_cfg.listen))?;
@@ -480,6 +519,7 @@ async fn supervise(config: PathBuf, workers: usize) -> anyhow::Result<()> {
         let statuses: StatusMap = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         let gauges: WorkerGauges =
             Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        gauge_state = Some((aggregate.clone(), gauges.clone()));
         spawn_metrics_receiver(socket, aggregate.clone(), statuses.clone(), gauges);
         let auth = match &metrics_cfg.auth_file {
             Some(path) => Some(Arc::new(elira_auth::BasicAuth::from_file(path)?)),
@@ -556,6 +596,9 @@ async fn supervise(config: PathBuf, workers: usize) -> anyhow::Result<()> {
                     tracing::error!(worker = index, %status, "worker exited, restarting it");
                 } else {
                     tracing::warn!(worker = index, %status, "worker exited, restarting it");
+                }
+                if let Some((aggregate, gauges)) = &gauge_state {
+                    remove_worker_gauges(aggregate, gauges, index);
                 }
                 let slot = spawn_worker(index, &config)?;
                 watch_worker(index, &slot, exit_tx.clone());
@@ -677,6 +720,20 @@ fn spawn_metrics_receiver(
             }
         }
     });
+}
+
+fn remove_worker_gauges(aggregate: &Metrics, gauges: &WorkerGauges, index: usize) {
+    let mut gauges = gauges
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    gauges.remove(&index);
+    let mut total = elira_metrics::Delta::default();
+    for (connections, up, down) in gauges.values() {
+        total.connections_in_flight += connections;
+        total.upstreams_up += up;
+        total.upstreams_down += down;
+    }
+    aggregate.apply_gauges(&total);
 }
 
 fn spawn_worker(index: usize, config: &Path) -> anyhow::Result<WorkerSlot> {

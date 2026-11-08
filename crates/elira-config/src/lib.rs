@@ -657,6 +657,14 @@ pub struct Tls {
     #[serde(default)]
     pub ocsp: Option<PathBuf>,
 
+    /// Command that refreshes `ocsp` and then triggers a reload.
+    #[serde(default)]
+    pub ocsp_hook: Option<PathBuf>,
+
+    /// How often `ocsp_hook` runs.
+    #[serde(default = "Tls::default_ocsp_refresh_secs")]
+    pub ocsp_refresh_secs: u64,
+
     /// Additional certificates selected by SNI. The `cert`/`key` pair above
     /// stays the default when no name matches.
     #[serde(default)]
@@ -673,6 +681,12 @@ pub struct ServerCert {
     /// the default instead of a named one.
     #[serde(default)]
     pub names: Vec<String>,
+}
+
+impl Tls {
+    fn default_ocsp_refresh_secs() -> u64 {
+        24 * 60 * 60
+    }
 }
 
 /// Client certificate policy for the TLS listener.
@@ -1134,6 +1148,16 @@ impl Config {
             {
                 return Err(Error::EmptyOcspPath);
             }
+            if tls
+                .ocsp_hook
+                .as_ref()
+                .is_some_and(|path| path.as_os_str().is_empty() || tls.ocsp.is_none())
+            {
+                return Err(Error::OcspHookNeedsFile);
+            }
+            if tls.ocsp_refresh_secs == 0 && tls.ocsp_hook.is_some() {
+                return Err(Error::OcspRefreshZero);
+            }
 
             let has_default = has_cert && has_key;
             if tls.certificates.is_empty() && !has_default {
@@ -1530,6 +1554,12 @@ pub enum Error {
 
     #[error("tls.ocsp must not be empty")]
     EmptyOcspPath,
+
+    #[error("tls.ocsp_hook needs a non-empty tls.ocsp path")]
+    OcspHookNeedsFile,
+
+    #[error("tls.ocsp_refresh_secs must be greater than zero")]
+    OcspRefreshZero,
 
     #[error("tls.client_ca must not be empty")]
     TlsClientCaEmpty,
@@ -2754,5 +2784,28 @@ root = "/srv/www"
             "challenge = \"dns_01\"\ndns_hook = \"/usr/local/bin/publish-txt\"",
         );
         assert!(Config::parse(&with_hook).is_ok());
+    }
+
+    #[test]
+    fn ocsp_hook_needs_a_file_and_positive_interval() {
+        let base = r#"
+listen = "127.0.0.1:8443"
+
+[tls]
+cert = "/tmp/cert.pem"
+key = "/tmp/key.pem"
+ocsp_hook = "/usr/local/bin/fetch-ocsp"
+
+[[routes]]
+host = "*"
+root = "/srv/www"
+"#;
+        assert!(matches!(Config::parse(base), Err(Error::OcspHookNeedsFile)));
+        let with_file = base.replace(
+            "ocsp_hook = \"/usr/local/bin/fetch-ocsp\"",
+            "ocsp = \"/tmp/ocsp.der\"\nocsp_hook = \"/usr/local/bin/fetch-ocsp\"",
+        );
+        let cfg = Config::parse(&with_file).expect("valid");
+        assert_eq!(cfg.tls.expect("tls").ocsp_refresh_secs, 86400);
     }
 }
