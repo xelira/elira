@@ -349,6 +349,9 @@ pub fn spawn_health_loop(
                     current.proxy.check_health(&current.health).await;
                     let (up, down) = current.proxy.upstream_counts();
                     metrics.set_upstreams(up, down);
+                    for (upstream, active) in current.proxy.pool_loads() {
+                        metrics.set_upstream_load(&upstream, active);
+                    }
                 }
             }
         }

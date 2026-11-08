@@ -830,6 +830,22 @@ impl Proxy {
         }
     }
 
+    /// Active requests per upstream pool, for gauges.
+    pub fn pool_loads(&self) -> Vec<(String, u64)> {
+        self.inner
+            .pools
+            .iter()
+            .map(|pool| {
+                let active = pool
+                    .active
+                    .iter()
+                    .map(|counter| counter.load(Ordering::Relaxed) as u64)
+                    .sum();
+                (pool.name.clone(), active)
+            })
+            .collect()
+    }
+
     /// How many upstream servers are up, and how many are down.
     pub fn upstream_counts(&self) -> (usize, usize) {
         let mut up = 0;

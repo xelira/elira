@@ -168,6 +168,8 @@ pub struct Delta {
     pub tls_handshakes_ok: u64,
     pub tls_handshakes_failed: u64,
     pub quic_connections: u64,
+    /// Active upstream requests per pool, a snapshot.
+    pub upstream_load: Vec<(String, u64)>,
     /// Current connections in flight, not a delta.
     pub connections_in_flight: u64,
     /// Current upstreams considered healthy, not a delta.
@@ -240,6 +242,7 @@ pub struct Metrics {
     tls_handshakes_ok: AtomicU64,
     tls_handshakes_failed: AtomicU64,
     quic_connections: AtomicU64,
+    upstream_load: Mutex<BTreeMap<String, u64>>,
 }
 
 impl Metrics {
@@ -263,6 +266,7 @@ impl Metrics {
             tls_handshakes_ok: AtomicU64::new(0),
             tls_handshakes_failed: AtomicU64::new(0),
             quic_connections: AtomicU64::new(0),
+            upstream_load: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -353,6 +357,14 @@ impl Metrics {
         self.quic_connections.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Replace the active-request gauge for one upstream pool.
+    pub fn set_upstream_load(&self, upstream: &str, active: u64) {
+        self.upstream_load
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(upstream.to_owned(), active);
+    }
+
     pub fn reload_failed(&self) {
         add_saturating(&self.reloads_failed, 1);
     }
@@ -431,6 +443,13 @@ impl Metrics {
             tls_handshakes_ok: self.tls_handshakes_ok.swap(0, Ordering::Relaxed),
             tls_handshakes_failed: self.tls_handshakes_failed.swap(0, Ordering::Relaxed),
             quic_connections: self.quic_connections.swap(0, Ordering::Relaxed),
+            upstream_load: self
+                .upstream_load
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .map(|(name, active)| (name.clone(), *active))
+                .collect(),
             connections_in_flight: self.connections_in_flight.load(Ordering::Relaxed),
             upstreams_up: self.upstreams_up.load(Ordering::Relaxed) as u64,
             upstreams_down: self.upstreams_down.load(Ordering::Relaxed) as u64,
@@ -491,6 +510,15 @@ impl Metrics {
     /// [`Metrics::apply_counters`] and set the gauges themselves.
     pub fn apply_gauges(&self, delta: &Delta) {
         self.connection_set(delta.connections_in_flight);
+        if !delta.upstream_load.is_empty() {
+            let mut load = self
+                .upstream_load
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for (name, active) in &delta.upstream_load {
+                load.insert(name.clone(), *active);
+            }
+        }
         self.set_upstreams(usize_of(delta.upstreams_up), usize_of(delta.upstreams_down));
     }
 
@@ -625,6 +653,22 @@ impl Metrics {
             self.response_bytes.load(Ordering::Relaxed)
         );
 
+        out.push_str("# HELP elira_upstream_active_requests Active requests per upstream pool.\n");
+        out.push_str("# TYPE elira_upstream_active_requests gauge\n");
+        {
+            let load = self
+                .upstream_load
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for (name, active) in load.iter() {
+                let _ = writeln!(
+                    out,
+                    "elira_upstream_active_requests{{upstream=\"{}\"}} {}",
+                    escape_label(name),
+                    active
+                );
+            }
+        }
         out.push_str("# HELP elira_reloads_total Configuration reload attempts by result.\n");
         out.push_str("# TYPE elira_reloads_total counter\n");
         let _ = writeln!(
@@ -1695,5 +1739,16 @@ mod tests {
             return false;
         }
         chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    }
+
+    #[test]
+    fn upstream_load_is_a_gauge() {
+        let metrics = Metrics::new();
+        metrics.set_upstream_load("app", 3);
+        assert!(metrics
+            .render()
+            .contains("elira_upstream_active_requests{upstream=\"app\"} 3"));
+        let delta = metrics.take_delta();
+        assert_eq!(delta.upstream_load, vec![("app".to_owned(), 3)]);
     }
 }

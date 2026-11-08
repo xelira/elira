@@ -47,8 +47,9 @@ Living list for the self-improvement loop. One item per session.
 
 ## C — large projects
 
-- [ ] Upstream HTTP/2 connection pool metrics: hyper's legacy client does not
-  expose pool internals; needs a custom connector or client.
+- [x] Upstream pool active-request gauge.
+- [ ] True HTTP/2 connection-pool internals (connections, streams, queued
+  requests): hyper's legacy client does not expose them; needs a custom client.
 
 - [x] Shared disk cache read-through (`cache.shared`).
 - [x] Global eviction and locking for the shared cache.
