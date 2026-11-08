@@ -516,6 +516,29 @@ async fn supervise(config: PathBuf, workers: usize) -> anyhow::Result<()> {
                 for slot in &slots {
                     kill(slot.pid, libc::SIGHUP);
                 }
+                match Config::load(&config) {
+                    Ok(next) if next.workers > slots.len() => {
+                        let extra = next.workers - slots.len();
+                        for _ in 0..extra {
+                            let index = slots.len();
+                            let slot = spawn_worker(index, &config)?;
+                            watch_worker(index, &slot, exit_tx.clone());
+                            slots.push(slot);
+                            wait_worker_ready(&slots[index]).await?;
+                            tracing::info!(worker = index, "added a worker on reload");
+                        }
+                    }
+                    Ok(next) if next.workers < slots.len() => {
+                        tracing::warn!(
+                            "reducing worker count needs a restart; keeping {} workers",
+                            slots.len()
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        tracing::error!(error = %err, "cannot read the config for worker scaling");
+                    }
+                }
                 tracing::info!("sent SIGHUP to every worker");
             }
             _ = sigusr2.recv() => {

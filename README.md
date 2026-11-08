@@ -280,7 +280,8 @@ The listener has no TLS. Put it on loopback or set `auth_file`.
 - FastCGI/CGI bodies stream with bounded channels; very large uploads are cut
   by `max_response_bytes`/`max_body_bytes`.
 - `workers` and listener changes need a restart. SIGHUP reloads routes in every
-  worker; SIGUSR2 rolls the workers one by one. In worker mode `/metrics` and
+  worker; SIGUSR2 rolls the workers one by one. Increasing `workers` on SIGHUP
+  adds processes, decreasing needs a restart. In worker mode `/metrics` and
   `/status` are aggregated by the supervisor; `/reload`, `/drain` and
   `/cache/purge` are not exposed there.
 - DNS resolution uses the system resolver. `dns_ttl_secs` bounds how long a
