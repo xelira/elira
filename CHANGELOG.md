@@ -105,7 +105,7 @@
 - Gauge `elira_tls_certificate_expires_seconds` для TCP/QUIC сертификатов.
 - Per-route `access_log = false`.
 - `Cache-Control: must-revalidate` запрещает stale-выдачу; `Expires`/`Date`
-  задают TTL, если `max-age` нет.
+  задают TTL, если `max-age` нет. Запросы с `no-cache`/`no-store` обходят кэш.
 - Заголовки `Forwarded` и `X-Forwarded-Port` к upstream.
 - `cache.shared`: read-through общего дискового кэша между воркерами,
   общий бюджет, advisory-lock и стабильное имя файла на key+Vary.

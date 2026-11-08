@@ -1000,7 +1000,23 @@ fn take_bytes<'a>(data: &'a [u8], pos: &mut usize) -> Option<&'a [u8]> {
 /// cache does not know whether two requests share an identity, so the only
 /// safe answer is to bypass it entirely.
 fn is_sensitive(request: &HeaderMap) -> bool {
-    request.contains_key(AUTHORIZATION) || request.contains_key(COOKIE)
+    if request.contains_key(AUTHORIZATION) || request.contains_key(COOKIE) {
+        return true;
+    }
+    // A client that asks for fresh content must not be answered from, or
+    // populate, a shared cache.
+    for value in request.get_all(CACHE_CONTROL) {
+        if let Ok(value) = value.to_str() {
+            let value = value.to_ascii_lowercase();
+            if value.contains("no-cache") || value.contains("no-store") {
+                return true;
+            }
+        }
+    }
+    request
+        .get("pragma")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().contains("no-cache"))
 }
 
 /// Lifetime for a response, or `None` when it must not be stored.
@@ -2354,5 +2370,34 @@ mod tests {
             b"body".to_vec(),
             Instant::now()
         ));
+    }
+
+    #[test]
+    fn request_no_cache_bypasses_the_cache() {
+        let cache = Cache::new(1024, Duration::from_secs(60));
+        let mut response = HeaderMap::new();
+        response.insert("cache-control", "max-age=60".parse().unwrap());
+        let now = Instant::now();
+
+        let request = HeaderMap::new();
+        assert!(cache.insert(
+            "example.com/x",
+            &request,
+            &response,
+            200,
+            b"body".to_vec(),
+            now
+        ));
+
+        for header in ["no-cache", "no-store"] {
+            let mut bypass = HeaderMap::new();
+            bypass.insert("cache-control", header.parse().unwrap());
+            assert!(cache.get("example.com/x", &bypass, now).is_none());
+            assert!(!cache.insert("example.com/y", &bypass, &response, 200, b"x".to_vec(), now));
+        }
+
+        let mut pragma = HeaderMap::new();
+        pragma.insert("pragma", "no-cache".parse().unwrap());
+        assert!(cache.get("example.com/x", &pragma, now).is_none());
     }
 }
