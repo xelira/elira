@@ -10,6 +10,8 @@ members = [
     "crates/elira-metrics",
     "crates/elira-limit",
     "crates/elira-cache",
+    "crates/elira-acme",
+    "crates/elira-upstream",
 ]
 
 [workspace.package]
@@ -46,4 +48,5 @@ tokio-util = { version = "0.7", features = ["io"] }
 percent-encoding = "2"
 httpdate = "1"
 ipnet = "2"
+socket2 = { version = "0.5", features = ["all"] }
 async-compression = { version = "0.4", features = ["tokio", "gzip", "brotli"] }

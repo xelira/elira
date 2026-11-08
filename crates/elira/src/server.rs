@@ -70,13 +70,14 @@ impl Runtime {
 
 /// What the accept loop needs. Everything here is captured at startup and a
 /// reload cannot change it.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Options {
     pub max_connections: usize,
     pub max_headers: usize,
     pub max_buf_size: usize,
     pub idle_timeout: Duration,
     pub proxy_protocol: bool,
+    pub acme: Option<Arc<elira_acme::Acme>>,
 }
 
 impl Options {
@@ -87,8 +88,30 @@ impl Options {
             max_buf_size: cfg.limits.max_header_bytes,
             idle_timeout: Duration::from_secs(cfg.limits.idle_timeout_secs),
             proxy_protocol: cfg.proxy_protocol,
+            acme: None,
         }
     }
+}
+
+/// Bind a TCP listener, optionally with SO_REUSEPORT so a replacement
+/// process can share the port during a hot restart.
+pub fn bind_tcp(addr: SocketAddr, reuse_port: bool) -> std::io::Result<TcpListener> {
+    let domain = if addr.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+
+    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    socket.set_reuse_address(true)?;
+    if reuse_port {
+        socket.set_reuse_port(true)?;
+    }
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+
+    TcpListener::from_std(socket.into())
 }
 
 /// Accept connections until the stop channel flips, then drain.
@@ -130,6 +153,7 @@ pub async fn serve(
 
                 let runtime = runtime.clone();
                 let metrics = metrics.clone();
+                let options = options.clone();
                 let mut stop = stop.clone();
                 connections.spawn(async move {
                     let _permit = permit;
@@ -209,16 +233,35 @@ async fn serve_stream(
         }
     }
 
-    let tls = runtime.load().tls.clone();
-    let secure = tls.is_some();
-
     let conn = ConnOptions {
         max_headers: options.max_headers,
         max_buf_size: options.max_buf_size,
         idle_timeout: options.idle_timeout,
         h2: false,
-        secure,
+        secure: false,
     };
+
+    if let Some(acme) = &options.acme {
+        match acme.accept(stream).await {
+            Ok((io, h2)) => {
+                let conn = ConnOptions {
+                    h2,
+                    secure: true,
+                    ..conn
+                };
+                serve_conn(io, peer, runtime, conn, metrics, stop).await;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::ConnectionAborted => {
+                tracing::debug!(%peer, "acme validation connection");
+            }
+            Err(err) => tracing::debug!(%peer, error = %err, "acme handshake failed"),
+        }
+        return;
+    }
+
+    let tls = runtime.load().tls.clone();
+    let secure = tls.is_some();
+    let conn = ConnOptions { secure, ..conn };
 
     match tls {
         Some(config) => {
@@ -454,5 +497,25 @@ async fn idle_watch(idle: Arc<tokio::sync::Notify>, timeout: Duration) {
             Ok(()) => continue,
             Err(_) => return,
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn reuse_port_lets_two_listeners_share_a_port() {
+        let first = bind_tcp("127.0.0.1:0".parse().unwrap(), true).expect("first bind");
+        let addr = first.local_addr().expect("addr");
+        let second = bind_tcp(addr, true).expect("second bind");
+        assert_eq!(second.local_addr().expect("addr"), addr);
+    }
+
+    #[tokio::test]
+    async fn without_reuse_port_the_second_bind_fails() {
+        let first = bind_tcp("127.0.0.1:0".parse().unwrap(), false).expect("first bind");
+        let addr = first.local_addr().expect("addr");
+        assert!(bind_tcp(addr, false).is_err());
     }
 }

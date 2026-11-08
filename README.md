@@ -118,6 +118,10 @@ remove_headers = ["X-Powered-By"]
 - `X-Request-Id` echoed and forwarded, `Alt-Svc` advertises HTTP/3
 - brotli and gzip, plus precompressed `.br`/`.gz` static siblings
 - an in-memory cache for small `GET` responses with `X-Cache: HIT/MISS`
+- `try_files` and generated directory listings (`autoindex`)
+- TLS to upstreams, with a custom CA or an explicit insecure mode
+- ACME (Let's Encrypt, TLS-ALPN-01) instead of a static `[tls]` block
+- hot restart on `SIGUSR2` with `reuse_port = true`, no dropped connections
 - access log in text or JSON, with a request id per line
 - active health checks: a server that stops answering 2xx/3xx stops receiving
   traffic, and comes back on its own
@@ -132,10 +136,12 @@ remove_headers = ["X-Powered-By"]
 ## Not yet
 
 `CONNECT` is disabled unless `[connect]` names the destinations, and it is
-HTTP/1.1 only. Static files are streamed through userspace, not `sendfile`,
-so a large file costs a copy per chunk. Multi-range requests fall back to the
-whole file. The HTTP/3 listener is restarted on SIGHUP, which resets its live
-connections; HTTP/1.1 and HTTP/2 connections survive a reload.
+HTTP/1.1 only. Static files are streamed through userspace, not `sendfile`:
+hyper owns the socket and never hands it to the body, so zero-copy needs a
+connection takeover that this architecture does not do. Multi-range requests
+fall back to the whole file. The HTTP/3 listener is restarted on SIGHUP, which
+resets its live connections; HTTP/1.1 and HTTP/2 connections survive a reload.
+The ACME path compiles and is wired, but has not been run against a real CA.
 
 ## Layout
 

@@ -1000,3 +1000,163 @@ root = "{}"
     assert!(lower.contains("content-encoding: br"), "{compressed}");
     assert!(compressed.ends_with("fake-brotli"), "{compressed}");
 }
+
+#[tokio::test]
+async fn try_files_rewrites_a_missing_path() {
+    let root = temp_root("tryfiles");
+    std::fs::write(root.join("about.html"), "<h1>about</h1>").unwrap();
+
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[routes]]
+host = "*"
+root = "{}"
+try_files = ["$uri", "$uri.html"]
+"#,
+        root.display()
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let about = roundtrip(
+        addr,
+        "GET /about HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&about), "HTTP/1.1 200 OK");
+    assert!(about.ends_with("<h1>about</h1>"), "{about}");
+
+    let missing = roundtrip(
+        addr,
+        "GET /nope HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&missing), "HTTP/1.1 404 Not Found");
+}
+
+#[tokio::test]
+async fn autoindex_lists_a_directory() {
+    let root = temp_root("autoindex");
+    std::fs::create_dir_all(root.join("docs")).unwrap();
+    std::fs::write(root.join("docs").join("a.txt"), "a").unwrap();
+
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[routes]]
+host = "*"
+root = "{}"
+autoindex = true
+"#,
+        root.display()
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let listing = roundtrip(
+        addr,
+        "GET /docs/ HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&listing), "HTTP/1.1 200 OK");
+    assert!(listing
+        .to_ascii_lowercase()
+        .contains("content-type: text/html"));
+    assert!(listing.contains("<a href=\"a.txt\">a.txt</a>"), "{listing}");
+
+    let redirect = roundtrip(
+        addr,
+        "GET /docs HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&redirect), "HTTP/1.1 301 Moved Permanently");
+}
+
+async fn tls_upstream() -> SocketAddr {
+    let fixtures =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../elira-tls/tests/fixtures");
+    let config = elira_tls::server_config(&fixtures.join("cert.pem"), &fixtures.join("key.pem"))
+        .expect("tls config");
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind tls");
+    let addr = listener.local_addr().expect("addr");
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let acceptor = acceptor.clone();
+
+            tokio::spawn(async move {
+                let Ok(mut stream) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 3\r\n\
+                          Connection: close\r\n\r\ntls",
+                    )
+                    .await;
+            });
+        }
+    });
+
+    addr
+}
+
+fn tls_proxy_config(upstream: SocketAddr, insecure: bool) -> String {
+    let block = if insecure {
+        "[upstream_tls]\ninsecure = true\n"
+    } else {
+        ""
+    };
+
+    format!(
+        r#"
+listen = "127.0.0.1:0"
+
+{block}
+
+[[upstreams]]
+name = "secure"
+servers = ["{upstream}"]
+tls = true
+
+[[routes]]
+host = "*"
+upstream = "secure"
+"#
+    )
+}
+
+#[tokio::test]
+async fn proxies_to_a_tls_upstream() {
+    let upstream = tls_upstream().await;
+    let (addr, _stop, _metrics) = start(&tls_proxy_config(upstream, true)).await;
+
+    let response = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&response), "HTTP/1.1 200 OK");
+    assert!(response.ends_with("tls"), "{response}");
+}
+
+#[tokio::test]
+async fn self_signed_tls_upstream_is_rejected_by_default() {
+    let upstream = tls_upstream().await;
+    let (addr, _stop, _metrics) = start(&tls_proxy_config(upstream, false)).await;
+
+    let response = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&response), "HTTP/1.1 502 Bad Gateway");
+}

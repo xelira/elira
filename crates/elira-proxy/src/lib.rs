@@ -22,6 +22,7 @@ use http::uri::Authority;
 use http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, StreamBody};
+use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -34,6 +35,7 @@ use tokio_util::io::{ReaderStream, StreamReader};
 use elira_cache::Cache;
 use elira_config::{Balance, Compression, Config, Health};
 use elira_limit::RateLimiter;
+use elira_upstream::{https_connector, TlsOptions};
 
 mod files;
 
@@ -50,7 +52,7 @@ pub struct Proxy {
 struct Inner {
     router: Router,
     pools: Vec<Arc<Pool>>,
-    client: Client<HttpConnector, Body>,
+    client: Client<HttpsConnector<HttpConnector>, Body>,
     tunnels: Arc<Semaphore>,
     connect: Option<Vec<Authority>>,
     compression: Compression,
@@ -141,6 +143,7 @@ struct Pool {
     next: AtomicUsize,
     balance: Balance,
     retries: u32,
+    scheme: &'static str,
 }
 
 struct ActiveGuard<'a> {
@@ -228,6 +231,7 @@ impl Proxy {
                     next: AtomicUsize::new(0),
                     balance: up.balance,
                     retries: up.retries,
+                    scheme: if up.tls { "https" } else { "http" },
                 }),
             );
         }
@@ -249,6 +253,8 @@ impl Proxy {
                     root.clone(),
                     route.index.clone(),
                     route.spa,
+                    route.try_files.clone(),
+                    route.autoindex,
                 )))
             } else if let Some(redirect) = &route.redirect {
                 let status =
@@ -351,6 +357,15 @@ impl Proxy {
             None
         };
 
+        let connector = https_connector(&TlsOptions {
+            insecure: cfg.upstream_tls.insecure,
+            ca: cfg.upstream_tls.ca.clone(),
+            sni: None,
+        })
+        .map_err(|err| Error::UpstreamTls {
+            reason: err.to_string(),
+        })?;
+
         let client = Client::builder(TokioExecutor::new())
             .pool_idle_timeout(Some(Duration::from_secs(30)))
             .build(connector);
@@ -407,6 +422,12 @@ impl Proxy {
         }
         let timeout = Duration::from_secs(cfg.timeout_secs);
         for pool in &self.inner.pools {
+            // The probe speaks plain HTTP; a TLS upstream would answer with a
+            // handshake failure. Leave those marked healthy.
+            if pool.scheme == "https" {
+                continue;
+            }
+
             for (index, server) in pool.servers.iter().enumerate() {
                 let up = probe(server, &cfg.path, timeout).await;
                 pool.set_health(index, up);
@@ -711,7 +732,7 @@ impl Proxy {
             let index = pool.pick();
             let server = pool.servers[index].clone();
             let _active = pool.enter(index);
-            let uri = upstream_uri(&server, &upstream_path)
+            let uri = upstream_uri(&server, &upstream_path, pool.scheme)
                 .ok_or_else(|| text(StatusCode::BAD_GATEWAY, "bad upstream address"))?;
 
             let mut upstream = Request::builder()
@@ -738,7 +759,7 @@ impl Proxy {
             let server = pool.servers[index].clone();
             let _active = pool.enter(index);
 
-            let uri = upstream_uri(&server, &upstream_path)
+            let uri = upstream_uri(&server, &upstream_path, pool.scheme)
                 .ok_or_else(|| text(StatusCode::BAD_GATEWAY, "bad upstream address"))?;
             let payload = if attempt == 0 {
                 body.take().unwrap_or_else(empty)
@@ -1282,9 +1303,9 @@ fn cache_response(entry: elira_cache::Entry) -> Response<Body> {
         .unwrap_or_else(|_| text(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"))
 }
 
-fn upstream_uri(server: &Authority, path: &str) -> Option<Uri> {
+fn upstream_uri(server: &Authority, path: &str, scheme: &'static str) -> Option<Uri> {
     Uri::builder()
-        .scheme("http")
+        .scheme(scheme)
         .authority(server.as_str())
         .path_and_query(path)
         .build()
@@ -1429,6 +1450,9 @@ pub enum Error {
 
     #[error("route for \"{host}\" has an invalid redirect target or status")]
     BadRedirect { host: String },
+
+    #[error("upstream TLS: {reason}")]
+    UpstreamTls { reason: String },
 }
 
 #[cfg(test)]
@@ -1509,6 +1533,7 @@ mod tests {
             next: AtomicUsize::new(0),
             balance: Balance::LeastConn,
             retries: 0,
+            scheme: "http",
         };
 
         assert_eq!(pool.pick(), 0);

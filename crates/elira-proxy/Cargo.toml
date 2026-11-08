@@ -9,6 +9,7 @@ repository.workspace = true
 elira-accesslog = { path = "../elira-accesslog" }
 elira-cache = { path = "../elira-cache" }
 elira-config = { path = "../elira-config" }
+elira-upstream = { path = "../elira-upstream" }
 elira-limit = { path = "../elira-limit" }
 futures-util = { workspace = true }
 httpdate = { workspace = true }
@@ -21,6 +22,7 @@ http = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
+hyper-rustls = "0.27.10"
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

@@ -22,10 +22,17 @@ pub struct Config {
     pub server_header: bool,
     #[serde(default)]
     pub cache: Cache,
+    #[serde(default)]
+    pub upstream_tls: UpstreamTls,
+    #[serde(default)]
+    pub acme: Option<Acme>,
     /// Expect a PROXY protocol header on every accepted connection. Enable
     /// only when the listener is reachable solely through a load balancer.
     #[serde(default)]
     pub proxy_protocol: bool,
+    /// Let a replacement process bind the same ports. Required for SIGUSR2.
+    #[serde(default)]
+    pub reuse_port: bool,
     #[serde(default)]
     pub tls: Option<Tls>,
     #[serde(default)]
@@ -241,6 +248,31 @@ pub struct Upstream {
     /// Extra attempts on connection errors for bodyless idempotent requests.
     #[serde(default)]
     pub retries: u32,
+
+    /// Connect to the servers with TLS (https).
+    #[serde(default)]
+    pub tls: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Acme {
+    pub domains: Vec<String>,
+    pub contacts: Vec<String>,
+    pub cache_dir: PathBuf,
+    #[serde(default)]
+    pub production: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamTls {
+    /// Skip certificate and hostname verification. Only for internal setups.
+    #[serde(default)]
+    pub insecure: bool,
+    /// Extra PEM roots, added to the system store.
+    #[serde(default)]
+    pub ca: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -285,6 +317,15 @@ pub struct Route {
     /// Remove the matched path prefix before forwarding to the upstream.
     #[serde(default)]
     pub strip_prefix: bool,
+
+    /// Candidates tried, in order, when the path does not exist. `$uri` is
+    /// replaced with the request path.
+    #[serde(default)]
+    pub try_files: Vec<String>,
+
+    /// Generate a directory listing when no index file exists.
+    #[serde(default)]
+    pub autoindex: bool,
 
     /// Response headers to set, as `Name: value`.
     #[serde(default)]
@@ -438,6 +479,21 @@ impl Config {
             }
         }
 
+        if let Some(acme) = &self.acme {
+            if self.tls.is_some() {
+                return Err(Error::TlsAndAcme);
+            }
+            if acme.domains.is_empty() {
+                return Err(Error::AcmeNoDomains);
+            }
+            if acme.contacts.is_empty() {
+                return Err(Error::AcmeNoContacts);
+            }
+            if acme.cache_dir.as_os_str().is_empty() {
+                return Err(Error::AcmeNoCacheDir);
+            }
+        }
+
         if let Some(http3) = &self.http3 {
             if http3.cert.as_os_str().is_empty() {
                 return Err(Error::Http3MissingCert);
@@ -546,6 +602,22 @@ impl Config {
 
             if route.strip_prefix && route.upstream.is_none() {
                 return Err(Error::StripWithoutUpstream { index });
+            }
+
+            if route.autoindex && route.root.is_none() {
+                return Err(Error::AutoindexWithoutRoot { index });
+            }
+
+            for candidate in &route.try_files {
+                if candidate.is_empty()
+                    || candidate.chars().any(char::is_control)
+                    || candidate.contains("..")
+                {
+                    return Err(Error::BadTryFile {
+                        index,
+                        candidate: candidate.clone(),
+                    });
+                }
             }
 
             if let Some(upstream) = &route.upstream {
@@ -737,6 +809,24 @@ pub enum Error {
 
     #[error("route {index}: `strip_prefix` needs an upstream")]
     StripWithoutUpstream { index: usize },
+
+    #[error("route {index}: `autoindex` needs a root")]
+    AutoindexWithoutRoot { index: usize },
+
+    #[error("[acme] and [tls] cannot both be set")]
+    TlsAndAcme,
+
+    #[error("acme.domains must not be empty")]
+    AcmeNoDomains,
+
+    #[error("acme.contacts must not be empty")]
+    AcmeNoContacts,
+
+    #[error("acme.cache_dir must not be empty")]
+    AcmeNoCacheDir,
+
+    #[error("route {index}: try_files entry \"{candidate}\" is empty or unsafe")]
+    BadTryFile { index: usize, candidate: String },
 
     #[error("route {index}: redirect target is empty or contains control characters")]
     BadRedirect { index: usize },
@@ -1178,5 +1268,72 @@ upstream = "app"
         assert!(!cfg.cache.enabled);
         assert_eq!(cfg.cache.ttl_secs, 60);
         assert!(cfg.server_header);
+    }
+
+    #[test]
+    fn rejects_acme_and_tls_together() {
+        let text = r#"
+listen = "127.0.0.1:8080"
+
+[tls]
+cert = "cert.pem"
+key = "key.pem"
+
+[acme]
+domains = ["example.com"]
+contacts = ["mailto:admin@example.com"]
+cache_dir = "/tmp/acme"
+
+[[routes]]
+host = "*"
+redirect = { to = "https://example.com", status = 301 }
+"#;
+        assert!(matches!(Config::parse(text), Err(Error::TlsAndAcme)));
+    }
+
+    #[test]
+    fn parses_try_files_autoindex_and_upstream_tls() {
+        let text = r#"
+listen = "127.0.0.1:8080"
+
+[upstream_tls]
+insecure = true
+
+[[upstreams]]
+name = "app"
+servers = ["127.0.0.1:3000"]
+tls = true
+
+[[routes]]
+host = "*"
+root = "/srv"
+try_files = ["$uri", "$uri.html"]
+autoindex = true
+"#;
+        let cfg = Config::parse(text).expect("valid config");
+        assert_eq!(cfg.routes[0].try_files.len(), 2);
+        assert!(cfg.routes[0].autoindex);
+        assert!(cfg.upstreams[0].tls);
+        assert!(cfg.upstream_tls.insecure);
+    }
+
+    #[test]
+    fn rejects_autoindex_without_root() {
+        let text = r#"
+listen = "127.0.0.1:8080"
+
+[[upstreams]]
+name = "app"
+servers = ["127.0.0.1:3000"]
+
+[[routes]]
+host = "*"
+upstream = "app"
+autoindex = true
+"#;
+        assert!(matches!(
+            Config::parse(text),
+            Err(Error::AutoindexWithoutRoot { .. })
+        ));
     }
 }

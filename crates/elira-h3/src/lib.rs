@@ -25,6 +25,7 @@ pub struct Config {
     pub listen: SocketAddr,
     pub cert: PathBuf,
     pub key: PathBuf,
+    pub reuse_port: bool,
 }
 
 pub async fn serve(
@@ -37,7 +38,7 @@ pub async fn serve(
     let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls)?;
     let server = quinn::ServerConfig::with_crypto(Arc::new(crypto));
 
-    let endpoint = bind(cfg.listen, server).await?;
+    let endpoint = bind(cfg.listen, server, cfg.reuse_port).await?;
     tracing::info!(listen = %cfg.listen, "http/3 listening");
 
     loop {
@@ -69,11 +70,15 @@ pub async fn serve(
 
 /// QUIC sockets are released by quinn's driver task, not by the `Endpoint`
 /// drop itself. A reload that rebinds on the same port needs a moment.
-async fn bind(addr: SocketAddr, server: quinn::ServerConfig) -> std::io::Result<quinn::Endpoint> {
+async fn bind(
+    addr: SocketAddr,
+    server: quinn::ServerConfig,
+    reuse_port: bool,
+) -> std::io::Result<quinn::Endpoint> {
     let mut last = None;
 
     for _ in 0..20 {
-        match quinn::Endpoint::server(server.clone(), addr) {
+        match try_bind(addr, server.clone(), reuse_port) {
             Ok(endpoint) => return Ok(endpoint),
             Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
                 last = Some(err);
@@ -84,6 +89,36 @@ async fn bind(addr: SocketAddr, server: quinn::ServerConfig) -> std::io::Result<
     }
 
     Err(last.expect("the loop only exits early with an error"))
+}
+
+fn try_bind(
+    addr: SocketAddr,
+    server: quinn::ServerConfig,
+    reuse_port: bool,
+) -> std::io::Result<quinn::Endpoint> {
+    let domain = if addr.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+
+    let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+    socket.set_reuse_address(true)?;
+    if reuse_port {
+        socket.set_reuse_port(true)?;
+    }
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+
+    let runtime = quinn::default_runtime()
+        .ok_or_else(|| std::io::Error::other("no async runtime for quinn"))?;
+
+    quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(server),
+        socket.into(),
+        runtime,
+    )
 }
 
 async fn connection(

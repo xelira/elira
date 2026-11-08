@@ -1,0 +1,16 @@
+[package]
+name = "elira-acme"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+futures-util = { workspace = true }
+rustls = { workspace = true }
+rustls-acme = { version = "0.15", features = ["tokio"] }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true, features = ["compat"] }
+tracing = { workspace = true }

@@ -28,11 +28,25 @@ pub(crate) struct Files {
     root: PathBuf,
     index: Vec<String>,
     spa: bool,
+    try_files: Vec<String>,
+    autoindex: bool,
 }
 
 impl Files {
-    pub(crate) fn new(root: PathBuf, index: Vec<String>, spa: bool) -> Self {
-        Self { root, index, spa }
+    pub(crate) fn new(
+        root: PathBuf,
+        index: Vec<String>,
+        spa: bool,
+        try_files: Vec<String>,
+        autoindex: bool,
+    ) -> Self {
+        Self {
+            root,
+            index,
+            spa,
+            try_files,
+            autoindex,
+        }
     }
 
     pub(crate) async fn serve(
@@ -78,35 +92,34 @@ impl Files {
         };
 
         let mut candidate = root.join(&relative);
-        let mut meta = match tokio::fs::metadata(&candidate).await {
-            Ok(meta) => meta,
-            Err(_) => return self.fallback(&root, req).await,
-        };
+        let mut meta = tokio::fs::metadata(&candidate).await.ok();
 
-        if meta.is_dir() {
-            if !decoded.ends_with('/') {
-                return redirect(&decoded);
-            }
-
-            let mut found = None;
-            for name in &self.index {
-                let path = candidate.join(name);
-                if let Ok(meta) = tokio::fs::metadata(&path).await {
-                    if meta.is_file() {
-                        found = Some((path, meta));
-                        break;
-                    }
+        if let Some(current) = &meta {
+            if current.is_dir() {
+                if !decoded.ends_with('/') {
+                    return redirect(&decoded);
                 }
-            }
-
-            match found {
-                Some((path, index_meta)) => {
+                if let Some((path, index_meta)) = self.index_for(&candidate).await {
                     candidate = path;
-                    meta = index_meta;
+                    meta = Some(index_meta);
+                } else if self.autoindex {
+                    return self.listing(&candidate, &decoded).await;
+                } else {
+                    meta = None;
                 }
-                None => return text(StatusCode::NOT_FOUND, "not found"),
             }
         }
+
+        if meta.is_none() {
+            if let Some(path) = self.try_files(&root, &relative).await {
+                candidate = path;
+                meta = tokio::fs::metadata(&candidate).await.ok();
+            }
+        }
+
+        let Some(meta) = meta else {
+            return self.fallback(&root, req).await;
+        };
 
         let resolved = match tokio::fs::canonicalize(&candidate).await {
             Ok(resolved) => resolved,
@@ -119,6 +132,76 @@ impl Files {
         }
 
         self.send(req, &resolved, &meta).await
+    }
+
+    async fn index_for(&self, dir: &Path) -> Option<(PathBuf, std::fs::Metadata)> {
+        for name in &self.index {
+            let path = dir.join(name);
+            if let Ok(meta) = tokio::fs::metadata(&path).await {
+                if meta.is_file() {
+                    return Some((path, meta));
+                }
+            }
+        }
+        None
+    }
+
+    async fn try_files(&self, root: &Path, relative: &Path) -> Option<PathBuf> {
+        let uri = relative.to_string_lossy();
+
+        for pattern in &self.try_files {
+            let candidate = pattern.replace("$uri", &uri);
+            let path = root.join(candidate.trim_start_matches('/'));
+            if let Ok(meta) = tokio::fs::metadata(&path).await {
+                if meta.is_file() {
+                    return Some(path);
+                }
+            }
+        }
+
+        None
+    }
+
+    async fn listing(&self, dir: &Path, decoded: &str) -> Response<super::Body> {
+        let mut entries = Vec::new();
+
+        if let Ok(mut read) = tokio::fs::read_dir(dir).await {
+            while let Ok(Some(entry)) = read.next_entry().await {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let is_dir = entry
+                    .file_type()
+                    .await
+                    .map(|kind| kind.is_dir())
+                    .unwrap_or(false);
+                entries.push((name, is_dir));
+            }
+        }
+
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut html =
+            String::from("<!doctype html><meta charset=\"utf-8\"><title>Index</title><ul>");
+        if decoded != "/" {
+            html.push_str("<li><a href=\"../\">../</a></li>");
+        }
+        for (name, is_dir) in entries {
+            let suffix = if is_dir { "/" } else { "" };
+            let escaped = escape_html(&name);
+            html.push_str(&format!(
+                "<li><a href=\"{escaped}{suffix}\">{escaped}{suffix}</a></li>"
+            ));
+        }
+        html.push_str("</ul>");
+
+        let body = http_body_util::Full::new(Bytes::from(html))
+            .map_err(|never| match never {})
+            .boxed();
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "text/html; charset=utf-8")
+            .header(http::header::CACHE_CONTROL, "no-store")
+            .body(body)
+            .expect("static response")
     }
 
     async fn fallback(&self, root: &Path, req: &Request<super::Body>) -> Response<super::Body> {
@@ -361,6 +444,23 @@ fn parse_range(value: &str, len: u64) -> Option<Result<ByteRange, ()>> {
     }
 
     Some(Ok(ByteRange { start, end }))
+}
+
+fn escape_html(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+
+    for ch in value.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            ch => out.push(ch),
+        }
+    }
+
+    out
 }
 
 fn content_type(path: &Path) -> &'static str {

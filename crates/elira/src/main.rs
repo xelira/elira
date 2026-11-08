@@ -8,7 +8,6 @@ use clap::{Parser, Subcommand};
 use elira::config::Config;
 use elira::server::{self, Options, Runtime};
 use elira_metrics::Metrics;
-use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
 
@@ -65,8 +64,7 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
     let cfg = Config::load(&path)?;
     let runtime = Arc::new(ArcSwap::from_pointee(Runtime::build(&cfg)?));
 
-    let listener = TcpListener::bind(cfg.listen)
-        .await
+    let listener = server::bind_tcp(cfg.listen, cfg.reuse_port)
         .with_context(|| format!("cannot bind {}", cfg.listen))?;
 
     tracing::info!(
@@ -77,28 +75,38 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
         "listening"
     );
 
-    let options = Options::from_config(&cfg);
+    let mut options = Options::from_config(&cfg);
+    if let Some(acme) = &cfg.acme {
+        let started = elira_acme::Acme::start(elira_acme::AcmeConfig {
+            domains: acme.domains.clone(),
+            contacts: acme.contacts.clone(),
+            cache_dir: acme.cache_dir.clone(),
+            production: acme.production,
+        })
+        .await?;
+        options.acme = Some(Arc::new(started));
+    }
     let metrics = Arc::new(Metrics::new());
     let (stop_tx, stop_rx) = watch::channel(false);
     let (reload_tx, mut reload_rx) = watch::channel(0u64);
+    let (restart_tx, mut restart_rx) = watch::channel(0u64);
 
-    spawn_signal_task(stop_tx.clone(), reload_tx)?;
+    spawn_signal_task(stop_tx.clone(), reload_tx, restart_tx)?;
     server::spawn_health_loop(runtime.clone(), metrics.clone(), stop_rx.clone());
 
     if let Some(metrics_cfg) = &cfg.metrics {
-        let metrics_listener = TcpListener::bind(metrics_cfg.listen)
-            .await
+        let metrics_listener = server::bind_tcp(metrics_cfg.listen, cfg.reuse_port)
             .with_context(|| format!("cannot bind metrics on {}", metrics_cfg.listen))?;
         server::spawn_metrics(metrics_listener, metrics.clone(), stop_rx.clone());
     }
 
-    let mut h3_task = spawn_h3(runtime.clone(), stop_rx.clone());
+    let mut h3_task = spawn_h3(runtime.clone(), stop_rx.clone(), cfg.reuse_port);
     let mut stop_wait = stop_rx.clone();
 
     let serving = tokio::spawn(server::serve(
         listener,
         runtime.clone(),
-        options,
+        options.clone(),
         metrics.clone(),
         stop_rx.clone(),
     ));
@@ -107,12 +115,30 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
         tokio::select! {
             _ = stop_wait.changed() => break,
 
+            changed = restart_rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+
+                if !cfg.reuse_port {
+                    tracing::warn!("SIGUSR2 needs reuse_port = true; ignoring");
+                    continue;
+                }
+
+                spawn_replacement();
+                // The replacement binds the same ports immediately; give it a
+                // moment, then let this process drain and exit.
+                tokio::time::sleep(Duration::from_millis(750)).await;
+                let _ = stop_tx.send(true);
+                break;
+            }
+
             changed = reload_rx.changed() => {
                 if changed.is_err() {
                     break;
                 }
 
-                reload(&path, &cfg, &runtime, options).await;
+                reload(&path, &cfg, &runtime, options.clone()).await;
 
                 // The new Runtime carries its own http3 config. Restart the
                 // listener against it instead of keeping the old one.
@@ -121,7 +147,7 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
                     // Wait for the QUIC endpoint to drop before rebinding.
                     let _ = handle.await;
                 }
-                h3_task = spawn_h3(runtime.clone(), stop_rx.clone());
+                h3_task = spawn_h3(runtime.clone(), stop_rx.clone(), cfg.reuse_port);
             }
         }
     }
@@ -148,6 +174,7 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
 fn spawn_h3(
     runtime: Arc<ArcSwap<Runtime>>,
     stop: watch::Receiver<bool>,
+    reuse_port: bool,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let current = runtime.load();
     let http3 = current.http3().cloned()?;
@@ -160,6 +187,7 @@ fn spawn_h3(
             listen: http3.listen,
             cert: http3.cert,
             key: http3.key,
+            reuse_port,
         };
         if let Err(err) = elira_h3::serve(cfg, proxy, log, stop).await {
             tracing::error!(error = %err, "http/3 listener stopped");
@@ -209,25 +237,54 @@ async fn reload(path: &Path, current: &Config, runtime: &ArcSwap<Runtime>, optio
     tracing::info!("config reloaded");
 }
 
+fn spawn_replacement() {
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(err) => {
+            tracing::error!(error = %err, "cannot find the executable");
+            return;
+        }
+    };
+
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+
+    match std::process::Command::new(exe).args(args).spawn() {
+        Ok(child) => {
+            tracing::info!(pid = child.id(), "started a replacement, draining this one")
+        }
+        Err(err) => tracing::error!(error = %err, "cannot start a replacement"),
+    }
+}
+
 #[cfg(unix)]
-fn spawn_signal_task(stop: watch::Sender<bool>, reload: watch::Sender<u64>) -> anyhow::Result<()> {
+fn spawn_signal_task(
+    stop: watch::Sender<bool>,
+    reload: watch::Sender<u64>,
+    restart: watch::Sender<u64>,
+) -> anyhow::Result<()> {
     use tokio::signal::unix::{signal, SignalKind};
 
     let mut term = signal(SignalKind::terminate())?;
     let mut hup = signal(SignalKind::hangup())?;
+    let mut usr2 = signal(SignalKind::user_defined2())?;
 
     tokio::spawn(async move {
         let ctrl_c = tokio::signal::ctrl_c();
         tokio::pin!(ctrl_c);
-        let mut seq = 0u64;
+        let mut reload_seq = 0u64;
+        let mut restart_seq = 0u64;
 
         loop {
             tokio::select! {
                 _ = &mut ctrl_c => { let _ = stop.send(true); return; }
                 _ = term.recv() => { let _ = stop.send(true); return; }
                 _ = hup.recv() => {
-                    seq += 1;
-                    let _ = reload.send(seq);
+                    reload_seq += 1;
+                    let _ = reload.send(reload_seq);
+                }
+                _ = usr2.recv() => {
+                    restart_seq += 1;
+                    let _ = restart.send(restart_seq);
                 }
             }
         }
@@ -237,7 +294,11 @@ fn spawn_signal_task(stop: watch::Sender<bool>, reload: watch::Sender<u64>) -> a
 }
 
 #[cfg(not(unix))]
-fn spawn_signal_task(stop: watch::Sender<bool>, _reload: watch::Sender<u64>) -> anyhow::Result<()> {
+fn spawn_signal_task(
+    stop: watch::Sender<bool>,
+    _reload: watch::Sender<u64>,
+    _restart: watch::Sender<u64>,
+) -> anyhow::Result<()> {
     tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;
         let _ = stop.send(true);
