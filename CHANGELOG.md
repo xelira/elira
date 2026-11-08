@@ -94,6 +94,7 @@
 - ACME DNS-01 через внешний hook: wildcard-сертификаты, кэш аккаунта,
   обновление раз в 12 часов.
 - `ocsp_hook` с периодическим обновлением OCSP-файла и reload.
+- `module_sandbox`: изоляция `.so` в дочернем процессе через JSON-протокол.
 - `elira migrate` переносит `try_files`, `add_header`, `allow`/`deny`,
   `auth_basic_user_file`, `client_max_body_size`, `gzip`, TLS и regex-location.
 - FastCGI-бэкенды по TCP и unix-сокетам, CGI-скрипты и нативные

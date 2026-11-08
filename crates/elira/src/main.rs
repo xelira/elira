@@ -30,6 +30,9 @@ enum Command {
         #[arg(short, long, default_value = "elira.toml")]
         config: PathBuf,
     },
+    /// Internal: host one isolated module process.
+    #[command(hide = true)]
+    ModuleWorker { module: PathBuf },
     /// Convert an nginx config into elira TOML.
     Migrate {
         /// nginx config to read.
@@ -56,6 +59,7 @@ fn main() -> anyhow::Result<()> {
             );
             Ok(())
         }
+        Command::ModuleWorker { module } => module_worker(&module),
         Command::Migrate { input, output } => {
             let source = std::fs::read_to_string(&input)
                 .with_context(|| format!("cannot read {}", input.display()))?;
@@ -90,6 +94,35 @@ fn main() -> anyhow::Result<()> {
                 runtime.block_on(run(config))
             }
         }
+    }
+}
+
+fn module_worker(path: &Path) -> anyhow::Result<()> {
+    use std::io::{Read, Write};
+
+    let module = elira_module::Module::load(path)?;
+    let mut input = std::io::stdin().lock();
+    let mut output = std::io::stdout().lock();
+
+    loop {
+        let mut length = [0u8; 4];
+        match input.read_exact(&mut length) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+        let length = u32::from_be_bytes(length) as usize;
+        if length > 16 * 1024 * 1024 {
+            anyhow::bail!("module request too large");
+        }
+        let mut body = vec![0u8; length];
+        input.read_exact(&mut body)?;
+        let request: elira_module::Request = serde_json::from_slice(&body)?;
+        let response = module.call(&request)?;
+        let encoded = serde_json::to_vec(&response)?;
+        output.write_all(&(encoded.len() as u32).to_be_bytes())?;
+        output.write_all(&encoded)?;
+        output.flush()?;
     }
 }
 

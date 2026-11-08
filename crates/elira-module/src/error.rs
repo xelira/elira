@@ -68,4 +68,8 @@ pub enum Error {
     /// would turn a module bug into a malformed response on the wire.
     #[error("module returned status {status}, expected 100..=599")]
     InvalidStatus { status: u16 },
+
+    /// The isolated module process failed, timed out, or broke the framing.
+    #[error("module process: {reason}")]
+    Process { reason: String },
 }

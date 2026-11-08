@@ -112,7 +112,12 @@ enum Target {
     Cgi {
         script: PathBuf,
     },
-    Module(Arc<elira_module::Module>),
+    Module(ModuleTarget),
+}
+
+enum ModuleTarget {
+    InProcess(Arc<elira_module::Module>),
+    Sandbox(Arc<elira_module::ProcessModule>),
 }
 
 struct RouteEntry {
@@ -474,12 +479,26 @@ impl Proxy {
                         });
                     }
                 }
-                let module =
-                    elira_module::Module::load(path).map_err(|err| Error::RouteConfig {
-                        host: route.host.clone(),
-                        reason: err.to_string(),
-                    })?;
-                Target::Module(Arc::new(module))
+                if route.module_sandbox {
+                    let runner = std::env::var_os("ELIRA_MODULE_RUNNER")
+                        .map(PathBuf::from)
+                        .map(Ok)
+                        .unwrap_or_else(std::env::current_exe)
+                        .map_err(|err| Error::RouteConfig {
+                            host: route.host.clone(),
+                            reason: format!("cannot locate the module runner: {err}"),
+                        })?;
+                    Target::Module(ModuleTarget::Sandbox(Arc::new(
+                        elira_module::ProcessModule::new(runner, path.clone()),
+                    )))
+                } else {
+                    let module =
+                        elira_module::Module::load(path).map_err(|err| Error::RouteConfig {
+                            host: route.host.clone(),
+                            reason: err.to_string(),
+                        })?;
+                    Target::Module(ModuleTarget::InProcess(Arc::new(module)))
+                }
             } else if let Some(redirect) = &route.redirect {
                 let status =
                     StatusCode::from_u16(redirect.status).map_err(|_| Error::BadRedirect {
@@ -1967,7 +1986,11 @@ impl Proxy {
                     body: body.to_vec(),
                     remote_addr: peer.to_string(),
                 };
-                match module.call(&request) {
+                let result = match module {
+                    ModuleTarget::InProcess(module) => module.call(&request),
+                    ModuleTarget::Sandbox(module) => module.call(&request),
+                };
+                match result {
                     Ok(response) => app_result(response.status, response.headers, response.body),
                     Err(err) => {
                         tracing::warn!(error = %err, "module request failed");

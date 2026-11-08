@@ -76,9 +76,11 @@
 
 mod abi;
 mod error;
+mod process;
 
 pub use abi::{FreeFn, HandleFn, Request, Response, VersionFn};
 pub use error::Error;
+pub use process::ProcessModule;
 
 use std::ffi::c_char;
 use std::fmt;

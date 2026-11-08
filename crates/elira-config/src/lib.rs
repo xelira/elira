@@ -486,6 +486,10 @@ pub struct Route {
     #[serde(default)]
     pub module: Option<PathBuf>,
 
+    /// Run the module in a child process instead of in the server process.
+    #[serde(default)]
+    pub module_sandbox: bool,
+
     /// Concurrent FastCGI/CGI/module requests allowed for this route. Defaults
     /// to 16 for application targets and is ignored for static/proxy routes.
     #[serde(default)]
@@ -1289,6 +1293,9 @@ impl Config {
                     return Err(Error::BadModulePath { index });
                 }
             }
+            if route.module_sandbox && route.module.is_none() {
+                return Err(Error::SandboxWithoutModule { index });
+            }
             if route.max_concurrent == Some(0) {
                 return Err(Error::BadConcurrency { index });
             }
@@ -1650,6 +1657,9 @@ pub enum Error {
 
     #[error("route {index}: module must be an absolute path")]
     BadModulePath { index: usize },
+
+    #[error("route {index}: module_sandbox needs module")]
+    SandboxWithoutModule { index: usize },
 
     #[error("route {index}: max_concurrent must be greater than zero")]
     BadConcurrency { index: usize },
