@@ -4,6 +4,7 @@
 //! different entry point: it exists so tests can drive it without spawning a
 //! process, and so the proxy can be embedded.
 
+pub mod proxy_protocol;
 pub mod server;
 
 pub use elira_config as config;

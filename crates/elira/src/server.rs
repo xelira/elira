@@ -76,6 +76,7 @@ pub struct Options {
     pub max_headers: usize,
     pub max_buf_size: usize,
     pub idle_timeout: Duration,
+    pub proxy_protocol: bool,
 }
 
 impl Options {
@@ -85,6 +86,7 @@ impl Options {
             max_headers: cfg.limits.max_headers,
             max_buf_size: cfg.limits.max_header_bytes,
             idle_timeout: Duration::from_secs(cfg.limits.idle_timeout_secs),
+            proxy_protocol: cfg.proxy_protocol,
         }
     }
 }
@@ -190,13 +192,23 @@ struct ConnOptions {
 }
 
 async fn serve_stream(
-    stream: TcpStream,
-    peer: SocketAddr,
+    mut stream: TcpStream,
+    mut peer: SocketAddr,
     runtime: Arc<ArcSwap<Runtime>>,
     options: Options,
     metrics: Arc<Metrics>,
     stop: &mut watch::Receiver<bool>,
 ) {
+    if options.proxy_protocol {
+        match crate::proxy_protocol::read_peer(&mut stream).await {
+            Some(real) => peer = real,
+            None => {
+                tracing::debug!(%peer, "missing or malformed PROXY header");
+                return;
+            }
+        }
+    }
+
     let tls = runtime.load().tls.clone();
     let secure = tls.is_some();
 

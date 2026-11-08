@@ -93,6 +93,7 @@ spa = false              # true serves index.html for client-side routes
 - gzip for compressible responses when the client asks, with `Vary`
 - per-IP token-bucket rate limiting and a `Content-Length` body cap
 - `trusted_proxies` so `X-Forwarded-For` is only extended by peers you name
+- PROXY protocol v1 and v2, so a load balancer can pass the real client address
 - access log in text or JSON, with a request id per line
 - active health checks: a server that stops answering 2xx/3xx stops receiving
   traffic, and comes back on its own

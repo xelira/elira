@@ -16,6 +16,10 @@ pub struct Config {
     pub listen: SocketAddr,
     #[serde(default)]
     pub limits: Limits,
+    /// Expect a PROXY protocol header on every accepted connection. Enable
+    /// only when the listener is reachable solely through a load balancer.
+    #[serde(default)]
+    pub proxy_protocol: bool,
     #[serde(default)]
     pub tls: Option<Tls>,
     #[serde(default)]

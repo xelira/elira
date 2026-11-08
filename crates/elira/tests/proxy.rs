@@ -648,3 +648,103 @@ upstream = "app"
     .await;
     assert_eq!(status(&response), "HTTP/1.1 502 Bad Gateway");
 }
+
+async fn read_all(mut stream: TcpStream) -> String {
+    let mut response = Vec::new();
+    let mut chunk = [0u8; 4096];
+
+    loop {
+        match tokio::time::timeout(Duration::from_secs(3), stream.read(&mut chunk)).await {
+            Ok(Ok(0)) | Err(_) => break,
+            Ok(Ok(read)) => response.extend_from_slice(&chunk[..read]),
+            Ok(Err(_)) => break,
+        }
+    }
+
+    String::from_utf8_lossy(&response).to_string()
+}
+
+fn proxy_config(upstream: SocketAddr) -> String {
+    format!(
+        r#"
+listen = "127.0.0.1:0"
+proxy_protocol = true
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "*"
+upstream = "app"
+"#
+    )
+}
+
+#[tokio::test]
+async fn proxy_protocol_v1_sets_the_client_address() {
+    let upstream = upstream().await;
+    let (addr, _stop, _metrics) = start(&proxy_config(upstream)).await;
+
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    stream
+        .write_all(b"PROXY TCP4 203.0.113.7 127.0.0.1 5555 8080\r\n")
+        .await
+        .expect("write header");
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("write request");
+
+    let response = read_all(stream).await;
+    assert!(
+        response.contains("x-forwarded-for: 203.0.113.7"),
+        "{response}"
+    );
+}
+
+#[tokio::test]
+async fn proxy_protocol_v2_sets_the_client_address() {
+    let upstream = upstream().await;
+    let (addr, _stop, _metrics) = start(&proxy_config(upstream)).await;
+
+    let mut header = Vec::new();
+    header.extend_from_slice(&[
+        0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a,
+    ]);
+    header.push(0x21);
+    header.push(0x11);
+    header.extend_from_slice(&12u16.to_be_bytes());
+    header.extend_from_slice(&[203, 0, 113, 7]);
+    header.extend_from_slice(&[127, 0, 0, 1]);
+    header.extend_from_slice(&5555u16.to_be_bytes());
+    header.extend_from_slice(&8080u16.to_be_bytes());
+
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    stream.write_all(&header).await.expect("write header");
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("write request");
+
+    let response = read_all(stream).await;
+    assert!(
+        response.contains("x-forwarded-for: 203.0.113.7"),
+        "{response}"
+    );
+}
+
+#[tokio::test]
+async fn proxy_protocol_closes_connections_without_the_header() {
+    let upstream = upstream().await;
+    let (addr, _stop, _metrics) = start(&proxy_config(upstream)).await;
+
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("write request");
+
+    let response = read_all(stream).await;
+    assert!(response.is_empty(), "{response}");
+}
