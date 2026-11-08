@@ -255,6 +255,8 @@ impl Proxy {
                     route.spa,
                     route.try_files.clone(),
                     route.autoindex,
+                    cfg.compression.enabled,
+                    cfg.compression.min_bytes,
                 )))
             } else if let Some(redirect) = &route.redirect {
                 let status =
@@ -1274,7 +1276,7 @@ pub fn compressible(content_type: &str) -> bool {
         )
 }
 
-fn compress(body: Body, encoding: &'static str) -> Body {
+pub(crate) fn compress(body: Body, encoding: &'static str) -> Body {
     fn finish<R>(reader: R) -> Body
     where
         R: tokio::io::AsyncRead + Send + Sync + 'static,

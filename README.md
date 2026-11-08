@@ -123,6 +123,8 @@ remove_headers = ["X-Powered-By"]
 - ACME (Let's Encrypt, TLS-ALPN-01) instead of a static `[tls]` block
 - hot restart on `SIGUSR2` with `reuse_port = true`, no dropped connections
 - `sendfile(2)` for plain HTTP/1.1 static GET/HEAD, decided before hyper
+- static files compressed on the fly, or served from a precompressed sibling
+- access log to a file with size-based rotation and reopen on SIGHUP
 - access log in text or JSON, with a request id per line
 - active health checks: a server that stops answering 2xx/3xx stops receiving
   traffic, and comes back on its own

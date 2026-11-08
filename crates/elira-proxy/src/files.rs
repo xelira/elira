@@ -30,6 +30,8 @@ pub(crate) struct Files {
     spa: bool,
     try_files: Vec<String>,
     autoindex: bool,
+    compress: bool,
+    min_bytes: u64,
 }
 
 impl Files {
@@ -39,6 +41,8 @@ impl Files {
         spa: bool,
         try_files: Vec<String>,
         autoindex: bool,
+        compress: bool,
+        min_bytes: usize,
     ) -> Self {
         Self {
             root,
@@ -46,6 +50,8 @@ impl Files {
             spa,
             try_files,
             autoindex,
+            compress,
+            min_bytes: min_bytes as u64,
         }
     }
 
@@ -345,13 +351,31 @@ impl Files {
 
         let length = if len == 0 { 0 } else { end - start + 1 };
 
+        // Compress only the whole representation: a range is a byte range of
+        // the identity body, and a precompressed sibling is already encoded.
+        let compress_with = if self.compress
+            && status == StatusCode::OK
+            && req.method() != Method::HEAD
+            && length >= self.min_bytes
+            && content_encoding.is_none()
+            && crate::compressible(content_type)
+        {
+            crate::preferred_encoding(req.headers())
+        } else {
+            None
+        };
+
         let mut builder = Response::builder()
             .status(status)
             .header(CONTENT_TYPE, content_type)
-            .header(CONTENT_LENGTH, length)
             .header(ACCEPT_RANGES, "bytes")
-            .header(ETAG, etag)
             .header("x-content-type-options", "nosniff");
+
+        // A compressed body has no fixed length, and its ETag would belong to
+        // a different representation, so both are dropped.
+        if compress_with.is_none() {
+            builder = builder.header(CONTENT_LENGTH, length).header(ETAG, etag);
+        }
 
         if let Some(modified) = modified {
             builder = builder.header(LAST_MODIFIED, httpdate::fmt_http_date(modified));
@@ -359,7 +383,7 @@ impl Files {
         if status == StatusCode::PARTIAL_CONTENT {
             builder = builder.header(CONTENT_RANGE, format!("bytes {start}-{end}/{len}"));
         }
-        if let Some(encoding) = content_encoding {
+        if let Some(encoding) = content_encoding.or(compress_with) {
             builder = builder
                 .header(CONTENT_ENCODING, encoding)
                 .header(VARY, "accept-encoding");
@@ -384,6 +408,11 @@ impl Files {
         let stream = ReaderStream::new(file.take(length)).map_ok(Frame::data);
         let body =
             BodyExt::map_err(StreamBody::new(stream), |err| -> BoxError { Box::new(err) }).boxed();
+        let body = if let Some(encoding) = compress_with {
+            crate::compress(body, encoding)
+        } else {
+            body
+        };
 
         builder
             .body(body)

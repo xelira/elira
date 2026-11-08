@@ -119,7 +119,9 @@ HTTP/1.1-соединении подглядывается до hyper, и про
 | `enabled` | bool | `true` | сжатие, если клиент прислал `Accept-Encoding` |
 | `min_bytes` | целое | `1024` | не сжимать тела меньше этого размера |
 
-Сжимаются только `200 OK` с типом `text/*`, `application/json`,
+Статика сжимается на лету теми же настройками, если рядом нет предсжатого
+`.br`/`.gz`; для `Range` и `HEAD` сжатие не применяется. Сжимаются только
+`200 OK` с типом `text/*`, `application/json`,
 `application/javascript`, `application/xml`, `application/rss+xml`,
 `application/atom+xml`, `image/svg+xml`. Исключения: `HEAD`, `206`, `304`,
 ответы с уже выставленным `Content-Encoding`.

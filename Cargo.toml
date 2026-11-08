@@ -12,6 +12,7 @@ members = [
     "crates/elira-cache",
     "crates/elira-acme",
     "crates/elira-upstream",
+    "crates/elira-auth",
 ]
 
 [workspace.package]

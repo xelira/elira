@@ -414,6 +414,28 @@ pub struct Tls {
 pub struct Log {
     #[serde(default)]
     pub format: LogFormat,
+
+    /// Append access lines here. Without it they go to stdout via tracing.
+    #[serde(default)]
+    pub file: Option<PathBuf>,
+
+    /// Rotate after this many bytes.
+    #[serde(default = "Log::default_max_bytes")]
+    pub max_bytes: usize,
+
+    /// How many rotated files to keep.
+    #[serde(default = "Log::default_keep")]
+    pub keep: usize,
+}
+
+impl Log {
+    fn default_max_bytes() -> usize {
+        64 * 1024 * 1024
+    }
+
+    fn default_keep() -> usize {
+        3
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -499,6 +521,15 @@ impl Config {
             }
             if acme.cache_dir.as_os_str().is_empty() {
                 return Err(Error::AcmeNoCacheDir);
+            }
+        }
+
+        if let Some(file) = &self.log.file {
+            if file.as_os_str().is_empty() {
+                return Err(Error::EmptyLogFile);
+            }
+            if self.log.max_bytes < 1024 {
+                return Err(Error::LogRotationTooSmall);
             }
         }
 
@@ -832,6 +863,12 @@ pub enum Error {
 
     #[error("acme.cache_dir must not be empty")]
     AcmeNoCacheDir,
+
+    #[error("log.file must not be empty")]
+    EmptyLogFile,
+
+    #[error("log.max_bytes must be at least 1024")]
+    LogRotationTooSmall,
 
     #[error("route {index}: try_files entry \"{candidate}\" is empty or unsafe")]
     BadTryFile { index: usize, candidate: String },
@@ -1342,6 +1379,25 @@ autoindex = true
         assert!(matches!(
             Config::parse(text),
             Err(Error::AutoindexWithoutRoot { .. })
+        ));
+    }
+
+    #[test]
+    fn parses_a_log_file() {
+        let text = format!(
+            "{MINIMAL}\n[log]\nfile = \"/var/log/elira/access.log\"\nmax_bytes = 4096\nkeep = 5\n"
+        );
+        let cfg = Config::parse(&text).expect("valid config");
+        assert!(cfg.log.file.is_some());
+        assert_eq!(cfg.log.keep, 5);
+    }
+
+    #[test]
+    fn rejects_a_tiny_log_rotation() {
+        let text = format!("{MINIMAL}\n[log]\nfile = \"/tmp/a.log\"\nmax_bytes = 10\n");
+        assert!(matches!(
+            Config::parse(&text),
+            Err(Error::LogRotationTooSmall)
         ));
     }
 }

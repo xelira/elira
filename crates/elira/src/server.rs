@@ -33,6 +33,7 @@ pub struct Runtime {
     log: LogFormat,
     health: Health,
     http3: Option<Http3>,
+    access_log: Option<Arc<crate::access_log::AccessLog>>,
 }
 
 impl Runtime {
@@ -48,6 +49,14 @@ impl Runtime {
             log: cfg.log.format,
             health: cfg.health.clone(),
             http3: cfg.http3.clone(),
+            access_log: match &cfg.log.file {
+                Some(path) => Some(Arc::new(crate::access_log::AccessLog::open(
+                    path.clone(),
+                    cfg.log.max_bytes,
+                    cfg.log.keep,
+                )?)),
+                None => None,
+            },
         })
     }
 
@@ -65,6 +74,10 @@ impl Runtime {
 
     pub fn http3(&self) -> Option<&Http3> {
         self.http3.as_ref()
+    }
+
+    pub fn access_log(&self) -> Option<&Arc<crate::access_log::AccessLog>> {
+        self.access_log.as_ref()
     }
 }
 
@@ -367,9 +380,14 @@ async fn serve_conn<I>(
                 request_id: id,
             };
 
-            match current.log {
-                LogFormat::Text => tracing::info!(target: "access", "{}", entry.line()),
-                LogFormat::Json => tracing::info!(target: "access", "{}", entry.json()),
+            let line = match current.log {
+                LogFormat::Text => entry.line(),
+                LogFormat::Json => entry.json(),
+            };
+
+            match current.access_log() {
+                Some(log) => log.write(&line),
+                None => tracing::info!(target: "access", "{}", line),
             }
 
             Ok::<_, std::convert::Infallible>(response)

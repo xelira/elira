@@ -1246,3 +1246,77 @@ root = "{}"
     .await;
     assert_eq!(status(&cached), "HTTP/1.1 304 Not Modified");
 }
+
+#[tokio::test]
+async fn static_files_are_compressed_on_the_fly() {
+    let root = temp_root("static-gzip");
+    std::fs::write(root.join("app.css"), "body { color: red }\n".repeat(200)).unwrap();
+
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[compression]
+enabled = true
+min_bytes = 64
+
+[[routes]]
+host = "*"
+root = "{}"
+"#,
+        root.display()
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let plain = roundtrip(
+        addr,
+        "GET /app.css HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(plain.ends_with("body { color: red }\n"), "{plain}");
+
+    let compressed = roundtrip(
+        addr,
+        "GET /app.css HTTP/1.1\r\nHost: example.com\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    let lower = compressed.to_ascii_lowercase();
+    assert!(lower.contains("content-encoding: gzip"), "{compressed}");
+    assert!(lower.contains("vary: accept-encoding"), "{compressed}");
+    assert!(!compressed.contains("body { color: red }"), "{compressed}");
+}
+
+#[tokio::test]
+async fn access_log_is_written_to_a_file() {
+    let root = temp_root("logfile");
+    std::fs::write(root.join("index.html"), "ok").unwrap();
+    let log_path = root.join("access.log");
+
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[log]
+format = "text"
+file = "{log}"
+max_bytes = 1048576
+
+[[routes]]
+host = "*"
+root = "{root}"
+"#,
+        log = log_path.display(),
+        root = root.display()
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let _ = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let logged = std::fs::read_to_string(&log_path).expect("log file");
+    assert!(logged.contains("GET /"), "{logged}");
+}

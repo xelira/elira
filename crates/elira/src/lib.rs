@@ -4,6 +4,7 @@
 //! different entry point: it exists so tests can drive it without spawning a
 //! process, and so the proxy can be embedded.
 
+mod access_log;
 pub mod proxy_protocol;
 mod sendfile;
 pub mod server;

@@ -98,8 +98,14 @@ pub(crate) async fn try_serve(
 
     let content_type = crate::proxy::files::content_type(&file);
 
-    // A precompressed sibling is served by the normal path, which knows how
-    // to set Content-Encoding and Vary.
+    // Compressible files and precompressed siblings are served by the normal
+    // path, which knows how to set Content-Encoding and Vary.
+    if elira_proxy::compressible(content_type)
+        && elira_proxy::preferred_encoding(&request_headers).is_some()
+    {
+        return None;
+    }
+
     if let Some(encoding) = elira_proxy::preferred_encoding(&request_headers) {
         let sibling = std::path::PathBuf::from(format!("{}.{}", file.display(), encoding));
         if tokio::fs::metadata(&sibling)
@@ -166,9 +172,14 @@ pub(crate) async fn try_serve(
     metrics.observe(http::StatusCode::OK.as_u16(), started.elapsed());
     metrics.connection_finished();
 
-    match current.log() {
-        LogFormat::Text => tracing::info!(target: "access", "{}", entry.line()),
-        LogFormat::Json => tracing::info!(target: "access", "{}", entry.json()),
+    let line = match current.log() {
+        LogFormat::Text => entry.line(),
+        LogFormat::Json => entry.json(),
+    };
+
+    match current.access_log() {
+        Some(log) => log.write(&line),
+        None => tracing::info!(target: "access", "{}", line),
     }
 
     Some(())
