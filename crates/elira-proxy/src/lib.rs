@@ -533,7 +533,8 @@ impl Proxy {
             let index = pool.pick();
             let server = pool.servers[index].clone();
             let _active = pool.enter(index);
-            let uri = upstream_uri(&server, &path)?;
+            let uri = upstream_uri(&server, &path)
+                .ok_or_else(|| text(StatusCode::BAD_GATEWAY, "bad upstream address"))?;
 
             let mut upstream = Request::builder()
                 .method(parts.method.clone())
@@ -559,7 +560,8 @@ impl Proxy {
             let server = pool.servers[index].clone();
             let _active = pool.enter(index);
 
-            let uri = upstream_uri(&server, &path)?;
+            let uri = upstream_uri(&server, &path)
+                .ok_or_else(|| text(StatusCode::BAD_GATEWAY, "bad upstream address"))?;
             let payload = if attempt == 0 {
                 body.take().unwrap_or_else(empty)
             } else {
@@ -953,13 +955,13 @@ fn gzip(body: Body) -> Body {
     BodyExt::map_err(StreamBody::new(stream), |err| -> BoxError { Box::new(err) }).boxed()
 }
 
-fn upstream_uri(server: &Authority, path: &str) -> Result<Uri, Response<Body>> {
+fn upstream_uri(server: &Authority, path: &str) -> Option<Uri> {
     Uri::builder()
         .scheme("http")
         .authority(server.as_str())
         .path_and_query(path)
         .build()
-        .map_err(|_| text(StatusCode::BAD_GATEWAY, "bad upstream address"))
+        .ok()
 }
 
 fn empty() -> Body {
