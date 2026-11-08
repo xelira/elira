@@ -70,7 +70,8 @@
   завершение соединений.
 - Команда `elira check` для разбора и валидации конфигурации без открытия
   сокетов и `elira migrate` для конвертации подмножества nginx-конфига.
-- ACME проверен против Let's Encrypt staging на реальном домене и порту 443.
+- ACME проверен против Let's Encrypt staging и production на реальном домене
+  и публичном порту 443.
 - Fuzz-цели для конфига, мигратора, заголовков и PROXY protocol; CI-джобы
   MSRV, `cargo-audit`, `cargo-deny`, musl и Docker; e2e-тесты mTLS и
   неудачного hot restart.
