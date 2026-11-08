@@ -91,7 +91,18 @@ connections; HTTP/1.1 and HTTP/2 connections survive a reload.
 - `crates/elira-tls` — certificate loading
 - `crates/elira-accesslog` — log formatting
 - `crates/elira-h3` — HTTP/3 over QUIC
-- `crates/elira` — the binary
+- `crates/elira` — the library, its `server` module, and the binary
+
+## Tests
+
+```
+cargo test
+```
+
+The unit tests cover config validation, header hygiene, log escaping and
+TLS loading. `crates/elira/tests/proxy.rs` drives the real listener over
+real sockets: routing, spoofed headers, idle shutdown, websockets and
+CONNECT.
 
 ## License
 
