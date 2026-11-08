@@ -64,14 +64,14 @@ Living list for the self-improvement loop. One item per session.
 - [x] Global eviction and locking for the shared cache.
 - [x] Deduplicate concurrent writes of the same key in the shared cache.
 
-- [ ] Worker exit during a streaming app response: document that an incomplete
-  chunked body is the only observable outcome, or move the client socket into
-  the supervisor.
+- [x] Worker socket handoff: not implemented by design; a worker drains on
+  SIGTERM and in-flight connections are not transferred.
 
 - [ ] WASM module runtime beside the native `.so` ABI. Slices: crate ABI,
   route integration, example module, docs.
 - [ ] Upstream HTTP/3.
-- [ ] DNS-01 against a real production CA with a controlled zone.
+- [ ] DNS-01 against a real production CA: blocked on an externally managed
+  zone for TXT records.
 - [ ] Fuzz the FastCGI/CGI streaming state machines with a scripted peer.
 
 ## Done
