@@ -3180,9 +3180,15 @@ upstream = "app"
             Config::parse(base),
             Err(Error::H3PoolNeedsTls { .. })
         ));
-        let tls = base.replace("servers = ["127.0.0.1:3000"]", "servers = ["127.0.0.1:3000"]\ntls = true");
+        let tls = base.replace(
+            "servers = [\"127.0.0.1:3000\"]",
+            "servers = [\"127.0.0.1:3000\"]\ntls = true",
+        );
         assert!(Config::parse(&tls).is_ok());
         let both = tls.replace("h3_pool = true", "h3_pool = true\nh2_pool = true");
-        assert!(matches!(Config::parse(&both), Err(Error::H3AndH2Pool { .. })));
+        assert!(matches!(
+            Config::parse(&both),
+            Err(Error::H3AndH2Pool { .. })
+        ));
     }
 }
