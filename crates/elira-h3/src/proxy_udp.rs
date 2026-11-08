@@ -28,9 +28,7 @@ pub struct ProxyUdpSocket {
 }
 
 impl ProxyUdpSocket {
-    pub fn new(
-        socket: std::net::UdpSocket,
-    ) -> io::Result<(Arc<Self>, Clients)> {
+    pub fn new(socket: std::net::UdpSocket) -> io::Result<(Arc<Self>, Clients)> {
         socket.set_nonblocking(true)?;
         #[allow(deprecated)]
         let fd = Arc::new(AsyncFd::new(socket)?);
