@@ -94,6 +94,17 @@ struct Record {
     seq: u64,
 }
 
+impl Location {
+    fn same_file(&self, other: &Location) -> bool {
+        match (self, other) {
+            (Location::Disk { path: left, .. }, Location::Disk { path: right, .. }) => {
+                left == right
+            }
+            _ => false,
+        }
+    }
+}
+
 impl Record {
     fn drop_body(&self) {
         if let Location::Disk { path, .. } = &self.location {
@@ -476,9 +487,12 @@ impl Cache {
                     .duration_since(UNIX_EPOCH)
                     .map(|delta| delta.as_nanos())
                     .unwrap_or(0);
+                // The final name is stable for a key+Vary signature, so two
+                // processes writing the same representation replace one file
+                // instead of accumulating duplicates.
                 let path = dir.join(format!(
-                    "elira-cache-{}-{index}-{stamp}.entry",
-                    std::process::id()
+                    "elira-cache-{:016x}.entry",
+                    cache_hash(key, &entry)
                 ));
                 let encoded = match encode(key, &entry, &entry.body) {
                     Some(encoded) => encoded,
@@ -488,7 +502,10 @@ impl Cache {
                 let len = entry.body.len();
                 // Write to a temporary name first so a crash never leaves a
                 // half-written entry that looks valid.
-                let temp = path.with_extension("tmp");
+                let temp = dir.join(format!(
+                    "elira-cache-tmp-{}-{index}-{stamp}",
+                    std::process::id()
+                ));
                 if fs::write(&temp, &encoded).is_err() || fs::rename(&temp, &path).is_err() {
                     let _ = fs::remove_file(&temp);
                     return false;
@@ -509,7 +526,9 @@ impl Cache {
                 .position(|record| record.entry.vary == entry.vary)
             {
                 let previous = records.remove(index);
-                previous.drop_body();
+                if !previous.location.same_file(&location) {
+                    previous.drop_body();
+                }
                 store.total_bytes -= previous.size;
             }
         }
@@ -525,7 +544,9 @@ impl Cache {
                 Some(records) if index < records.len() => records.remove(index),
                 _ => continue,
             };
-            victim.drop_body();
+            if !victim.location.same_file(&location) {
+                victim.drop_body();
+            }
             store.total_bytes -= victim.size;
             if store
                 .entries
@@ -744,6 +765,28 @@ fn trim_shared_dir(dir: &Path, max_bytes: usize) {
             total = total.saturating_sub(len);
         }
     }
+}
+
+fn cache_hash(key: &str, entry: &Entry) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut feed = |bytes: &[u8]| {
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    feed(key.as_bytes());
+    for (name, value) in &entry.vary {
+        feed(name.as_str().as_bytes());
+        match value {
+            Some(value) => {
+                feed(&[1]);
+                feed(value);
+            }
+            None => feed(&[0]),
+        }
+    }
+    hash
 }
 
 fn load_dir(dir: &Path, stale: Duration) -> (HashMap<String, Vec<Record>>, usize, u64) {
@@ -2151,6 +2194,51 @@ mod tests {
             .filter(|entry| entry.file_name().to_string_lossy().ends_with(".entry"))
             .collect();
         assert_eq!(files.len(), 1, "only the b.example entry should remain");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn one_file_per_key_and_vary_signature() {
+        let dir = temp_dir("dedup");
+        let cache = Cache::with_shared_disk(
+            1024,
+            Duration::from_secs(60),
+            Some(dir.clone()),
+            Duration::ZERO,
+            true,
+        );
+        let request = HeaderMap::new();
+        let response = HeaderMap::new();
+        let now = Instant::now();
+        assert!(cache.insert(
+            "example.com/x",
+            &request,
+            &response,
+            200,
+            b"one".to_vec(),
+            now
+        ));
+        assert!(cache.insert(
+            "example.com/x",
+            &request,
+            &response,
+            200,
+            b"two".to_vec(),
+            now
+        ));
+
+        let files: Vec<_> = fs::read_dir(&dir)
+            .expect("dir")
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".entry"))
+            .collect();
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            cache
+                .get("example.com/x", &request, now)
+                .map(|entry| entry.body),
+            Some(b"two".to_vec())
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

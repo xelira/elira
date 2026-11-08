@@ -52,7 +52,7 @@ Living list for the self-improvement loop. One item per session.
 
 - [x] Shared disk cache read-through (`cache.shared`).
 - [x] Global eviction and locking for the shared cache.
-- [ ] Deduplicate concurrent writes of the same key in the shared cache.
+- [x] Deduplicate concurrent writes of the same key in the shared cache.
 
 - [ ] Worker exit during a streaming app response: document that an incomplete
   chunked body is the only observable outcome, or move the client socket into
