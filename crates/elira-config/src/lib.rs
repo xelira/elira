@@ -26,6 +26,9 @@ pub struct Config {
     pub connect: Connect,
     #[serde(default)]
     pub http3: Option<Http3>,
+    #[serde(default)]
+    pub metrics: Option<MetricsConfig>,
+    #[serde(default)]
     pub upstreams: Vec<Upstream>,
     pub routes: Vec<Route>,
 }
@@ -144,6 +147,13 @@ pub struct Connect {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct MetricsConfig {
+    /// Bind loopback here unless you really mean to expose the counters.
+    pub listen: SocketAddr,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Http3 {
     pub listen: SocketAddr,
     // Defaults so a missing field names itself in the error instead of
@@ -166,7 +176,28 @@ pub struct Upstream {
 pub struct Route {
     /// Host to match, case-insensitive. `*` catches everything else.
     pub host: String,
-    pub upstream: String,
+
+    /// Name of an upstream to proxy to. Exactly one of `upstream` or `root`.
+    #[serde(default)]
+    pub upstream: Option<String>,
+
+    /// Directory to serve files from. Exactly one of `upstream` or `root`.
+    #[serde(default)]
+    pub root: Option<PathBuf>,
+
+    /// Files tried for a directory request, in order.
+    #[serde(default = "Route::default_index")]
+    pub index: Vec<String>,
+
+    /// Serve the first index file for missing paths. For client-side routers.
+    #[serde(default)]
+    pub spa: bool,
+}
+
+impl Route {
+    fn default_index() -> Vec<String> {
+        vec!["index.html".to_owned()]
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -328,11 +359,34 @@ impl Config {
                     host: route.host.clone(),
                 });
             }
-            if !names.contains(route.upstream.as_str()) {
-                return Err(Error::UnknownUpstream {
-                    index,
-                    upstream: route.upstream.clone(),
-                });
+
+            match (&route.upstream, &route.root) {
+                (Some(upstream), None) => {
+                    if !names.contains(upstream.as_str()) {
+                        return Err(Error::UnknownUpstream {
+                            index,
+                            upstream: upstream.clone(),
+                        });
+                    }
+                }
+                (None, Some(root)) => {
+                    if root.as_os_str().is_empty() {
+                        return Err(Error::EmptyRoot { index });
+                    }
+                    if route.spa && route.index.is_empty() {
+                        return Err(Error::SpaNeedsIndex { index });
+                    }
+                    for entry in &route.index {
+                        if entry.is_empty() || entry.contains('/') || entry.contains("..") {
+                            return Err(Error::BadIndexEntry {
+                                index,
+                                entry: entry.clone(),
+                            });
+                        }
+                    }
+                }
+                (Some(_), Some(_)) => return Err(Error::RouteHasTwoTargets { index }),
+                (None, None) => return Err(Error::RouteNeedsTarget { index }),
             }
         }
 
@@ -432,6 +486,21 @@ pub enum Error {
 
     #[error("route {index} points to unknown upstream \"{upstream}\"")]
     UnknownUpstream { index: usize, upstream: String },
+
+    #[error("route {index} needs exactly one of `upstream` or `root`")]
+    RouteNeedsTarget { index: usize },
+
+    #[error("route {index} has both `upstream` and `root`")]
+    RouteHasTwoTargets { index: usize },
+
+    #[error("route {index} has an empty `root`")]
+    EmptyRoot { index: usize },
+
+    #[error("route {index}: index file \"{entry}\" must be a plain file name")]
+    BadIndexEntry { index: usize, entry: String },
+
+    #[error("route {index}: `spa` needs at least one index file")]
+    SpaNeedsIndex { index: usize },
 }
 
 impl Error {
@@ -600,6 +669,77 @@ upstream = "app"
         assert!(matches!(
             Config::parse(&text),
             Err(Error::BadConnectTarget { .. })
+        ));
+    }
+
+    #[test]
+    fn parses_a_static_route() {
+        let text = r#"
+listen = "127.0.0.1:8080"
+
+[[routes]]
+host = "*"
+root = "/var/www"
+"#;
+        let cfg = Config::parse(text).expect("valid config");
+        assert_eq!(cfg.upstreams.len(), 0);
+        assert_eq!(
+            cfg.routes[0].root.as_deref(),
+            Some(std::path::Path::new("/var/www"))
+        );
+        assert_eq!(cfg.routes[0].index, vec!["index.html".to_owned()]);
+    }
+
+    #[test]
+    fn rejects_a_route_with_two_targets() {
+        let text = format!(
+            "{MINIMAL}\n[[routes]]\nhost = \"both.example\"\nupstream = \"app\"\nroot = \"/srv\"\n"
+        );
+        assert!(matches!(
+            Config::parse(&text),
+            Err(Error::RouteHasTwoTargets { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_a_route_without_a_target() {
+        let text = format!("{MINIMAL}\n[[routes]]\nhost = \"empty.example\"\n");
+        assert!(matches!(
+            Config::parse(&text),
+            Err(Error::RouteNeedsTarget { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_an_index_name_with_a_slash() {
+        let text = r#"
+listen = "127.0.0.1:8080"
+
+[[routes]]
+host = "*"
+root = "/var/www"
+index = ["../secret"]
+"#;
+        assert!(matches!(
+            Config::parse(text),
+            Err(Error::BadIndexEntry { .. })
+        ));
+    }
+
+    #[test]
+    fn spa_needs_an_index() {
+        let text = r#"
+listen = "127.0.0.1:8080"
+
+[[routes]]
+host = "*"
+root = "/var/www"
+index = []
+spa = true
+"#;
+        assert!(matches!(
+            Config::parse(text),
+            Err(Error::SpaNeedsIndex { .. })
         ));
     }
 }

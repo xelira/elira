@@ -7,6 +7,7 @@ use arc_swap::ArcSwap;
 use clap::{Parser, Subcommand};
 use elira::config::Config;
 use elira::server::{self, Options, Runtime};
+use elira_metrics::Metrics;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
@@ -77,11 +78,19 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
     );
 
     let options = Options::from_config(&cfg);
+    let metrics = Arc::new(Metrics::new());
     let (stop_tx, stop_rx) = watch::channel(false);
     let (reload_tx, mut reload_rx) = watch::channel(0u64);
 
     spawn_signal_task(stop_tx.clone(), reload_tx)?;
-    server::spawn_health_loop(runtime.clone(), stop_rx.clone());
+    server::spawn_health_loop(runtime.clone(), metrics.clone(), stop_rx.clone());
+
+    if let Some(metrics_cfg) = &cfg.metrics {
+        let metrics_listener = TcpListener::bind(metrics_cfg.listen)
+            .await
+            .with_context(|| format!("cannot bind metrics on {}", metrics_cfg.listen))?;
+        server::spawn_metrics(metrics_listener, metrics.clone(), stop_rx.clone());
+    }
 
     let mut h3_task = spawn_h3(runtime.clone(), stop_rx.clone());
     let mut stop_wait = stop_rx.clone();
@@ -90,6 +99,7 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
         listener,
         runtime.clone(),
         options,
+        metrics.clone(),
         stop_rx.clone(),
     ));
 
@@ -170,6 +180,9 @@ async fn reload(path: &Path, current: &Config, runtime: &ArcSwap<Runtime>, optio
     // pretending otherwise would silently ignore the operator's edit.
     if next.listen != current.listen {
         tracing::warn!("listen address changes need a restart");
+    }
+    if next.metrics.as_ref().map(|m| m.listen) != current.metrics.as_ref().map(|m| m.listen) {
+        tracing::warn!("metrics listener changes need a restart");
     }
     if next.limits.max_connections != options.max_connections
         || next.limits.max_headers != options.max_headers

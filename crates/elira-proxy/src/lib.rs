@@ -28,6 +28,10 @@ use tokio::sync::Semaphore;
 
 use elira_config::{Config, Health};
 
+mod files;
+
+use files::Files;
+
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub type Body = BoxBody<Bytes, BoxError>;
 
@@ -45,9 +49,14 @@ struct Inner {
     timeout: Duration,
 }
 
+enum Target {
+    Proxy(Arc<Pool>),
+    Files(Arc<Files>),
+}
+
 struct Router {
-    by_host: HashMap<String, Arc<Pool>>,
-    default: Option<Arc<Pool>>,
+    by_host: HashMap<String, Arc<Target>>,
+    default: Option<Arc<Target>>,
 }
 
 struct Pool {
@@ -78,7 +87,7 @@ impl Pool {
 }
 
 impl Router {
-    fn pick(&self, host: &str) -> Option<&Arc<Pool>> {
+    fn pick(&self, host: &str) -> Option<&Arc<Target>> {
         self.by_host.get(host).or(self.default.as_ref())
     }
 }
@@ -110,18 +119,34 @@ impl Proxy {
         let mut by_host = HashMap::new();
         let mut default = None;
         for route in &cfg.routes {
-            let pool =
-                pools
-                    .get(&route.upstream)
-                    .cloned()
-                    .ok_or_else(|| Error::UnknownUpstream {
-                        upstream: route.upstream.clone(),
-                    })?;
+            let target = match (&route.upstream, &route.root) {
+                (Some(upstream), _) => {
+                    let pool =
+                        pools
+                            .get(upstream)
+                            .cloned()
+                            .ok_or_else(|| Error::UnknownUpstream {
+                                upstream: upstream.clone(),
+                            })?;
+                    Arc::new(Target::Proxy(pool))
+                }
+                (None, Some(root)) => Arc::new(Target::Files(Arc::new(Files::new(
+                    root.clone(),
+                    route.index.clone(),
+                    route.spa,
+                )))),
+                (None, None) => {
+                    return Err(Error::MissingTarget {
+                        host: route.host.clone(),
+                    })
+                }
+            };
+
             let host = route.host.trim().to_ascii_lowercase();
             if host == "*" {
-                default = Some(pool);
+                default = Some(target);
             } else {
-                by_host.insert(host, pool);
+                by_host.insert(host, target);
             }
         }
 
@@ -159,6 +184,24 @@ impl Proxy {
                 timeout: Duration::from_secs(cfg.limits.upstream_timeout_secs),
             }),
         })
+    }
+
+    /// How many upstream servers are up, and how many are down.
+    pub fn upstream_counts(&self) -> (usize, usize) {
+        let mut up = 0;
+        let mut down = 0;
+
+        for pool in &self.inner.pools {
+            for healthy in &pool.health {
+                if healthy.load(Ordering::Relaxed) {
+                    up += 1;
+                } else {
+                    down += 1;
+                }
+            }
+        }
+
+        (up, down)
     }
 
     /// Probe every upstream once and update its health flag.
@@ -306,11 +349,16 @@ impl Proxy {
         let (key, forward_host) = canonical_host(&host)
             .ok_or_else(|| text(StatusCode::BAD_REQUEST, "malformed Host header"))?;
 
-        let pool = self
+        let target = self
             .inner
             .router
             .pick(&key)
             .ok_or_else(|| text(StatusCode::NOT_FOUND, "no route"))?;
+
+        let pool = match target.as_ref() {
+            Target::Proxy(pool) => pool,
+            Target::Files(files) => return Ok(files.serve(&req, peer).await),
+        };
         let server = pool.pick().clone();
 
         let path = req
@@ -765,7 +813,7 @@ fn header(value: &str) -> HeaderValue {
     HeaderValue::from_str(value).expect("peer address and Host are valid header values")
 }
 
-fn text(status: StatusCode, msg: &'static str) -> Response<Body> {
+pub(crate) fn text(status: StatusCode, msg: &'static str) -> Response<Body> {
     let body = Full::new(Bytes::from_static(msg.as_bytes()))
         .map_err(|never| match never {})
         .boxed();
@@ -787,6 +835,9 @@ pub enum Error {
 
     #[error("connect target \"{target}\" is not host:port")]
     BadConnectTarget { target: String },
+
+    #[error("route for \"{host}\" has neither an upstream nor a root")]
+    MissingTarget { host: String },
 }
 
 #[cfg(test)]

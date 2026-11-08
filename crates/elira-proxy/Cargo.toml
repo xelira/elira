@@ -7,6 +7,10 @@ repository.workspace = true
 
 [dependencies]
 elira-config = { path = "../elira-config" }
+futures-util = { workspace = true }
+httpdate = { workspace = true }
+percent-encoding = { workspace = true }
+tokio-util = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }

@@ -49,6 +49,9 @@ key = "/etc/elira/key.pem"
 enabled = false                 # an open CONNECT proxy is an SSRF pivot
 allow = ["10.0.0.5:5432"]       # exact host:port destinations only
 
+[metrics]
+listen = "127.0.0.1:9090"
+
 [[upstreams]]
 name = "app"
 servers = ["127.0.0.1:3000", "127.0.0.1:3001"]
@@ -56,6 +59,13 @@ servers = ["127.0.0.1:3000", "127.0.0.1:3001"]
 [[routes]]
 host = "*"               # or example.com; `*` catches the rest
 upstream = "app"
+
+# A static route uses `root` instead of `upstream`.
+[[routes]]
+host = "static.example.com"
+root = "/srv/www"
+index = ["index.html"]
+spa = false              # true serves index.html for client-side routes
 ```
 
 ## What it does today
@@ -66,6 +76,10 @@ upstream = "app"
 - HTTP/1.1, HTTP/2, and HTTP/3 over QUIC on a separate UDP listener
 - websockets and other `Upgrade` protocols, tunneled over a raw upstream socket
 - `CONNECT` tunnels, off by default and limited to an explicit `host:port` list
+- static files: index files, MIME types, ETag and `If-None-Match`,
+  `If-Modified-Since`, single byte ranges, `HEAD`, optional SPA fallback
+- Prometheus metrics on a separate listener: requests by status class,
+  latency histogram, in-flight connections, healthy upstreams
 - access log in text or JSON, with a request id per line
 - active health checks: a server that stops answering 2xx/3xx stops receiving
   traffic, and comes back on its own
@@ -80,8 +94,9 @@ upstream = "app"
 ## Not yet
 
 `CONNECT` is disabled unless `[connect]` names the destinations, and it is
-HTTP/1.1 only. HTTP/3 request bodies are streamed now, not buffered.
-The HTTP/3 listener is restarted on SIGHUP, which resets its live
+HTTP/1.1 only. Static files are streamed through userspace, not `sendfile`,
+so a large file costs a copy per chunk. Multi-range requests fall back to the
+whole file. The HTTP/3 listener is restarted on SIGHUP, which resets its live
 connections; HTTP/1.1 and HTTP/2 connections survive a reload.
 
 ## Layout

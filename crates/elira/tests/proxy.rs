@@ -7,6 +7,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use elira::config::Config;
 use elira::server::{self, Options, Runtime};
+use elira_metrics::Metrics;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
@@ -113,7 +114,7 @@ async fn tcp_echo() -> SocketAddr {
 
 /// Start the real server on an ephemeral port. Keep the returned sender alive
 /// for the duration of the test: dropping it stops the server.
-async fn start(config: &str) -> (SocketAddr, watch::Sender<bool>) {
+async fn start(config: &str) -> (SocketAddr, watch::Sender<bool>, Arc<Metrics>) {
     let cfg = Config::parse(config).expect("parse config");
     let runtime = Arc::new(ArcSwap::from_pointee(
         Runtime::build(&cfg).expect("build runtime"),
@@ -123,14 +124,16 @@ async fn start(config: &str) -> (SocketAddr, watch::Sender<bool>) {
     let addr = listener.local_addr().expect("proxy addr");
 
     let (stop_tx, stop_rx) = watch::channel(false);
+    let metrics = Arc::new(Metrics::new());
     tokio::spawn(server::serve(
         listener,
         runtime,
         Options::from_config(&cfg),
+        metrics.clone(),
         stop_rx,
     ));
 
-    (addr, stop_tx)
+    (addr, stop_tx, metrics)
 }
 
 /// Send a request with `Connection: close` and read until the server hangs up.
@@ -174,7 +177,7 @@ upstream = "app"
 async fn routes_by_host_and_drops_spoofed_headers() {
     let upstream = upstream().await;
     let config = NO_DEFAULT.replace("{upstream}", &upstream.to_string());
-    let (addr, _stop) = start(&config).await;
+    let (addr, _stop, _metrics) = start(&config).await;
 
     let response = roundtrip(
         addr,
@@ -222,7 +225,7 @@ async fn routes_by_host_and_drops_spoofed_headers() {
 async fn unknown_host_is_404_and_missing_host_is_400() {
     let upstream = upstream().await;
     let config = NO_DEFAULT.replace("{upstream}", &upstream.to_string());
-    let (addr, _stop) = start(&config).await;
+    let (addr, _stop, _metrics) = start(&config).await;
 
     let missing = roundtrip(addr, "GET / HTTP/1.1\r\nConnection: close\r\n\r\n").await;
     assert_eq!(status(&missing), "HTTP/1.1 400 Bad Request");
@@ -240,7 +243,7 @@ async fn idle_connection_is_closed() {
     let upstream = upstream().await;
     let mut config = NO_DEFAULT.replace("{upstream}", &upstream.to_string());
     config.push_str("\n[limits]\nidle_timeout_secs = 1\n");
-    let (addr, _stop) = start(&config).await;
+    let (addr, _stop, _metrics) = start(&config).await;
 
     let mut stream = TcpStream::connect(addr).await.expect("connect");
     stream
@@ -271,7 +274,7 @@ async fn idle_connection_is_closed() {
 async fn websocket_upgrade_is_tunnelled() {
     let upstream = upstream().await;
     let config = NO_DEFAULT.replace("{upstream}", &upstream.to_string());
-    let (addr, _stop) = start(&config).await;
+    let (addr, _stop, _metrics) = start(&config).await;
 
     let mut stream = TcpStream::connect(addr).await.expect("connect");
     stream
@@ -317,7 +320,7 @@ host = "*"
 upstream = "app"
 "#
     );
-    let (addr, _stop) = start(&config).await;
+    let (addr, _stop, _metrics) = start(&config).await;
 
     let mut stream = TcpStream::connect(addr).await.expect("connect");
     stream
@@ -341,4 +344,164 @@ upstream = "app"
     )
     .await;
     assert_eq!(status(&denied), "HTTP/1.1 403 Forbidden");
+}
+
+fn temp_root(label: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    let path = std::env::temp_dir().join(format!(
+        "elira-static-{}-{}-{}",
+        std::process::id(),
+        label,
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&path).expect("create root");
+    path
+}
+
+#[tokio::test]
+async fn serves_files_with_ranges_and_conditionals() {
+    let root = temp_root("files");
+    std::fs::write(root.join("index.html"), "<h1>index</h1>").unwrap();
+    std::fs::write(root.join("file.txt"), "hello world").unwrap();
+
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[routes]]
+host = "*"
+root = "{}"
+"#,
+        root.display()
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let index = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&index), "HTTP/1.1 200 OK");
+    assert!(index.contains("content-type: text/html"), "{index}");
+    assert!(index.ends_with("<h1>index</h1>"));
+
+    let file = roundtrip(
+        addr,
+        "GET /file.txt HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&file), "HTTP/1.1 200 OK");
+    assert!(file.ends_with("hello world"));
+
+    let etag = file
+        .lines()
+        .find(|line| line.to_ascii_lowercase().starts_with("etag:"))
+        .map(|line| line["etag:".len()..].trim().to_owned())
+        .expect("etag header");
+
+    let range = roundtrip(
+        addr,
+        "GET /file.txt HTTP/1.1\r\nHost: example.com\r\nRange: bytes=0-4\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&range), "HTTP/1.1 206 Partial Content");
+    assert!(range.contains("content-range: bytes 0-4/11"), "{range}");
+    assert!(range.ends_with("hello"));
+
+    let cached = roundtrip(
+        addr,
+        &format!(
+            "GET /file.txt HTTP/1.1\r\nHost: example.com\r\nIf-None-Match: {etag}\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await;
+    assert_eq!(status(&cached), "HTTP/1.1 304 Not Modified");
+
+    let missing = roundtrip(
+        addr,
+        "GET /missing HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&missing), "HTTP/1.1 404 Not Found");
+}
+
+#[tokio::test]
+async fn static_root_blocks_traversal_and_supports_spa() {
+    let root = temp_root("spa");
+    std::fs::write(root.join("index.html"), "<h1>app</h1>").unwrap();
+
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[routes]]
+host = "*"
+root = "{}"
+spa = true
+"#,
+        root.display()
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let traversal = roundtrip(
+        addr,
+        "GET /../Cargo.toml HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&traversal), "HTTP/1.1 403 Forbidden");
+
+    let encoded = roundtrip(
+        addr,
+        "GET /%2e%2e%2fCargo.toml HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&encoded), "HTTP/1.1 403 Forbidden");
+
+    let spa = roundtrip(
+        addr,
+        "GET /some/client/route HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&spa), "HTTP/1.1 200 OK");
+    assert!(spa.ends_with("<h1>app</h1>"));
+}
+
+#[tokio::test]
+async fn metrics_listener_reports_requests() {
+    let upstream = upstream().await;
+    let config = NO_DEFAULT.replace("{upstream}", &upstream.to_string());
+    let (addr, _stop, metrics) = start(&config).await;
+
+    let metrics_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind metrics");
+    let metrics_addr = metrics_listener.local_addr().expect("metrics addr");
+    let (_metrics_stop, metrics_stop_rx) = watch::channel(false);
+    server::spawn_metrics(metrics_listener, metrics.clone(), metrics_stop_rx);
+
+    roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let body = roundtrip(
+        metrics_addr,
+        "GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+
+    assert!(
+        body.contains("elira_requests_total{class=\"2xx\"}"),
+        "{body}"
+    );
+    assert!(
+        body.contains("elira_request_duration_seconds_count"),
+        "{body}"
+    );
+    assert!(body.contains("elira_connections_in_flight"), "{body}");
 }

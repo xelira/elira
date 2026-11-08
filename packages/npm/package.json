@@ -1,15 +1,15 @@
 {
   "name": "elira",
   "version": "0.0.2",
-  "description": "Elira — HTTP server and reverse proxy. Name reservation; implementation in progress.",
+  "description": "HTTP server and reverse proxy. Launcher for the native elira binary.",
   "license": "MIT",
   "main": "index.js",
   "bin": {
-    "elira": "bin/elira.js"
+    "elira": "./bin/elira.js"
   },
   "files": [
     "index.js",
-    "bin/",
+    "bin/elira.js",
     "README.md",
     "LICENSE"
   ],

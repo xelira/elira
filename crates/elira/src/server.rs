@@ -20,6 +20,7 @@ use tokio::sync::{watch, Semaphore};
 use tokio_rustls::TlsAcceptor;
 
 use elira_accesslog::{request_id, Entry};
+use elira_metrics::Metrics;
 
 use crate::config::{Config, Health, Http3, LogFormat};
 use crate::proxy::{BoxError, Proxy};
@@ -93,6 +94,7 @@ pub async fn serve(
     listener: TcpListener,
     runtime: Arc<ArcSwap<Runtime>>,
     options: Options,
+    metrics: Arc<Metrics>,
     mut stop: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let semaphore = Arc::new(Semaphore::new(options.max_connections));
@@ -125,10 +127,11 @@ pub async fn serve(
                 };
 
                 let runtime = runtime.clone();
+                let metrics = metrics.clone();
                 let mut stop = stop.clone();
                 connections.spawn(async move {
                     let _permit = permit;
-                    serve_stream(stream, peer, runtime, options, &mut stop).await;
+                    serve_stream(stream, peer, runtime, options, metrics, &mut stop).await;
                 });
             }
         }
@@ -151,7 +154,11 @@ pub async fn serve(
 
 /// Re-probe upstreams on a timer until shutdown. Reads the current runtime
 /// every tick, so a reload changes the interval and the targets.
-pub fn spawn_health_loop(runtime: Arc<ArcSwap<Runtime>>, mut stop: watch::Receiver<bool>) {
+pub fn spawn_health_loop(
+    runtime: Arc<ArcSwap<Runtime>>,
+    metrics: Arc<Metrics>,
+    mut stop: watch::Receiver<bool>,
+) {
     tokio::spawn(async move {
         loop {
             let current = runtime.load_full();
@@ -165,6 +172,8 @@ pub fn spawn_health_loop(runtime: Arc<ArcSwap<Runtime>>, mut stop: watch::Receiv
                 _ = stop.changed() => break,
                 _ = tokio::time::sleep(interval) => {
                     current.proxy.check_health(&current.health).await;
+                    let (up, down) = current.proxy.upstream_counts();
+                    metrics.set_upstreams(up, down);
                 }
             }
         }
@@ -185,6 +194,7 @@ async fn serve_stream(
     peer: SocketAddr,
     runtime: Arc<ArcSwap<Runtime>>,
     options: Options,
+    metrics: Arc<Metrics>,
     stop: &mut watch::Receiver<bool>,
 ) {
     let tls = runtime.load().tls.clone();
@@ -207,13 +217,13 @@ async fn serve_stream(
                 Ok(Ok(stream)) => {
                     let h2 = stream.get_ref().1.alpn_protocol() == Some(b"h2".as_slice());
                     let conn = ConnOptions { h2, ..conn };
-                    serve_conn(stream, peer, runtime, conn, stop).await;
+                    serve_conn(stream, peer, runtime, conn, metrics, stop).await;
                 }
                 Ok(Err(err)) => tracing::debug!(%peer, error = %err, "tls handshake failed"),
                 Err(_) => tracing::debug!(%peer, "tls handshake timed out"),
             }
         }
-        None => serve_conn(stream, peer, runtime, conn, stop).await,
+        None => serve_conn(stream, peer, runtime, conn, metrics, stop).await,
     }
 }
 
@@ -222,17 +232,22 @@ async fn serve_conn<I>(
     peer: SocketAddr,
     runtime: Arc<ArcSwap<Runtime>>,
     opts: ConnOptions,
+    metrics: Arc<Metrics>,
     stop: &mut watch::Receiver<bool>,
 ) where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    metrics.connection_started();
+
     let idle = Arc::new(tokio::sync::Notify::new());
     let idle_for_service = idle.clone();
     let scheme = if opts.secure { "https" } else { "http" };
+    let metrics_for_service = metrics.clone();
 
     let service = service_fn(move |req: hyper::Request<Incoming>| {
         let runtime = runtime.clone();
         let idle = idle_for_service.clone();
+        let metrics = metrics_for_service.clone();
         async move {
             // Reset the keep-alive watchdog: a request means the client is
             // still there, even if the response takes a while.
@@ -267,6 +282,8 @@ async fn serve_conn<I>(
 
             let req = req.map(|body| body.map_err(|err| -> BoxError { Box::new(err) }).boxed());
             let response = current.proxy.handle(req, peer, scheme).await;
+            let elapsed = started.elapsed();
+            metrics.observe(response.status().as_u16(), elapsed);
             let bytes = response.body().size_hint().exact().unwrap_or(0);
             let entry = Entry {
                 peer: peer.ip(),
@@ -276,7 +293,7 @@ async fn serve_conn<I>(
                 path,
                 status: response.status(),
                 bytes,
-                duration: started.elapsed(),
+                duration: elapsed,
                 user_agent,
                 request_id: id,
             };
@@ -343,6 +360,59 @@ async fn serve_conn<I>(
             }
         }
     }
+
+    metrics.connection_finished();
+}
+
+/// Serve `/metrics` on a small separate listener. Everything else is a 404.
+pub fn spawn_metrics(
+    listener: TcpListener,
+    metrics: Arc<Metrics>,
+    mut stop: watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = stop.changed() => break,
+                accepted = listener.accept() => {
+                    let Ok((stream, _)) = accepted else {
+                        continue;
+                    };
+
+                    let metrics = metrics.clone();
+                    tokio::spawn(async move {
+                        let service = service_fn(move |req: hyper::Request<Incoming>| {
+                            let metrics = metrics.clone();
+                            async move {
+                                let (status, body) = if req.method() == hyper::Method::GET
+                                    && req.uri().path() == "/metrics"
+                                {
+                                    (hyper::StatusCode::OK, metrics.render())
+                                } else {
+                                    (hyper::StatusCode::NOT_FOUND, "not found".to_owned())
+                                };
+
+                                let response = hyper::Response::builder()
+                                    .status(status)
+                                    .header(
+                                        hyper::header::CONTENT_TYPE,
+                                        "text/plain; version=0.0.4; charset=utf-8",
+                                    )
+                                    .body(http_body_util::Full::new(hyper::body::Bytes::from(body)))
+                                    .expect("static response");
+
+                                Ok::<_, std::convert::Infallible>(response)
+                            }
+                        });
+
+                        let _ = http1::Builder::new()
+                            .serve_connection(TokioIo::new(stream), service)
+                            .await;
+                    });
+                }
+            }
+        }
+    });
 }
 
 /// Let the current request finish, but do not wait forever: a client that
