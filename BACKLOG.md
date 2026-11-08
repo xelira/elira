@@ -37,8 +37,7 @@ Living list for the self-improvement loop. One item per session.
 - [x] QUIC idle timeout configuration.
 - [x] QUIC 0-RTT server-side switch (`http3.early_data`).
 - [x] 0-RTT integration test with a QUIC client.
-- [ ] Shared cache or consistent-hash routing so worker caches do not produce
-  avoidable misses.
+- [x] TLS handshake and QUIC connection metrics.
 - [x] Per-route FastCGI pool size.
 - [x] TLS session ticket and resumption settings.
 - [ ] Upstream HTTP/2 connection pool metrics.
@@ -47,6 +46,9 @@ Living list for the self-improvement loop. One item per session.
 - [x] Cache prefix invalidation API.
 
 ## C — large projects
+
+- [ ] Shared cache or consistent-hash routing so worker caches do not produce
+  avoidable misses.
 
 - [ ] Worker exit during a streaming app response: document that an incomplete
   chunked body is the only observable outcome, or move the client socket into

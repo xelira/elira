@@ -77,6 +77,7 @@ pub async fn serve(
                 tokio::spawn(async move {
                     match incoming.await {
                         Ok(conn) => {
+                            metrics.quic_connection();
                             let peer = conn.remote_address();
                             if let Err(err) = connection(
                                 conn,

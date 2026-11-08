@@ -165,6 +165,9 @@ pub struct Delta {
     pub reloads_ok: u64,
     /// Failed configuration reloads.
     pub reloads_failed: u64,
+    pub tls_handshakes_ok: u64,
+    pub tls_handshakes_failed: u64,
+    pub quic_connections: u64,
     /// Current connections in flight, not a delta.
     pub connections_in_flight: u64,
     /// Current upstreams considered healthy, not a delta.
@@ -207,6 +210,9 @@ impl Delta {
             && self.response_bytes == 0
             && self.reloads_ok == 0
             && self.reloads_failed == 0
+            && self.tls_handshakes_ok == 0
+            && self.tls_handshakes_failed == 0
+            && self.quic_connections == 0
             && self.connections_in_flight == 0
             && self.upstreams_up == 0
             && self.upstreams_down == 0
@@ -231,6 +237,9 @@ pub struct Metrics {
     response_bytes: AtomicU64,
     reloads_ok: AtomicU64,
     reloads_failed: AtomicU64,
+    tls_handshakes_ok: AtomicU64,
+    tls_handshakes_failed: AtomicU64,
+    quic_connections: AtomicU64,
 }
 
 impl Metrics {
@@ -251,6 +260,9 @@ impl Metrics {
             response_bytes: AtomicU64::new(0),
             reloads_ok: AtomicU64::new(0),
             reloads_failed: AtomicU64::new(0),
+            tls_handshakes_ok: AtomicU64::new(0),
+            tls_handshakes_failed: AtomicU64::new(0),
+            quic_connections: AtomicU64::new(0),
         }
     }
 
@@ -326,6 +338,21 @@ impl Metrics {
     }
 
     /// Record a failed configuration reload.
+    /// Record a TLS handshake outcome.
+    pub fn tls_handshake(&self, ok: bool) {
+        let counter = if ok {
+            &self.tls_handshakes_ok
+        } else {
+            &self.tls_handshakes_failed
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record an accepted QUIC connection.
+    pub fn quic_connection(&self) {
+        self.quic_connections.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn reload_failed(&self) {
         add_saturating(&self.reloads_failed, 1);
     }
@@ -401,6 +428,9 @@ impl Metrics {
             response_bytes: self.response_bytes.swap(0, Ordering::Relaxed),
             reloads_ok: self.reloads_ok.swap(0, Ordering::Relaxed),
             reloads_failed: self.reloads_failed.swap(0, Ordering::Relaxed),
+            tls_handshakes_ok: self.tls_handshakes_ok.swap(0, Ordering::Relaxed),
+            tls_handshakes_failed: self.tls_handshakes_failed.swap(0, Ordering::Relaxed),
+            quic_connections: self.quic_connections.swap(0, Ordering::Relaxed),
             connections_in_flight: self.connections_in_flight.load(Ordering::Relaxed),
             upstreams_up: self.upstreams_up.load(Ordering::Relaxed) as u64,
             upstreams_down: self.upstreams_down.load(Ordering::Relaxed) as u64,
@@ -447,6 +477,9 @@ impl Metrics {
         add_saturating(&self.response_bytes, delta.response_bytes);
         add_saturating(&self.reloads_ok, delta.reloads_ok);
         add_saturating(&self.reloads_failed, delta.reloads_failed);
+        add_saturating(&self.tls_handshakes_ok, delta.tls_handshakes_ok);
+        add_saturating(&self.tls_handshakes_failed, delta.tls_handshakes_failed);
+        add_saturating(&self.quic_connections, delta.quic_connections);
     }
 
     /// Overwrite this registry's gauges with the values in `delta`.

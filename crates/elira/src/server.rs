@@ -413,6 +413,7 @@ async fn serve_stream(
         }
         match acme.accept(stream).await {
             Ok((io, h2)) => {
+                metrics.tls_handshake(true);
                 let conn = ConnOptions {
                     h2,
                     secure: true,
@@ -423,7 +424,10 @@ async fn serve_stream(
             Err(err) if err.kind() == std::io::ErrorKind::ConnectionAborted => {
                 tracing::debug!(%peer, "acme validation connection");
             }
-            Err(err) => tracing::debug!(%peer, error = %err, "acme handshake failed"),
+            Err(err) => {
+                metrics.tls_handshake(false);
+                tracing::debug!(%peer, error = %err, "acme handshake failed");
+            }
         }
         return;
     }
@@ -468,6 +472,7 @@ async fn serve_stream(
             // and with it the accept loop, forever.
             match tokio::time::timeout(Duration::from_secs(10), acceptor.accept(stream)).await {
                 Ok(Ok(stream)) => {
+                    metrics.tls_handshake(true);
                     let h2 = stream.get_ref().1.alpn_protocol() == Some(b"h2".as_slice());
                     let conn = ConnOptions { h2, ..conn };
                     serve_conn(
@@ -481,8 +486,14 @@ async fn serve_stream(
                     )
                     .await;
                 }
-                Ok(Err(err)) => tracing::debug!(%peer, error = %err, "tls handshake failed"),
-                Err(_) => tracing::debug!(%peer, "tls handshake timed out"),
+                Ok(Err(err)) => {
+                    metrics.tls_handshake(false);
+                    tracing::debug!(%peer, error = %err, "tls handshake failed");
+                }
+                Err(_) => {
+                    metrics.tls_handshake(false);
+                    tracing::debug!(%peer, "tls handshake timed out");
+                }
             }
         }
         None => serve_conn(stream, peer, runtime, conn, metrics, stop, None).await,
