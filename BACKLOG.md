@@ -56,9 +56,9 @@ Living list for the self-improvement loop. One item per session.
 - [x] Cache-Control must-revalidate. Disk format bumped to ELIRA2.
 - [x] Expires/Date TTL fallback.
 - [x] Request Cache-Control/Pragma no-cache bypass.
-- [ ] True HTTP/2 connection-pool internals (connections, streams, queued
-  requests): hyper-util's `Connect` trait is sealed, so this needs a custom
-  HTTP/2 client rather than a connector wrapper.
+- [ ] Custom HTTP/2 upstream client with pool stats (connections, active
+  streams, total). Slices: crate API + h2c/TLS handshake, retry, proxy route
+  opt-in, metrics wiring.
 
 - [x] Shared disk cache read-through (`cache.shared`).
 - [x] Global eviction and locking for the shared cache.
@@ -68,7 +68,8 @@ Living list for the self-improvement loop. One item per session.
   chunked body is the only observable outcome, or move the client socket into
   the supervisor.
 
-- [ ] WASM module runtime beside the native `.so` ABI.
+- [ ] WASM module runtime beside the native `.so` ABI. Slices: crate ABI,
+  route integration, example module, docs.
 - [ ] Upstream HTTP/3.
 - [ ] DNS-01 against a real production CA with a controlled zone.
 - [ ] Fuzz the FastCGI/CGI streaming state machines with a scripted peer.
