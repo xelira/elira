@@ -223,6 +223,22 @@ pub struct Http3 {
 pub struct Upstream {
     pub name: String,
     pub servers: Vec<String>,
+
+    /// How to choose a server. `round_robin` by default.
+    #[serde(default)]
+    pub balance: Balance,
+
+    /// Extra attempts on connection errors for bodyless idempotent requests.
+    #[serde(default)]
+    pub retries: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Balance {
+    #[default]
+    RoundRobin,
+    LeastConn,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -393,6 +409,12 @@ impl Config {
                     name: up.name.clone(),
                 });
             }
+            if up.retries > 5 {
+                return Err(Error::TooManyRetries {
+                    name: up.name.clone(),
+                    retries: up.retries,
+                });
+            }
             for addr in &up.servers {
                 check_server(addr).map_err(|_| Error::BadServer {
                     upstream: up.name.clone(),
@@ -533,6 +555,9 @@ pub enum Error {
 
     #[error("upstream \"{name}\" has no servers")]
     EmptyUpstream { name: String },
+
+    #[error("upstream \"{name}\" has {retries} retries, the maximum is 5")]
+    TooManyRetries { name: String, retries: u32 },
 
     #[error("upstream \"{upstream}\": \"{addr}\" is not host:port")]
     BadServer { upstream: String, addr: String },
@@ -748,6 +773,38 @@ upstream = "app"
         let cfg = Config::parse(MINIMAL).expect("valid config");
         assert!(cfg.compression.enabled);
         assert_eq!(cfg.compression.min_bytes, 1024);
+    }
+
+    #[test]
+    fn parses_balance_and_retries() {
+        let text = MINIMAL.replace(
+            "servers = [\"127.0.0.1:3000\"]",
+            "servers = [\"127.0.0.1:3000\"]\nbalance = \"least_conn\"\nretries = 2",
+        );
+        let cfg = Config::parse(&text).expect("valid config");
+        assert_eq!(cfg.upstreams[0].balance, Balance::LeastConn);
+        assert_eq!(cfg.upstreams[0].retries, 2);
+    }
+
+    #[test]
+    fn rejects_unknown_balance() {
+        let text = MINIMAL.replace(
+            "servers = [\"127.0.0.1:3000\"]",
+            "servers = [\"127.0.0.1:3000\"]\nbalance = \"random\"",
+        );
+        assert!(matches!(Config::parse(&text), Err(Error::Toml(_))));
+    }
+
+    #[test]
+    fn rejects_too_many_retries() {
+        let text = MINIMAL.replace(
+            "servers = [\"127.0.0.1:3000\"]",
+            "servers = [\"127.0.0.1:3000\"]\nretries = 9",
+        );
+        assert!(matches!(
+            Config::parse(&text),
+            Err(Error::TooManyRetries { .. })
+        ));
     }
 
     #[test]

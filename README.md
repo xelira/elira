@@ -88,6 +88,8 @@ spa = false              # true serves index.html for client-side routes
   `If-Modified-Since`, single byte ranges, `HEAD`, optional SPA fallback
 - Prometheus metrics on a separate listener: requests by status class,
   latency histogram, in-flight connections, healthy upstreams
+- round-robins or least-conn across upstreams, retries a dead one for bodyless
+  idempotent requests
 - gzip for compressible responses when the client asks, with `Vary`
 - per-IP token-bucket rate limiting and a `Content-Length` body cap
 - `trusted_proxies` so `X-Forwarded-For` is only extended by peers you name

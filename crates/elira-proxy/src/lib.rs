@@ -30,7 +30,7 @@ use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 use tokio_util::io::{ReaderStream, StreamReader};
 
-use elira_config::{Compression, Config, Health};
+use elira_config::{Balance, Compression, Config, Health};
 use elira_limit::RateLimiter;
 
 mod files;
@@ -71,21 +71,65 @@ struct Router {
 struct Pool {
     servers: Vec<Authority>,
     health: Vec<AtomicBool>,
+    active: Vec<AtomicUsize>,
     next: AtomicUsize,
+    balance: Balance,
+    retries: u32,
+}
+
+struct ActiveGuard<'a> {
+    active: &'a AtomicUsize,
+}
+
+impl Drop for ActiveGuard<'_> {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl Pool {
-    fn pick(&self) -> &Authority {
+    fn pick(&self) -> usize {
+        let count = self.servers.len();
         let start = self.next.fetch_add(1, Ordering::Relaxed);
-        for offset in 0..self.servers.len() {
-            let index = (start + offset) % self.servers.len();
-            if self.health[index].load(Ordering::Relaxed) {
-                return &self.servers[index];
+
+        match self.balance {
+            Balance::RoundRobin => {
+                for offset in 0..count {
+                    let index = (start + offset) % count;
+                    if self.health[index].load(Ordering::Relaxed) {
+                        return index;
+                    }
+                }
+                // Everything looks down. Send traffic anyway: a broken probe
+                // should not turn into an outage, and the checker corrects it.
+                start % count
+            }
+            Balance::LeastConn => {
+                let mut best = None;
+                let mut best_active = usize::MAX;
+
+                for offset in 0..count {
+                    let index = (start + offset) % count;
+                    if !self.health[index].load(Ordering::Relaxed) {
+                        continue;
+                    }
+                    let active = self.active[index].load(Ordering::Relaxed);
+                    if active < best_active {
+                        best = Some(index);
+                        best_active = active;
+                    }
+                }
+
+                best.unwrap_or(start % count)
             }
         }
-        // Everything looks down. Send traffic anyway: a broken probe should
-        // not turn into an outage, and the checker will correct itself.
-        &self.servers[start % self.servers.len()]
+    }
+
+    fn enter(&self, index: usize) -> ActiveGuard<'_> {
+        self.active[index].fetch_add(1, Ordering::Relaxed);
+        ActiveGuard {
+            active: &self.active[index],
+        }
     }
 
     fn set_health(&self, index: usize, up: bool) {
@@ -114,12 +158,16 @@ impl Proxy {
                 servers.push(authority);
             }
             let health = (0..servers.len()).map(|_| AtomicBool::new(true)).collect();
+            let active = (0..servers.len()).map(|_| AtomicUsize::new(0)).collect();
             pools.insert(
                 up.name.clone(),
                 Arc::new(Pool {
                     servers,
                     health,
+                    active,
                     next: AtomicUsize::new(0),
+                    balance: up.balance,
+                    retries: up.retries,
                 }),
             );
         }
@@ -439,73 +487,115 @@ impl Proxy {
             Target::Proxy(pool) => pool,
             Target::Files(files) => return Ok(files.serve(&req, peer).await),
         };
-        let server = pool.pick().clone();
-
         let path = req
             .uri()
             .path_and_query()
-            .map(|p| p.as_str())
-            .unwrap_or("/");
+            .map(|value| value.as_str().to_owned())
+            .unwrap_or_else(|| "/".to_owned());
 
-        let uri = Uri::builder()
-            .scheme("http")
-            .authority(server.as_str())
-            .path_and_query(path)
-            .build()
-            .map_err(|_| text(StatusCode::BAD_GATEWAY, "bad upstream address"))?;
+        // Retries are only safe when there is nothing to replay: an
+        // idempotent method with no declared body.
+        let can_retry = pool.retries > 0
+            && !req.headers().contains_key(CONTENT_LENGTH)
+            && !req.headers().contains_key(TRANSFER_ENCODING)
+            && (req.method() == Method::GET
+                || req.method() == Method::HEAD
+                || req.method() == Method::OPTIONS);
 
         let (parts, body) = req.into_parts();
-        let mut upstream = Request::builder()
-            .method(parts.method)
-            .uri(uri)
-            .body(body)
-            .map_err(|_| text(StatusCode::BAD_GATEWAY, "bad request"))?;
-
+        let mut template = HeaderMap::new();
         let drop = connection_tokens(&parts.headers);
-        let headers = upstream.headers_mut();
         for (name, value) in parts.headers.iter() {
             if is_hop_by_hop(name) || drop.contains(name) || is_client_forwarding(name) {
                 continue;
             }
-            headers.append(name, value.clone());
+            template.append(name, value.clone());
         }
 
         // Everything below is set by us. A client that sent its own copies
         // had them dropped above.
-        headers.insert(HOST, header(&forward_host));
-        headers.insert("x-forwarded-for", header(&forwarded_for));
-        headers.insert("x-forwarded-proto", HeaderValue::from_static(scheme));
-        headers.insert("x-forwarded-host", header(&forward_host));
-        headers.insert("via", HeaderValue::from_static("1.1 elira"));
+        template.insert(HOST, header(&forward_host));
+        template.insert("x-forwarded-for", header(&forwarded_for));
+        template.insert("x-forwarded-proto", HeaderValue::from_static(scheme));
+        template.insert("x-forwarded-host", header(&forward_host));
+        template.insert("via", HeaderValue::from_static("1.1 elira"));
 
         // Upgrade is hop-by-hop, but dropping it would break websockets.
-        // Put it back only when the client actually asked for it.
         if let Some(upgrade) = &requested_upgrade {
-            headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
-            headers.insert(UPGRADE, upgrade.clone());
+            template.insert(CONNECTION, HeaderValue::from_static("upgrade"));
+            template.insert(UPGRADE, upgrade.clone());
         }
+
+        let mut body = Some(body);
 
         if let Some(upgrade) = requested_upgrade.clone() {
             let client = client_upgrade.expect("created together with requested_upgrade");
+            let index = pool.pick();
+            let server = pool.servers[index].clone();
+            let _active = pool.enter(index);
+            let uri = upstream_uri(&server, &path)?;
+
+            let mut upstream = Request::builder()
+                .method(parts.method.clone())
+                .uri(uri)
+                .body(body.take().unwrap_or_else(empty))
+                .map_err(|_| text(StatusCode::BAD_GATEWAY, "bad request"))?;
+            *upstream.headers_mut() = template;
+
             return self
-                .forward_upgrade(upstream, client, upgrade, server.clone())
+                .forward_upgrade(upstream, client, upgrade, server)
                 .await;
         }
 
-        let response =
+        let attempts = if can_retry {
+            pool.retries as usize + 1
+        } else {
+            1
+        };
+        let mut response = None;
+
+        for attempt in 0..attempts {
+            let index = pool.pick();
+            let server = pool.servers[index].clone();
+            let _active = pool.enter(index);
+
+            let uri = upstream_uri(&server, &path)?;
+            let payload = if attempt == 0 {
+                body.take().unwrap_or_else(empty)
+            } else {
+                empty()
+            };
+
+            let mut upstream = Request::builder()
+                .method(parts.method.clone())
+                .uri(uri)
+                .body(payload)
+                .map_err(|_| text(StatusCode::BAD_GATEWAY, "bad request"))?;
+            *upstream.headers_mut() = template.clone();
+
             match tokio::time::timeout(self.inner.timeout, self.inner.client.request(upstream))
                 .await
             {
-                Ok(Ok(response)) => response,
+                Ok(Ok(answer)) => {
+                    response = Some(answer);
+                    break;
+                }
                 Ok(Err(err)) => {
                     tracing::warn!(upstream = %server, error = %err, "upstream request failed");
-                    return Err(text(StatusCode::BAD_GATEWAY, "bad gateway"));
+                    if attempt + 1 == attempts {
+                        return Err(text(StatusCode::BAD_GATEWAY, "bad gateway"));
+                    }
                 }
                 Err(_) => {
                     tracing::warn!(upstream = %server, "upstream timed out");
-                    return Err(text(StatusCode::GATEWAY_TIMEOUT, "gateway timeout"));
+                    if attempt + 1 == attempts {
+                        return Err(text(StatusCode::GATEWAY_TIMEOUT, "gateway timeout"));
+                    }
                 }
-            };
+            }
+        }
+
+        let response = response.ok_or_else(|| text(StatusCode::BAD_GATEWAY, "bad gateway"))?;
 
         // Same rule as the request side: hyper only unwraps `chunked`, so
         // anything else would reach the client still transfer-coded.
@@ -863,6 +953,21 @@ fn gzip(body: Body) -> Body {
     BodyExt::map_err(StreamBody::new(stream), |err| -> BoxError { Box::new(err) }).boxed()
 }
 
+fn upstream_uri(server: &Authority, path: &str) -> Result<Uri, Response<Body>> {
+    Uri::builder()
+        .scheme("http")
+        .authority(server.as_str())
+        .path_and_query(path)
+        .build()
+        .map_err(|_| text(StatusCode::BAD_GATEWAY, "bad upstream address"))
+}
+
+fn empty() -> Body {
+    Full::new(Bytes::new())
+        .map_err(|never| match never {})
+        .boxed()
+}
+
 fn canonical_host(raw: &str) -> Option<(String, String)> {
     if raw.contains('@') {
         return None;
@@ -1058,6 +1163,25 @@ mod tests {
 
         headers.insert(TRANSFER_ENCODING, HeaderValue::from_static("gzip, chunked"));
         assert!(!transfer_encoding_is_plain_chunked(&headers));
+    }
+
+    #[test]
+    fn least_conn_prefers_the_idle_server() {
+        let pool = Pool {
+            servers: vec![
+                "127.0.0.1:1".parse().unwrap(),
+                "127.0.0.1:2".parse().unwrap(),
+            ],
+            health: vec![AtomicBool::new(true), AtomicBool::new(true)],
+            active: vec![AtomicUsize::new(0), AtomicUsize::new(5)],
+            next: AtomicUsize::new(0),
+            balance: Balance::LeastConn,
+            retries: 0,
+        };
+
+        assert_eq!(pool.pick(), 0);
+        pool.active[0].store(10, Ordering::Relaxed);
+        assert_eq!(pool.pick(), 1);
     }
 
     #[test]
