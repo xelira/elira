@@ -6,6 +6,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+elira-accesslog = { path = "../elira-accesslog" }
+elira-cache = { path = "../elira-cache" }
 elira-config = { path = "../elira-config" }
 elira-limit = { path = "../elira-limit" }
 futures-util = { workspace = true }

@@ -748,3 +748,255 @@ async fn proxy_protocol_closes_connections_without_the_header() {
     let response = read_all(stream).await;
     assert!(response.is_empty(), "{response}");
 }
+
+#[tokio::test]
+async fn path_prefix_routes_and_strips() {
+    let upstream = upstream().await;
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "*"
+path = "/api"
+upstream = "app"
+strip_prefix = true
+
+[[routes]]
+host = "*"
+upstream = "app"
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let api = roundtrip(
+        addr,
+        "GET /api/users HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(api.contains("GET /users HTTP/1.1"), "{api}");
+
+    let other = roundtrip(
+        addr,
+        "GET /other HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(other.contains("GET /other HTTP/1.1"), "{other}");
+}
+
+#[tokio::test]
+async fn wildcard_host_matches_subdomains() {
+    let upstream = upstream().await;
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "*.example.com"
+upstream = "app"
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let matched = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: api.example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&matched), "HTTP/1.1 200 OK");
+
+    let missed = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.org\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&missed), "HTTP/1.1 404 Not Found");
+}
+
+#[tokio::test]
+async fn redirect_routes_answer_without_an_upstream() {
+    let config = r#"
+listen = "127.0.0.1:0"
+
+[[routes]]
+host = "*"
+redirect = { to = "https://new.example.com/", status = 301 }
+"#;
+    let (addr, _stop, _metrics) = start(config).await;
+
+    let response = roundtrip(
+        addr,
+        "GET /old HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&response), "HTTP/1.1 301 Moved Permanently");
+    assert!(
+        response
+            .to_ascii_lowercase()
+            .contains("location: https://new.example.com/"),
+        "{response}"
+    );
+}
+
+#[tokio::test]
+async fn route_headers_are_applied_and_server_header_can_hide() {
+    let upstream = upstream().await;
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+server_header = false
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "*"
+upstream = "app"
+add_headers = ["X-Frame-Options: DENY"]
+remove_headers = ["Server"]
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let response = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    let lower = response.to_ascii_lowercase();
+    assert!(lower.contains("x-frame-options: deny"), "{response}");
+    assert!(
+        !lower.lines().any(|line| line.starts_with("server:")),
+        "{response}"
+    );
+}
+
+#[tokio::test]
+async fn request_id_is_echoed_and_forwarded() {
+    let upstream = upstream().await;
+    let config = NO_DEFAULT.replace("{upstream}", &upstream.to_string());
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let response = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nX-Request-Id: test-123\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(
+        response
+            .to_ascii_lowercase()
+            .contains("x-request-id: test-123"),
+        "{response}"
+    );
+}
+
+#[tokio::test]
+async fn cache_reports_miss_then_hit() {
+    let upstream = upstream().await;
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[cache]
+enabled = true
+max_bytes = 1048576
+max_item_bytes = 8192
+ttl_secs = 60
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "*"
+upstream = "app"
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let first = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(
+        first.to_ascii_lowercase().contains("x-cache: miss"),
+        "{first}"
+    );
+
+    let second = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(
+        second.to_ascii_lowercase().contains("x-cache: hit"),
+        "{second}"
+    );
+}
+
+#[tokio::test]
+async fn brotli_is_preferred_when_offered() {
+    let upstream = upstream().await;
+    let config = NO_DEFAULT.replace("{upstream}", &upstream.to_string());
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let response = roundtrip(
+        addr,
+        "GET /big HTTP/1.1\r\nHost: example.com\r\nAccept-Encoding: gzip, br\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(
+        response
+            .to_ascii_lowercase()
+            .contains("content-encoding: br"),
+        "{response}"
+    );
+    assert!(response
+        .to_ascii_lowercase()
+        .contains("vary: accept-encoding"));
+}
+
+#[tokio::test]
+async fn precompressed_static_files_are_served() {
+    let root = temp_root("precompressed");
+    std::fs::write(root.join("app.js"), "console.log(1)").unwrap();
+    std::fs::write(root.join("app.js.br"), "fake-brotli").unwrap();
+
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[routes]]
+host = "*"
+root = "{}"
+"#,
+        root.display()
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let plain = roundtrip(
+        addr,
+        "GET /app.js HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(plain.ends_with("console.log(1)"), "{plain}");
+
+    let compressed = roundtrip(
+        addr,
+        "GET /app.js HTTP/1.1\r\nHost: example.com\r\nAccept-Encoding: br\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    let lower = compressed.to_ascii_lowercase();
+    assert!(lower.contains("content-encoding: br"), "{compressed}");
+    assert!(compressed.ends_with("fake-brotli"), "{compressed}");
+}

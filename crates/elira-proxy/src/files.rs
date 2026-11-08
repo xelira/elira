@@ -12,8 +12,8 @@ use std::time::{Duration, SystemTime};
 use bytes::Bytes;
 use futures_util::TryStreamExt;
 use http::header::{
-    ACCEPT_RANGES, ALLOW, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, IF_MODIFIED_SINCE,
-    IF_NONE_MATCH, LAST_MODIFIED,
+    ACCEPT_RANGES, ALLOW, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG,
+    IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, VARY,
 };
 use http::{Method, Request, Response, StatusCode};
 use http_body_util::combinators::BoxBody;
@@ -150,6 +150,27 @@ impl Files {
         path: &Path,
         meta: &std::fs::Metadata,
     ) -> Response<super::Body> {
+        let content_type = content_type(path);
+
+        // A precompressed sibling wins when the client accepts it. The
+        // content type still comes from the original extension.
+        let mut path = path.to_path_buf();
+        let mut content_encoding = None;
+        if let Some(encoding) = crate::preferred_encoding(req.headers()) {
+            let candidate = PathBuf::from(format!("{}.{}", path.display(), encoding));
+            if let Ok(meta) = tokio::fs::metadata(&candidate).await {
+                if meta.is_file() {
+                    path = candidate;
+                    content_encoding = Some(encoding);
+                }
+            }
+        }
+
+        let meta = match tokio::fs::metadata(&path).await {
+            Ok(meta) => meta,
+            Err(_) => meta.clone(),
+        };
+        let path = path.as_path();
         let len = meta.len();
         let modified = meta.modified().ok();
         let etag = etag(len, modified);
@@ -194,7 +215,7 @@ impl Files {
 
         let mut builder = Response::builder()
             .status(status)
-            .header(CONTENT_TYPE, content_type(path))
+            .header(CONTENT_TYPE, content_type)
             .header(CONTENT_LENGTH, length)
             .header(ACCEPT_RANGES, "bytes")
             .header(ETAG, etag)
@@ -205,6 +226,11 @@ impl Files {
         }
         if status == StatusCode::PARTIAL_CONTENT {
             builder = builder.header(CONTENT_RANGE, format!("bytes {start}-{end}/{len}"));
+        }
+        if let Some(encoding) = content_encoding {
+            builder = builder
+                .header(CONTENT_ENCODING, encoding)
+                .header(VARY, "accept-encoding");
         }
 
         // A HEAD response carries the headers but no body, and hyper will not

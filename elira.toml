@@ -30,6 +30,11 @@ format = "text"   # or "json"
 enabled = true
 min_bytes = 1024
 
+[cache]
+enabled = false
+ttl_secs = 60
+max_item_bytes = 1048576
+
 [[upstreams]]
 name = "app"
 servers = ["127.0.0.1:3000"]

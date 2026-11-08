@@ -1,0 +1,19 @@
+[advisories]
+yanked = "deny"
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+]
+
+[bans]
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"

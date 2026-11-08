@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+use http::header::{HeaderName, HeaderValue};
 use http::uri::Authority;
 use serde::Deserialize;
 use thiserror::Error;
@@ -16,6 +17,11 @@ pub struct Config {
     pub listen: SocketAddr,
     #[serde(default)]
     pub limits: Limits,
+    /// Send our `Server: elira` header and keep the upstream one.
+    #[serde(default = "Config::default_server_header")]
+    pub server_header: bool,
+    #[serde(default)]
+    pub cache: Cache,
     /// Expect a PROXY protocol header on every accepted connection. Enable
     /// only when the listener is reachable solely through a load balancer.
     #[serde(default)]
@@ -248,16 +254,25 @@ pub enum Balance {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Route {
-    /// Host to match, case-insensitive. `*` catches everything else.
+    /// Host to match, case-insensitive. `*` catches everything else, and
+    /// `*.example.com` matches any subdomain.
     pub host: String,
 
-    /// Name of an upstream to proxy to. Exactly one of `upstream` or `root`.
+    /// Path prefix. The longest matching prefix wins inside a host.
+    #[serde(default)]
+    pub path: Option<String>,
+
+    /// Name of an upstream to proxy to. Exactly one target.
     #[serde(default)]
     pub upstream: Option<String>,
 
-    /// Directory to serve files from. Exactly one of `upstream` or `root`.
+    /// Directory to serve files from. Exactly one target.
     #[serde(default)]
     pub root: Option<PathBuf>,
+
+    /// Redirect instead of proxying or serving. Exactly one target.
+    #[serde(default)]
+    pub redirect: Option<Redirect>,
 
     /// Files tried for a directory request, in order.
     #[serde(default = "Route::default_index")]
@@ -266,11 +281,75 @@ pub struct Route {
     /// Serve the first index file for missing paths. For client-side routers.
     #[serde(default)]
     pub spa: bool,
+
+    /// Remove the matched path prefix before forwarding to the upstream.
+    #[serde(default)]
+    pub strip_prefix: bool,
+
+    /// Response headers to set, as `Name: value`.
+    #[serde(default)]
+    pub add_headers: Vec<String>,
+
+    /// Response headers to drop.
+    #[serde(default)]
+    pub remove_headers: Vec<String>,
 }
 
 impl Route {
     fn default_index() -> Vec<String> {
         vec!["index.html".to_owned()]
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Redirect {
+    pub to: String,
+    #[serde(default = "Redirect::default_status")]
+    pub status: u16,
+}
+
+impl Redirect {
+    fn default_status() -> u16 {
+        302
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Cache {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "Cache::default_ttl_secs")]
+    pub ttl_secs: u64,
+    #[serde(default = "Cache::default_max_bytes")]
+    pub max_bytes: usize,
+    #[serde(default = "Cache::default_max_item_bytes")]
+    pub max_item_bytes: usize,
+}
+
+impl Default for Cache {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ttl_secs: Self::default_ttl_secs(),
+            max_bytes: Self::default_max_bytes(),
+            max_item_bytes: Self::default_max_item_bytes(),
+        }
+    }
+}
+
+impl Cache {
+    fn default_ttl_secs() -> u64 {
+        60
+    }
+
+    fn default_max_bytes() -> usize {
+        64 * 1024 * 1024
+    }
+
+    fn default_max_item_bytes() -> usize {
+        1024 * 1024
     }
 }
 
@@ -316,6 +395,10 @@ impl<'de> Deserialize<'de> for LogFormat {
 }
 
 impl Config {
+    fn default_server_header() -> bool {
+        true
+    }
+
     pub fn load(path: &Path) -> Result<Self, Error> {
         let text = std::fs::read_to_string(path).map_err(|source| Error::Read {
             path: path.display().to_string(),
@@ -427,56 +510,115 @@ impl Config {
             }
         }
 
-        let mut hosts = HashSet::new();
-        let mut has_default = false;
+        let mut seen = HashSet::new();
         for (index, route) in self.routes.iter().enumerate() {
             let host = route.host.trim().to_ascii_lowercase();
             if host.is_empty() {
                 return Err(Error::EmptyRouteHost { index });
             }
-            if host == "*" {
-                if has_default {
-                    return Err(Error::DuplicateDefaultRoute);
-                }
-                has_default = true;
-            } else if !hosts.insert(host) {
+
+            // The same host may appear several times with different paths;
+            // only an identical pair is ambiguous.
+            if !seen.insert((host.clone(), route.path.clone().unwrap_or_default())) {
                 return Err(Error::DuplicateRoute {
                     host: route.host.clone(),
                 });
             }
 
-            match (&route.upstream, &route.root) {
-                (Some(upstream), None) => {
-                    if !names.contains(upstream.as_str()) {
-                        return Err(Error::UnknownUpstream {
+            let targets = usize::from(route.upstream.is_some())
+                + usize::from(route.root.is_some())
+                + usize::from(route.redirect.is_some());
+            if targets == 0 {
+                return Err(Error::RouteNeedsTarget { index });
+            }
+            if targets > 1 {
+                return Err(Error::RouteHasTwoTargets { index });
+            }
+
+            if let Some(path) = &route.path {
+                if !path.starts_with('/') || path.chars().any(char::is_control) {
+                    return Err(Error::BadPath {
+                        index,
+                        path: path.clone(),
+                    });
+                }
+            }
+
+            if route.strip_prefix && route.upstream.is_none() {
+                return Err(Error::StripWithoutUpstream { index });
+            }
+
+            if let Some(upstream) = &route.upstream {
+                if !names.contains(upstream.as_str()) {
+                    return Err(Error::UnknownUpstream {
+                        index,
+                        upstream: upstream.clone(),
+                    });
+                }
+            }
+
+            if let Some(root) = &route.root {
+                if root.as_os_str().is_empty() {
+                    return Err(Error::EmptyRoot { index });
+                }
+                if route.spa && route.index.is_empty() {
+                    return Err(Error::SpaNeedsIndex { index });
+                }
+                for entry in &route.index {
+                    if entry.is_empty() || entry.contains('/') || entry.contains("..") {
+                        return Err(Error::BadIndexEntry {
                             index,
-                            upstream: upstream.clone(),
+                            entry: entry.clone(),
                         });
                     }
                 }
-                (None, Some(root)) => {
-                    if root.as_os_str().is_empty() {
-                        return Err(Error::EmptyRoot { index });
-                    }
-                    if route.spa && route.index.is_empty() {
-                        return Err(Error::SpaNeedsIndex { index });
-                    }
-                    for entry in &route.index {
-                        if entry.is_empty() || entry.contains('/') || entry.contains("..") {
-                            return Err(Error::BadIndexEntry {
-                                index,
-                                entry: entry.clone(),
-                            });
-                        }
-                    }
+            }
+
+            if let Some(redirect) = &route.redirect {
+                if redirect.to.is_empty() || redirect.to.chars().any(char::is_control) {
+                    return Err(Error::BadRedirect { index });
                 }
-                (Some(_), Some(_)) => return Err(Error::RouteHasTwoTargets { index }),
-                (None, None) => return Err(Error::RouteNeedsTarget { index }),
+                if !matches!(redirect.status, 301 | 302 | 303 | 307 | 308) {
+                    return Err(Error::BadRedirectStatus {
+                        index,
+                        status: redirect.status,
+                    });
+                }
+            }
+
+            for header in &route.add_headers {
+                parse_header_line(header).ok_or_else(|| Error::BadHeader {
+                    index,
+                    header: header.clone(),
+                })?;
+            }
+            for name in &route.remove_headers {
+                HeaderName::from_bytes(name.as_bytes()).map_err(|_| Error::BadHeader {
+                    index,
+                    header: name.clone(),
+                })?;
+            }
+
+            if host != "*" {
+                if let Some(suffix) = host.strip_prefix('*') {
+                    if !suffix.starts_with('.') || suffix.len() < 2 || suffix.contains('*') {
+                        return Err(Error::BadWildcardHost { index });
+                    }
+                } else if host.contains('*') {
+                    return Err(Error::BadWildcardHost { index });
+                }
             }
         }
 
         Ok(())
     }
+}
+
+fn parse_header_line(line: &str) -> Option<(HeaderName, HeaderValue)> {
+    let (name, value) = line.split_once(':')?;
+    let name = HeaderName::from_bytes(name.trim().as_bytes()).ok()?;
+    let value = HeaderValue::from_str(value.trim()).ok()?;
+    Some((name, value))
 }
 
 fn check_server(addr: &str) -> Result<(), ()> {
@@ -572,9 +714,6 @@ pub enum Error {
     #[error("route for host \"{host}\" is defined twice")]
     DuplicateRoute { host: String },
 
-    #[error("only one `host = \"*\"` route is allowed")]
-    DuplicateDefaultRoute,
-
     #[error("route {index} points to unknown upstream \"{upstream}\"")]
     UnknownUpstream { index: usize, upstream: String },
 
@@ -592,6 +731,24 @@ pub enum Error {
 
     #[error("route {index}: `spa` needs at least one index file")]
     SpaNeedsIndex { index: usize },
+
+    #[error("route {index}: path \"{path}\" must start with '/'")]
+    BadPath { index: usize, path: String },
+
+    #[error("route {index}: `strip_prefix` needs an upstream")]
+    StripWithoutUpstream { index: usize },
+
+    #[error("route {index}: redirect target is empty or contains control characters")]
+    BadRedirect { index: usize },
+
+    #[error("route {index}: redirect status {status} is not 301, 302, 303, 307 or 308")]
+    BadRedirectStatus { index: usize, status: u16 },
+
+    #[error("route {index}: \"{header}\" is not a `Name: value` header")]
+    BadHeader { index: usize, header: String },
+
+    #[error("route {index}: host wildcard must look like `*.example.com`")]
+    BadWildcardHost { index: usize },
 }
 
 impl Error {
@@ -693,8 +850,29 @@ upstream = "app"
         let text = format!("{MINIMAL}\n[[routes]]\nhost = \"*\"\nupstream = \"app\"\n");
         assert!(matches!(
             Config::parse(&text),
-            Err(Error::DuplicateDefaultRoute)
+            Err(Error::DuplicateRoute { .. })
         ));
+    }
+
+    #[test]
+    fn allows_one_host_with_several_paths() {
+        let text = r#"
+listen = "127.0.0.1:8080"
+
+[[upstreams]]
+name = "app"
+servers = ["127.0.0.1:3000"]
+
+[[routes]]
+host = "*"
+path = "/api"
+upstream = "app"
+
+[[routes]]
+host = "*"
+upstream = "app"
+"#;
+        assert!(Config::parse(text).is_ok());
     }
 
     #[test]
@@ -880,5 +1058,125 @@ spa = true
             Config::parse(text),
             Err(Error::SpaNeedsIndex { .. })
         ));
+    }
+
+    #[test]
+    fn parses_path_wildcard_redirect_and_headers() {
+        let text = r#"
+listen = "127.0.0.1:8080"
+
+[[upstreams]]
+name = "app"
+servers = ["127.0.0.1:3000"]
+
+[[routes]]
+host = "*.example.com"
+path = "/api"
+upstream = "app"
+strip_prefix = true
+add_headers = ["X-Frame-Options: DENY"]
+remove_headers = ["X-Powered-By"]
+
+[[routes]]
+host = "old.example.com"
+redirect = { to = "https://new.example.com", status = 301 }
+"#;
+        let cfg = Config::parse(text).expect("valid config");
+        assert_eq!(cfg.routes[0].path.as_deref(), Some("/api"));
+        assert!(cfg.routes[0].strip_prefix);
+        assert_eq!(cfg.routes[0].add_headers.len(), 1);
+        assert_eq!(cfg.routes[1].redirect.as_ref().map(|r| r.status), Some(301));
+    }
+
+    #[test]
+    fn rejects_a_bad_redirect_status() {
+        let text = r#"
+listen = "127.0.0.1:8080"
+
+[[routes]]
+host = "*"
+redirect = { to = "https://example.com", status = 200 }
+"#;
+        assert!(matches!(
+            Config::parse(text),
+            Err(Error::BadRedirectStatus { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_strip_prefix_without_upstream() {
+        let text = r#"
+listen = "127.0.0.1:8080"
+
+[[routes]]
+host = "*"
+root = "/srv"
+strip_prefix = true
+"#;
+        assert!(matches!(
+            Config::parse(text),
+            Err(Error::StripWithoutUpstream { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_a_path_without_a_leading_slash() {
+        let text = r#"
+listen = "127.0.0.1:8080"
+
+[[upstreams]]
+name = "app"
+servers = ["127.0.0.1:3000"]
+
+[[routes]]
+host = "*"
+path = "api"
+upstream = "app"
+"#;
+        assert!(matches!(Config::parse(text), Err(Error::BadPath { .. })));
+    }
+
+    #[test]
+    fn rejects_a_header_without_a_colon() {
+        let text = r#"
+listen = "127.0.0.1:8080"
+
+[[upstreams]]
+name = "app"
+servers = ["127.0.0.1:3000"]
+
+[[routes]]
+host = "*"
+upstream = "app"
+add_headers = ["X-Broken"]
+"#;
+        assert!(matches!(Config::parse(text), Err(Error::BadHeader { .. })));
+    }
+
+    #[test]
+    fn rejects_a_malformed_wildcard() {
+        let text = r#"
+listen = "127.0.0.1:8080"
+
+[[upstreams]]
+name = "app"
+servers = ["127.0.0.1:3000"]
+
+[[routes]]
+host = "api.*.example.com"
+upstream = "app"
+"#;
+        assert!(matches!(
+            Config::parse(text),
+            Err(Error::BadWildcardHost { .. })
+        ));
+    }
+
+    #[test]
+    fn cache_is_off_by_default() {
+        let cfg = Config::parse(MINIMAL).expect("valid config");
+        assert!(!cfg.cache.enabled);
+        assert_eq!(cfg.cache.ttl_secs, 60);
+        assert!(cfg.server_header);
     }
 }

@@ -10,12 +10,13 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use async_compression::tokio::bufread::GzipEncoder;
+use async_compression::tokio::bufread::{BrotliEncoder, GzipEncoder};
 use bytes::Bytes;
 use futures_util::TryStreamExt;
 use http::header::{
-    HeaderName, HeaderValue, ACCEPT_ENCODING, CACHE_CONTROL, CONNECTION, CONTENT_ENCODING,
-    CONTENT_LENGTH, CONTENT_TYPE, HOST, SERVER, TRANSFER_ENCODING, UPGRADE, VARY,
+    HeaderName, HeaderValue, ACCEPT_ENCODING, ALT_SVC, CACHE_CONTROL, CONNECTION, CONTENT_ENCODING,
+    CONTENT_LENGTH, CONTENT_TYPE, HOST, LOCATION, SERVER, SET_COOKIE, TRANSFER_ENCODING, UPGRADE,
+    VARY,
 };
 use http::uri::Authority;
 use http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
@@ -30,6 +31,7 @@ use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 use tokio_util::io::{ReaderStream, StreamReader};
 
+use elira_cache::Cache;
 use elira_config::{Balance, Compression, Config, Health};
 use elira_limit::RateLimiter;
 
@@ -52,7 +54,11 @@ struct Inner {
     tunnels: Arc<Semaphore>,
     connect: Option<Vec<Authority>>,
     compression: Compression,
+    server_header: bool,
+    alt_svc: Option<HeaderValue>,
     max_body_bytes: usize,
+    cache: Option<Arc<Cache>>,
+    cache_max_item: usize,
     limiter: Option<Arc<RateLimiter>>,
     trusted_proxies: Vec<ipnet::IpNet>,
     timeout: Duration,
@@ -61,11 +67,71 @@ struct Inner {
 enum Target {
     Proxy(Arc<Pool>),
     Files(Arc<Files>),
+    Redirect {
+        status: StatusCode,
+        location: HeaderValue,
+    },
+}
+
+struct RouteEntry {
+    prefix: String,
+    target: Target,
+    strip_prefix: bool,
+    add_headers: Vec<(HeaderName, HeaderValue)>,
+    remove_headers: Vec<HeaderName>,
 }
 
 struct Router {
-    by_host: HashMap<String, Arc<Target>>,
-    default: Option<Arc<Target>>,
+    exact: HashMap<String, Vec<RouteEntry>>,
+    wildcard: Vec<(String, Vec<RouteEntry>)>,
+    default: Vec<RouteEntry>,
+}
+
+impl Router {
+    fn pick(&self, host: &str, path: &str) -> Option<&RouteEntry> {
+        let mut lists: Vec<&Vec<RouteEntry>> = Vec::with_capacity(3);
+
+        if let Some(list) = self.exact.get(host) {
+            lists.push(list);
+        }
+        if let Some((_, list)) = self
+            .wildcard
+            .iter()
+            .find(|(suffix, _)| host.ends_with(suffix.as_str()))
+        {
+            lists.push(list);
+        }
+        lists.push(&self.default);
+
+        for list in lists {
+            if let Some(entry) = list.iter().find(|entry| path_matches(&entry.prefix, path)) {
+                return Some(entry);
+            }
+        }
+
+        None
+    }
+}
+
+fn path_matches(prefix: &str, path: &str) -> bool {
+    if prefix.is_empty() || prefix == "/" {
+        return true;
+    }
+    if !path.starts_with(prefix) {
+        return false;
+    }
+    path.len() == prefix.len() || path.as_bytes()[prefix.len()] == b'/'
+}
+
+fn sort_routes(list: &mut [RouteEntry]) {
+    list.sort_by_key(|entry| std::cmp::Reverse(entry.prefix.len()));
+}
+
+fn parse_header_line(line: &str) -> Option<(HeaderName, HeaderValue)> {
+    let (name, value) = line.split_once(':')?;
+    let name = HeaderName::from_bytes(name.trim().as_bytes()).ok()?;
+    let value = HeaderValue::from_str(value.trim()).ok()?;
+    Some((name, value))
 }
 
 struct Pool {
@@ -101,7 +167,7 @@ impl Pool {
                     }
                 }
                 // Everything looks down. Send traffic anyway: a broken probe
-                // should not turn into an outage, and the checker corrects it.
+                // should not turn into an outage.
                 start % count
             }
             Balance::LeastConn => {
@@ -139,12 +205,6 @@ impl Pool {
     }
 }
 
-impl Router {
-    fn pick(&self, host: &str) -> Option<&Arc<Target>> {
-        self.by_host.get(host).or(self.default.as_ref())
-    }
-}
-
 impl Proxy {
     pub fn new(cfg: &Config) -> Result<Self, Error> {
         let mut pools: HashMap<String, Arc<Pool>> = HashMap::new();
@@ -173,39 +233,77 @@ impl Proxy {
         }
         let all_pools: Vec<Arc<Pool>> = pools.values().cloned().collect();
 
-        let mut by_host = HashMap::new();
-        let mut default = None;
+        let mut exact: HashMap<String, Vec<RouteEntry>> = HashMap::new();
+        let mut wildcard: Vec<(String, Vec<RouteEntry>)> = Vec::new();
+        let mut default: Vec<RouteEntry> = Vec::new();
+
         for route in &cfg.routes {
-            let target = match (&route.upstream, &route.root) {
-                (Some(upstream), _) => {
-                    let pool =
-                        pools
-                            .get(upstream)
-                            .cloned()
-                            .ok_or_else(|| Error::UnknownUpstream {
-                                upstream: upstream.clone(),
-                            })?;
-                    Arc::new(Target::Proxy(pool))
-                }
-                (None, Some(root)) => Arc::new(Target::Files(Arc::new(Files::new(
+            let target = if let Some(upstream) = &route.upstream {
+                Target::Proxy(pools.get(upstream).cloned().ok_or_else(|| {
+                    Error::UnknownUpstream {
+                        upstream: upstream.clone(),
+                    }
+                })?)
+            } else if let Some(root) = &route.root {
+                Target::Files(Arc::new(Files::new(
                     root.clone(),
                     route.index.clone(),
                     route.spa,
-                )))),
-                (None, None) => {
-                    return Err(Error::MissingTarget {
+                )))
+            } else if let Some(redirect) = &route.redirect {
+                let status =
+                    StatusCode::from_u16(redirect.status).map_err(|_| Error::BadRedirect {
                         host: route.host.clone(),
-                    })
-                }
+                    })?;
+                let location =
+                    HeaderValue::from_str(&redirect.to).map_err(|_| Error::BadRedirect {
+                        host: route.host.clone(),
+                    })?;
+                Target::Redirect { status, location }
+            } else {
+                return Err(Error::MissingTarget {
+                    host: route.host.clone(),
+                });
+            };
+
+            let entry = RouteEntry {
+                prefix: route.path.clone().unwrap_or_default(),
+                target,
+                strip_prefix: route.strip_prefix,
+                add_headers: route
+                    .add_headers
+                    .iter()
+                    .filter_map(|line| parse_header_line(line))
+                    .collect(),
+                remove_headers: route
+                    .remove_headers
+                    .iter()
+                    .filter_map(|name| HeaderName::from_bytes(name.as_bytes()).ok())
+                    .collect(),
             };
 
             let host = route.host.trim().to_ascii_lowercase();
             if host == "*" {
-                default = Some(target);
+                default.push(entry);
+            } else if let Some(suffix) = host.strip_prefix('*') {
+                if let Some((_, list)) = wildcard.iter_mut().find(|(known, _)| known == suffix) {
+                    list.push(entry);
+                } else {
+                    wildcard.push((suffix.to_owned(), vec![entry]));
+                }
             } else {
-                by_host.insert(host, target);
+                exact.entry(host).or_default().push(entry);
             }
         }
+
+        for list in exact.values_mut() {
+            sort_routes(list);
+        }
+        for (_, list) in wildcard.iter_mut() {
+            sort_routes(list);
+        }
+        sort_routes(&mut default);
+        wildcard.sort_by_key(|(suffix, _)| std::cmp::Reverse(suffix.len()));
 
         let connect =
             if cfg.connect.enabled {
@@ -221,6 +319,16 @@ impl Proxy {
             } else {
                 None
             };
+
+        let cache = if cfg.cache.enabled {
+            Some(Arc::new(Cache::new(
+                cfg.cache.max_bytes,
+                Duration::from_secs(cfg.cache.ttl_secs),
+            )))
+        } else {
+            None
+        };
+        let cache_max_item = cfg.cache.max_item_bytes;
 
         let mut connector = HttpConnector::new();
         connector.set_connect_timeout(Some(Duration::from_secs(5)));
@@ -249,13 +357,24 @@ impl Proxy {
 
         Ok(Self {
             inner: Arc::new(Inner {
-                router: Router { by_host, default },
+                router: Router {
+                    exact,
+                    wildcard,
+                    default,
+                },
                 pools: all_pools,
                 client,
                 tunnels: Arc::new(Semaphore::new(cfg.limits.max_connections)),
                 connect,
                 compression: cfg.compression.clone(),
+                server_header: cfg.server_header,
+                alt_svc: cfg.http3.as_ref().and_then(|http3| {
+                    HeaderValue::from_str(&format!("h3=\":{}\"; ma=86400", http3.listen.port()))
+                        .ok()
+                }),
                 max_body_bytes: cfg.limits.max_body_bytes,
+                cache,
+                cache_max_item,
                 limiter,
                 trusted_proxies,
                 timeout: Duration::from_secs(cfg.limits.upstream_timeout_secs),
@@ -434,8 +553,9 @@ impl Proxy {
             }
         }
 
-        let accepts_gzip = accepts_gzip(req.headers());
+        let encoding = preferred_encoding(req.headers());
         let is_head = req.method() == Method::HEAD;
+        let is_get = req.method() == Method::GET;
         let forwarded_for = self.forwarded_for(&req, peer);
 
         let requested_upgrade = wants_upgrade(req.headers());
@@ -477,21 +597,63 @@ impl Proxy {
         let (key, forward_host) = canonical_host(&host)
             .ok_or_else(|| text(StatusCode::BAD_REQUEST, "malformed Host header"))?;
 
-        let target = self
+        let request_id = req
+            .headers()
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.is_empty() && value.len() <= 64)
+            .map(str::to_owned)
+            .unwrap_or_else(elira_accesslog::request_id);
+
+        let entry = self
             .inner
             .router
-            .pick(&key)
+            .pick(&key, req.uri().path())
             .ok_or_else(|| text(StatusCode::NOT_FOUND, "no route"))?;
 
-        let pool = match target.as_ref() {
+        let pool = match &entry.target {
             Target::Proxy(pool) => pool,
-            Target::Files(files) => return Ok(files.serve(&req, peer).await),
+            Target::Files(files) => {
+                let mut response = files.serve(&req, peer).await;
+                self.apply_route(&mut response, entry, &request_id);
+                return Ok(response);
+            }
+            Target::Redirect { status, location } => {
+                let mut response =
+                    Response::builder()
+                        .status(*status)
+                        .body(empty())
+                        .map_err(|_| {
+                            text(StatusCode::INTERNAL_SERVER_ERROR, "response build failed")
+                        })?;
+                response.headers_mut().insert(LOCATION, location.clone());
+                self.apply_route(&mut response, entry, &request_id);
+                return Ok(response);
+            }
         };
         let path = req
             .uri()
             .path_and_query()
             .map(|value| value.as_str().to_owned())
             .unwrap_or_else(|| "/".to_owned());
+
+        let cache_key = format!("{key}{path}");
+
+        let upstream_path = if entry.strip_prefix {
+            let rest = path
+                .strip_prefix(entry.prefix.as_str())
+                .unwrap_or(&path)
+                .to_owned();
+            if rest.is_empty() {
+                "/".to_owned()
+            } else if rest.starts_with('/') {
+                rest
+            } else {
+                format!("/{rest}")
+            }
+        } else {
+            path.clone()
+        };
 
         // Retries are only safe when there is nothing to replay: an
         // idempotent method with no declared body.
@@ -519,6 +681,9 @@ impl Proxy {
         template.insert("x-forwarded-proto", HeaderValue::from_static(scheme));
         template.insert("x-forwarded-host", header(&forward_host));
         template.insert("via", HeaderValue::from_static("1.1 elira"));
+        if let Ok(value) = HeaderValue::from_str(&request_id) {
+            template.insert("x-request-id", value);
+        }
 
         // Upgrade is hop-by-hop, but dropping it would break websockets.
         if let Some(upgrade) = &requested_upgrade {
@@ -528,12 +693,25 @@ impl Proxy {
 
         let mut body = Some(body);
 
+        if is_get && requested_upgrade.is_none() {
+            if let Some(cache) = &self.inner.cache {
+                if let Some(hit) = cache.get(&cache_key, Instant::now()) {
+                    let mut response = cache_response(hit);
+                    response
+                        .headers_mut()
+                        .insert("x-cache", HeaderValue::from_static("HIT"));
+                    self.apply_route(&mut response, entry, &request_id);
+                    return Ok(response);
+                }
+            }
+        }
+
         if let Some(upgrade) = requested_upgrade.clone() {
             let client = client_upgrade.expect("created together with requested_upgrade");
             let index = pool.pick();
             let server = pool.servers[index].clone();
             let _active = pool.enter(index);
-            let uri = upstream_uri(&server, &path)
+            let uri = upstream_uri(&server, &upstream_path)
                 .ok_or_else(|| text(StatusCode::BAD_GATEWAY, "bad upstream address"))?;
 
             let mut upstream = Request::builder()
@@ -560,7 +738,7 @@ impl Proxy {
             let server = pool.servers[index].clone();
             let _active = pool.enter(index);
 
-            let uri = upstream_uri(&server, &path)
+            let uri = upstream_uri(&server, &upstream_path)
                 .ok_or_else(|| text(StatusCode::BAD_GATEWAY, "bad upstream address"))?;
             let payload = if attempt == 0 {
                 body.take().unwrap_or_else(empty)
@@ -620,15 +798,19 @@ impl Proxy {
             .get(CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default();
-        let compress = self.inner.compression.enabled
+        let compress_with = if self.inner.compression.enabled
             && parts.status == StatusCode::OK
             && !is_head
-            && accepts_gzip
             && !parts.headers.contains_key(CONTENT_ENCODING)
             && compressible(content_type)
             && upstream_len
                 .map(|length| length >= self.inner.compression.min_bytes)
-                .unwrap_or(true);
+                .unwrap_or(true)
+        {
+            encoding
+        } else {
+            None
+        };
 
         let drop = connection_tokens(&parts.headers);
         let mut builder = Response::builder().status(parts.status);
@@ -650,8 +832,8 @@ impl Proxy {
             }
             headers.insert(SERVER, HeaderValue::from_static("elira"));
 
-            if compress {
-                headers.insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+            if let Some(encoding) = compress_with {
+                headers.insert(CONTENT_ENCODING, HeaderValue::from_static(encoding));
                 headers.append(VARY, HeaderValue::from_static("accept-encoding"));
             }
 
@@ -665,12 +847,94 @@ impl Proxy {
             }
         }
 
-        let body = BodyExt::map_err(body, |err| -> BoxError { Box::new(err) }).boxed();
-        let body = if compress { gzip(body) } else { body };
+        let cacheable = self.inner.cache.is_some()
+            && is_get
+            && requested_upgrade.is_none()
+            && parts.status == StatusCode::OK
+            && upstream_len
+                .map(|length| length <= self.inner.cache_max_item)
+                .unwrap_or(false)
+            && cacheable_response(&parts.headers);
 
-        builder
+        let body = if cacheable {
+            let collected = match BodyExt::collect(body).await {
+                Ok(collected) => collected.to_bytes(),
+                Err(err) => {
+                    tracing::warn!(error = %err, "failed to buffer a cacheable response");
+                    return Err(text(StatusCode::BAD_GATEWAY, "bad gateway"));
+                }
+            };
+
+            if let Some(cache) = &self.inner.cache {
+                let headers = parts
+                    .headers
+                    .iter()
+                    .filter(|(name, _)| !is_hop_by_hop(name) && *name != CONTENT_LENGTH)
+                    .filter_map(|(name, value)| {
+                        value
+                            .to_str()
+                            .ok()
+                            .map(|value| (name.as_str().to_owned(), value.to_owned()))
+                    })
+                    .collect();
+
+                cache.insert(
+                    cache_key,
+                    elira_cache::Entry {
+                        status: parts.status.as_u16(),
+                        headers,
+                        body: collected.to_vec(),
+                    },
+                    Instant::now(),
+                );
+            }
+
+            Full::new(collected).map_err(|never| match never {}).boxed()
+        } else {
+            BodyExt::map_err(body, |err| -> BoxError { Box::new(err) }).boxed()
+        };
+
+        let body = if let Some(encoding) = compress_with {
+            compress(body, encoding)
+        } else {
+            body
+        };
+
+        let mut response = builder
             .body(body)
-            .map_err(|_| text(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"))
+            .map_err(|_| text(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"))?;
+
+        if self.inner.cache.is_some() && is_get && requested_upgrade.is_none() {
+            response
+                .headers_mut()
+                .insert("x-cache", HeaderValue::from_static("MISS"));
+        }
+
+        self.apply_route(&mut response, entry, &request_id);
+        Ok(response)
+    }
+
+    fn apply_route(&self, response: &mut Response<Body>, entry: &RouteEntry, request_id: &str) {
+        let headers = response.headers_mut();
+
+        for name in &entry.remove_headers {
+            headers.remove(name);
+        }
+        for (name, value) in &entry.add_headers {
+            headers.insert(name, value.clone());
+        }
+
+        if !headers.contains_key("x-request-id") {
+            if let Ok(value) = HeaderValue::from_str(request_id) {
+                headers.insert("x-request-id", value);
+            }
+        }
+        if !self.inner.server_header {
+            headers.remove(SERVER);
+        }
+        if let Some(alt) = &self.inner.alt_svc {
+            headers.insert(ALT_SVC, alt.clone());
+        }
     }
 
     /// Upgrades cannot go through the connection pool: hyper has to hand the
@@ -908,12 +1172,13 @@ fn wants_upgrade(headers: &HeaderMap) -> Option<HeaderValue> {
         .then_some(upgrade)
 }
 
-fn accepts_gzip(headers: &HeaderMap) -> bool {
-    let Some(value) = headers.get(ACCEPT_ENCODING).and_then(|v| v.to_str().ok()) else {
-        return false;
-    };
+pub(crate) fn preferred_encoding(headers: &HeaderMap) -> Option<&'static str> {
+    let value = headers.get(ACCEPT_ENCODING)?.to_str().ok()?;
 
-    value.split(',').any(|part| {
+    let mut br = 0.0f32;
+    let mut gzip = 0.0f32;
+
+    for part in value.split(',') {
         let mut pieces = part.trim().split(';');
         let name = pieces.next().unwrap_or_default().trim();
         let quality = pieces
@@ -922,8 +1187,20 @@ fn accepts_gzip(headers: &HeaderMap) -> bool {
             .and_then(|value| value.parse::<f32>().ok())
             .unwrap_or(1.0);
 
-        name.eq_ignore_ascii_case("gzip") && quality > 0.0
-    })
+        if name.eq_ignore_ascii_case("br") {
+            br = quality;
+        } else if name.eq_ignore_ascii_case("gzip") {
+            gzip = quality;
+        }
+    }
+
+    if br > 0.0 && br >= gzip {
+        Some("br")
+    } else if gzip > 0.0 {
+        Some("gzip")
+    } else {
+        None
+    }
 }
 
 fn compressible(content_type: &str) -> bool {
@@ -946,13 +1223,63 @@ fn compressible(content_type: &str) -> bool {
         )
 }
 
-fn gzip(body: Body) -> Body {
+fn compress(body: Body, encoding: &'static str) -> Body {
+    fn finish<R>(reader: R) -> Body
+    where
+        R: tokio::io::AsyncRead + Send + Sync + 'static,
+    {
+        let stream = ReaderStream::new(reader).map_ok(hyper::body::Frame::data);
+        BodyExt::map_err(StreamBody::new(stream), |err| -> BoxError { Box::new(err) }).boxed()
+    }
+
     let stream = TryStreamExt::map_err(body.into_data_stream(), std::io::Error::other);
     let reader = StreamReader::new(stream);
-    let encoder = GzipEncoder::new(BufReader::new(reader));
-    let stream = ReaderStream::new(encoder).map_ok(hyper::body::Frame::data);
 
-    BodyExt::map_err(StreamBody::new(stream), |err| -> BoxError { Box::new(err) }).boxed()
+    match encoding {
+        "br" => finish(BrotliEncoder::new(BufReader::new(reader))),
+        _ => finish(GzipEncoder::new(BufReader::new(reader))),
+    }
+}
+
+fn cacheable_response(headers: &HeaderMap) -> bool {
+    if headers.contains_key(SET_COOKIE) {
+        return false;
+    }
+
+    match headers
+        .get(CACHE_CONTROL)
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(value) => {
+            let value = value.to_ascii_lowercase();
+            !value.contains("no-store") && !value.contains("private")
+        }
+        None => true,
+    }
+}
+
+fn cache_response(entry: elira_cache::Entry) -> Response<Body> {
+    let status = StatusCode::from_u16(entry.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let mut builder = Response::builder().status(status);
+
+    if let Some(headers) = builder.headers_mut() {
+        for (name, value) in &entry.headers {
+            if let (Ok(name), Ok(value)) = (
+                HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_str(value),
+            ) {
+                headers.append(name, value);
+            }
+        }
+    }
+
+    let body = Full::new(Bytes::from(entry.body))
+        .map_err(|never| match never {})
+        .boxed();
+
+    builder
+        .body(body)
+        .unwrap_or_else(|_| text(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"))
 }
 
 fn upstream_uri(server: &Authority, path: &str) -> Option<Uri> {
@@ -1099,6 +1426,9 @@ pub enum Error {
 
     #[error("route for \"{host}\" has neither an upstream nor a root")]
     MissingTarget { host: String },
+
+    #[error("route for \"{host}\" has an invalid redirect target or status")]
+    BadRedirect { host: String },
 }
 
 #[cfg(test)]

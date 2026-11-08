@@ -60,13 +60,30 @@ allow = ["10.0.0.5:5432"]       # exact host:port destinations only
 [metrics]
 listen = "127.0.0.1:9090"
 
+[cache]
+enabled = true
+ttl_secs = 60
+max_item_bytes = 1048576
+
 [[upstreams]]
 name = "app"
 servers = ["127.0.0.1:3000", "127.0.0.1:3001"]
+balance = "least_conn"
+retries = 1
 
 [[routes]]
-host = "*"               # or example.com; `*` catches the rest
+host = "*"               # or example.com, or *.example.com
 upstream = "app"
+
+[[routes]]
+host = "*"
+path = "/api"            # longest prefix wins
+upstream = "app"
+strip_prefix = true      # /api/users reaches the backend as /users
+
+[[routes]]
+host = "old.example.com"
+redirect = { to = "https://new.example.com/", status = 301 }
 
 # A static route uses `root` instead of `upstream`.
 [[routes]]
@@ -74,6 +91,8 @@ host = "static.example.com"
 root = "/srv/www"
 index = ["index.html"]
 spa = false              # true serves index.html for client-side routes
+add_headers = ["X-Frame-Options: DENY"]
+remove_headers = ["X-Powered-By"]
 ```
 
 ## What it does today
@@ -94,6 +113,11 @@ spa = false              # true serves index.html for client-side routes
 - per-IP token-bucket rate limiting and a `Content-Length` body cap
 - `trusted_proxies` so `X-Forwarded-For` is only extended by peers you name
 - PROXY protocol v1 and v2, so a load balancer can pass the real client address
+- routes by exact host, `*.wildcard`, longest path prefix, with `strip_prefix`
+- redirect routes, per-route `add_headers`/`remove_headers`, `Server` can be hidden
+- `X-Request-Id` echoed and forwarded, `Alt-Svc` advertises HTTP/3
+- brotli and gzip, plus precompressed `.br`/`.gz` static siblings
+- an in-memory cache for small `GET` responses with `X-Cache: HIT/MISS`
 - access log in text or JSON, with a request id per line
 - active health checks: a server that stops answering 2xx/3xx stops receiving
   traffic, and comes back on its own
