@@ -551,6 +551,8 @@ advisory-lock `.elira-cache.lock`, а `max_bytes` считается по все
 | `fastcgi_pass` | строка | нет | `host:port` или `unix:/path` |
 | `fastcgi_root` | путь | нет | корень для `SCRIPT_FILENAME` |
 | `fastcgi_index` | строка | `index.php` | файл для пути с `/` на конце |
+| `fastcgi_param` | массив строк | `[]` | дополнительные параметры `NAME: value` |
+| `cgi_param` | массив строк | `[]` | дополнительные переменные CGI `NAME: value` |
 | `cgi_pass` | путь | нет | абсолютный путь к CGI-скрипту |
 | `module` | путь | нет | абсолютный путь к `.so`-модулю |
 | `module_sandbox` | bool | `false` | запускать модуль в дочернем процессе |

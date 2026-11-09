@@ -143,6 +143,8 @@ struct RouteEntry {
     cache: Option<bool>,
     cache_ttl: Option<Duration>,
     access_log: bool,
+    fastcgi_param: Vec<(String, String)>,
+    cgi_param: Vec<(String, String)>,
 }
 
 struct Router {
@@ -684,6 +686,16 @@ impl Proxy {
                 cache: route.cache_enabled,
                 cache_ttl: route.cache_ttl_secs.map(Duration::from_secs),
                 access_log: route.access_log,
+                fastcgi_param: route
+                    .fastcgi_param
+                    .iter()
+                    .filter_map(|line| parse_param(line))
+                    .collect(),
+                cgi_param: route
+                    .cgi_param
+                    .iter()
+                    .filter_map(|line| parse_param(line))
+                    .collect(),
                 fastcgi_pool: route.fastcgi_pool_idle.map(|idle| {
                     Arc::new(elira_fastcgi::Pool::new(
                         idle,
@@ -1829,6 +1841,7 @@ impl Proxy {
         params.push(("SCRIPT_FILENAME".to_owned(), script.display().to_string()));
         params.push(("SCRIPT_NAME".to_owned(), path.to_owned()));
         params.push(("DOCUMENT_ROOT".to_owned(), root.display().to_string()));
+        params.extend(entry.fastcgi_param.iter().cloned());
 
         let limit = entry.body_limit.unwrap_or(self.inner.max_body_bytes);
         let request_body = body.into_data_stream().boxed();
@@ -1959,6 +1972,7 @@ impl Proxy {
         params.push(("SCRIPT_FILENAME".to_owned(), script.display().to_string()));
         params.push(("SCRIPT_NAME".to_owned(), script.display().to_string()));
         params.push(("PATH_INFO".to_owned(), path.to_owned()));
+        params.extend(entry.cgi_param.iter().cloned());
 
         let limit = entry.body_limit.unwrap_or(self.inner.max_body_bytes);
         let request_body = body.into_data_stream().boxed();
@@ -2943,6 +2957,11 @@ fn validators_from_entry(entry: &elira_cache::Entry) -> HeaderMap {
         }
     }
     validators
+}
+
+fn parse_param(value: &str) -> Option<(String, String)> {
+    let (name, value) = value.split_once(':')?;
+    Some((name.trim().to_owned(), value.trim().to_owned()))
 }
 
 fn module_request(

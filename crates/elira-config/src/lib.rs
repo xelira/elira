@@ -523,6 +523,14 @@ pub struct Route {
     #[serde(default = "Route::default_fastcgi_index")]
     pub fastcgi_index: String,
 
+    /// Extra FastCGI params as `NAME: value`.
+    #[serde(default)]
+    pub fastcgi_param: Vec<String>,
+
+    /// Extra CGI environment variables as `NAME: value`.
+    #[serde(default)]
+    pub cgi_param: Vec<String>,
+
     /// CGI script to execute for this route.
     #[serde(default)]
     pub cgi_pass: Option<PathBuf>,
@@ -1040,6 +1048,15 @@ fn substitute_env(text: &str) -> Result<String, Error> {
     Ok(out)
 }
 
+fn parse_param(value: &str) -> Option<(String, String)> {
+    let (name, value) = value.split_once(':')?;
+    let name = name.trim();
+    if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        return None;
+    }
+    Some((name.to_owned(), value.trim().to_owned()))
+}
+
 /// Host name without wildcards: letters, digits, dots, hyphens, underscores.
 fn is_plain_name(name: &str) -> bool {
     !name.is_empty()
@@ -1404,6 +1421,14 @@ impl Config {
             }
             if route.fastcgi_index.contains('/') || route.fastcgi_index.contains("..") {
                 return Err(Error::BadFastCgiIndex { index });
+            }
+            for param in route.fastcgi_param.iter().chain(route.cgi_param.iter()) {
+                if parse_param(param).is_none() {
+                    return Err(Error::BadAppParam {
+                        index,
+                        param: param.clone(),
+                    });
+                }
             }
             if let Some(script) = &route.cgi_pass {
                 if script.as_os_str().is_empty() || !script.is_absolute() {
@@ -1799,6 +1824,9 @@ pub enum Error {
 
     #[error("route {index}: fastcgi_index must be a file name")]
     BadFastCgiIndex { index: usize },
+
+    #[error("route {index}: \"{param}\" is not \"NAME: value\"")]
+    BadAppParam { index: usize, param: String },
 
     #[error("route {index}: cgi_pass must be an absolute script path")]
     BadCgiScript { index: usize },
@@ -3189,6 +3217,24 @@ upstream = "app"
         assert!(matches!(
             Config::parse(&both),
             Err(Error::H3AndH2Pool { .. })
+        ));
+    }
+
+    #[test]
+    fn app_params_are_validated() {
+        let ok = r#"
+listen = "127.0.0.1:8080"
+[[routes]]
+host = "*"
+fastcgi_pass = "127.0.0.1:9000"
+fastcgi_root = "/srv"
+fastcgi_param = ["APP_ENV: production", "FLAG:1"]
+"#;
+        assert!(Config::parse(ok).is_ok());
+        let bad = ok.replace("APP_ENV: production", "bad name: x");
+        assert!(matches!(
+            Config::parse(&bad),
+            Err(Error::BadAppParam { .. })
         ));
     }
 }

@@ -2076,7 +2076,7 @@ async fn cgi_route_runs_a_script() {
     let script = root.join("hello");
     std::fs::write(
         &script,
-        "#!/bin/sh\nread body\nprintf 'Content-Type: text/plain\\r\\n\\r\\ncgi:%s\\n' \"$QUERY_STRING\"\n",
+        "#!/bin/sh\nread body\nprintf 'Content-Type: text/plain\\r\\n\\r\\ncgi:%s:%s\\n' \"$QUERY_STRING\" \"$APP_ENV\"\n",
     )
     .unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -2089,6 +2089,7 @@ listen = "127.0.0.1:0"
 host = "*"
 path = "/cgi"
 cgi_pass = "{}"
+cgi_param = ["APP_ENV: test"]
 "#,
         script.display()
     );
@@ -2100,7 +2101,7 @@ cgi_pass = "{}"
     )
     .await;
     assert_eq!(status(&response), "HTTP/1.1 200 OK");
-    assert!(response.contains("cgi:name=elira"), "{response}");
+    assert!(response.contains("cgi:name=elira:test"), "{response}");
 }
 
 /// A tiny FastCGI responder: it ignores params and answers every STDIN
