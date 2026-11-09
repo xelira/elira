@@ -163,6 +163,7 @@
 - `[[rewrites]]`: regex-замены пути с `last`/`break`/`redirect`/`permanent`.
 - `[[maps]]`: именованные переменные из таблицы значений.
 - `[[geos]]`, `[[splits]]` и route-level `if` с `return`.
+- `match = "exact"` и `no_regex` (`location =` и `^~`).
 - `Cache-Control: must-revalidate` запрещает stale-выдачу; `Expires`/`Date`
   задают TTL, если `max-age` нет. Запросы с `no-cache`/`no-store` обходят кэш.
 - Заголовки `Forwarded` и `X-Forwarded-Port` к upstream.

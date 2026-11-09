@@ -191,8 +191,8 @@ the code is in [docs/architecture.md](docs/architecture.md).
 
 Routing:
 
-- exact hosts, `*.example.com`, `host = "*"`, longest path prefix and
-  `path_regex` after prefixes- `strip_prefix`, redirect routes, fixed `return` responses, regex `rewrites`,
+- exact hosts, `*.example.com`, `host = "*"`, longest path prefix,
+  `match = "exact"`, `no_regex` and `path_regex` with nginx ordering- `strip_prefix`, redirect routes, fixed `return` responses, regex `rewrites`,
   `map`/`geo`/`split` variables, conditional `if` returns, `try_files`,
   SPA fallback, directory listings
 - per-route `add_headers`/`remove_headers` for responses and

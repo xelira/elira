@@ -1414,6 +1414,63 @@ if = [{{ variable = "$http_x_debug", equals = "1", return = {{ status = 503, bod
 }
 
 #[tokio::test]
+async fn exact_and_no_regex_locations_pick_the_right_route() {
+    let config = r#"
+listen = "127.0.0.1:0"
+
+[[routes]]
+host = "example.com"
+path = "/app"
+match = "exact"
+return = { status = 200, body = "exact" }
+
+[[routes]]
+host = "example.com"
+path = "/app"
+return = { status = 200, body = "prefix" }
+
+[[routes]]
+host = "example.com"
+path_regex = "^/app/.*"
+return = { status = 200, body = "regex" }
+
+[[routes]]
+host = "noregex.example"
+path = "/app"
+no_regex = true
+return = { status = 200, body = "prefix" }
+
+[[routes]]
+host = "noregex.example"
+path_regex = "^/app/.*"
+return = { status = 200, body = "regex" }
+"#;
+    let (addr, _stop, _metrics) = start(config).await;
+
+    let exact = roundtrip(
+        addr,
+        "GET /app HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&exact), "HTTP/1.1 200 OK", "{exact}");
+    assert!(exact.ends_with("exact"), "{exact}");
+
+    let regex = roundtrip(
+        addr,
+        "GET /app/x HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(regex.ends_with("regex"), "{regex}");
+
+    let no_regex = roundtrip(
+        addr,
+        "GET /app/x HTTP/1.1\r\nHost: noregex.example\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(no_regex.ends_with("prefix"), "{no_regex}");
+}
+
+#[tokio::test]
 async fn route_request_headers_are_set_and_removed() {
     let upstream = upstream().await;
     let config = format!(

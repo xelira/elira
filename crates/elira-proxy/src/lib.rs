@@ -596,6 +596,8 @@ struct RouteEntry {
     label: String,
     host: String,
     prefix: String,
+    exact: bool,
+    no_regex: bool,
     regex: Option<regex::Regex>,
     target: Target,
     strip_prefix: bool,
@@ -716,9 +718,17 @@ impl Router {
         for list in lists {
             if let Some(entry) = list
                 .iter()
-                .find(|entry| entry.regex.is_none() && path_matches(&entry.prefix, path))
+                .find(|entry| entry.exact && entry.prefix == path)
             {
                 return Some(entry);
+            }
+            let prefix = list
+                .iter()
+                .find(|entry| entry.regex.is_none() && path_matches(&entry.prefix, path));
+            if let Some(entry) = prefix {
+                if entry.no_regex {
+                    return Some(entry);
+                }
             }
             if let Some(entry) = list.iter().find(|entry| {
                 entry
@@ -726,6 +736,9 @@ impl Router {
                     .as_ref()
                     .is_some_and(|regex| regex.is_match(path))
             }) {
+                return Some(entry);
+            }
+            if let Some(entry) = prefix {
                 return Some(entry);
             }
         }
@@ -1438,6 +1451,8 @@ impl Proxy {
                 ),
                 host: route.host.trim().to_ascii_lowercase(),
                 prefix: route.path.clone().unwrap_or_default(),
+                exact: route.match_type == elira_config::RouteMatch::Exact,
+                no_regex: route.no_regex,
                 regex: route
                     .path_regex
                     .as_deref()

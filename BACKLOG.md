@@ -127,7 +127,9 @@ Living list for the self-improvement loop. One item per session.
 - [x] `rewrite` rules.
 - [x] `map` variables.
 - [x] `if`, `geo`, `split_clients`.
-- [ ] `location =`, `^~`, nested and named locations, `internal`.
+- [x] `location =` and `^~` matching (`match = "exact"`, `no_regex`).
+- [ ] Nested locations.
+- [ ] Named locations and `internal`.
 - [x] `alias` (distinct from `root`).
 - [x] `expires` and `etag off` for static responses.
 - [ ] `auth_request` subrequests.

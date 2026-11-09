@@ -241,6 +241,14 @@ pub struct SplitBucket {
     pub value: String,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteMatch {
+    #[default]
+    Prefix,
+    Exact,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Limits {
@@ -774,6 +782,14 @@ pub struct Route {
     /// Path prefix. The longest matching prefix wins inside a host.
     #[serde(default)]
     pub path: Option<String>,
+
+    /// `prefix` (default) or `exact`, like `location = /path`.
+    #[serde(default, rename = "match")]
+    pub match_type: RouteMatch,
+
+    /// Skip regex routes when this prefix matches, like `location ^~`.
+    #[serde(default)]
+    pub no_regex: bool,
 
     /// Regular expression matched against the path after prefix routes.
     #[serde(default)]
@@ -2193,11 +2209,17 @@ impl Config {
 
             // The same host may appear several times with different paths;
             // only an identical pair is ambiguous.
-            let discriminator = route
+            let mut discriminator = route
                 .path
                 .clone()
                 .or_else(|| route.path_regex.clone())
                 .unwrap_or_default();
+            if route.match_type == RouteMatch::Exact {
+                discriminator.push_str("|exact");
+            }
+            if route.no_regex {
+                discriminator.push_str("|noregex");
+            }
             let mut route_listeners = route.listeners.clone();
             route_listeners.sort();
             route_listeners.dedup();
@@ -2333,6 +2355,14 @@ impl Config {
             }
             if route.path.is_some() && route.path_regex.is_some() {
                 return Err(Error::PathAndRegex { index });
+            }
+            if (route.match_type == RouteMatch::Exact || route.no_regex)
+                && (route.path.is_none() || route.path_regex.is_some())
+            {
+                return Err(Error::BadRouteMatch { index });
+            }
+            if route.match_type == RouteMatch::Exact && route.no_regex {
+                return Err(Error::BadRouteMatch { index });
             }
             if let Some(pattern) = &route.path_regex {
                 if regex::Regex::new(pattern).is_err() {
@@ -2890,6 +2920,9 @@ pub enum Error {
 
     #[error("route {index}: path and path_regex are mutually exclusive")]
     PathAndRegex { index: usize },
+
+    #[error("route {index}: match = \"exact\" and no_regex need a literal path and no path_regex")]
+    BadRouteMatch { index: usize },
 
     #[error("route {index}: \"{pattern}\" is not a valid regular expression")]
     BadPathRegex { index: usize, pattern: String },
@@ -4580,6 +4613,43 @@ root = "/srv/www"
 
         let empty = base.replace("^/old/(.*)$", "");
         assert!(matches!(Config::parse(&empty), Err(Error::BadRewrite)));
+    }
+
+    #[test]
+    fn route_match_modes_are_validated() {
+        let base = r#"
+listen = "127.0.0.1:8080"
+
+[[routes]]
+host = "*"
+path = "/app"
+match = "exact"
+return = { status = 200, body = "exact" }
+
+[[routes]]
+host = "*"
+path = "/api"
+no_regex = true
+return = { status = 200, body = "prefix" }
+"#;
+        let cfg = Config::parse(base).expect("valid");
+        assert_eq!(cfg.routes[0].match_type, RouteMatch::Exact);
+        assert!(cfg.routes[1].no_regex);
+
+        let no_path = base.replace("path = \"/app\"\n", "");
+        assert!(matches!(
+            Config::parse(&no_path),
+            Err(Error::BadRouteMatch { .. })
+        ));
+
+        let regex = base.replace(
+            "match = \"exact\"",
+            "match = \"exact\"\npath_regex = \"^/app$\"",
+        );
+        assert!(matches!(
+            Config::parse(&regex),
+            Err(Error::PathAndRegex { .. }) | Err(Error::BadRouteMatch { .. })
+        ));
     }
 
     #[test]
