@@ -9,7 +9,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
-use http::header::{CONNECTION, SERVER, UPGRADE};
+use http::header::{CONNECTION, CONTENT_LENGTH, SERVER, UPGRADE};
 use http::uri::Authority;
 use http::{HeaderMap, HeaderValue, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};

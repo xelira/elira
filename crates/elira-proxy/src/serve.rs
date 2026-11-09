@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
-use http::header::{AUTHORIZATION, WWW_AUTHENTICATE};
+use http::header::{AUTHORIZATION, CONTENT_LENGTH, LOCATION, WWW_AUTHENTICATE};
 use http::{HeaderValue, Request, Response, StatusCode};
 
 use elira_tls::ClientIdentity;
