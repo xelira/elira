@@ -387,6 +387,10 @@ pub struct Upstream {
     pub name: String,
     pub servers: Vec<String>,
 
+    /// Relative weights for `servers`. Empty means every server weighs one.
+    #[serde(default)]
+    pub weights: Vec<u32>,
+
     /// How to choose a server. `round_robin` by default.
     #[serde(default)]
     pub balance: Balance,
@@ -1524,6 +1528,29 @@ impl Config {
                     name: up.name.clone(),
                 });
             }
+            if !up.weights.is_empty() {
+                if up.weights.len() != up.servers.len() {
+                    return Err(Error::WeightsLength {
+                        name: up.name.clone(),
+                    });
+                }
+                if up.weights.contains(&0) {
+                    return Err(Error::ZeroWeight {
+                        name: up.name.clone(),
+                    });
+                }
+                if up.balance == Balance::Hash {
+                    return Err(Error::WeightsWithHash {
+                        name: up.name.clone(),
+                    });
+                }
+                let total: u64 = up.weights.iter().map(|weight| u64::from(*weight)).sum();
+                if total > 10_000 {
+                    return Err(Error::WeightsTooLarge {
+                        name: up.name.clone(),
+                    });
+                }
+            }
             if up.retries > 5 {
                 return Err(Error::TooManyRetries {
                     name: up.name.clone(),
@@ -2071,6 +2098,18 @@ pub enum Error {
 
     #[error("upstream \"{name}\": dns_ttl_secs must be greater than zero")]
     BadDnsTtl { name: String },
+
+    #[error("upstream \"{name}\": weights and balance = \"hash\" cannot be combined")]
+    WeightsWithHash { name: String },
+
+    #[error("upstream \"{name}\": weights must contain one positive value per server")]
+    WeightsLength { name: String },
+
+    #[error("upstream \"{name}\": weights must be greater than zero")]
+    ZeroWeight { name: String },
+
+    #[error("upstream \"{name}\": total weight must not exceed 10000")]
+    WeightsTooLarge { name: String },
 
     #[error("upstream \"{name}\": eject_secs must be greater than zero when failures_before_eject is set")]
     BadEjectTimeout { name: String },
@@ -3293,6 +3332,42 @@ root = "/srv/www"
             cfg.cache.dir.as_deref().map(|p| p.to_str().unwrap()),
             Some("/var/cache/elira")
         );
+    }
+
+    #[test]
+    fn upstream_weights_are_validated() {
+        let base = r#"
+listen = "127.0.0.1:8080"
+
+[[upstreams]]
+name = "app"
+servers = ["127.0.0.1:9000", "127.0.0.1:9001"]
+weights = [3, 1]
+
+[[routes]]
+host = "*"
+upstream = "app"
+"#;
+        let cfg = Config::parse(base).expect("valid");
+        assert_eq!(cfg.upstreams[0].weights, vec![3, 1]);
+
+        let short = base.replace("weights = [3, 1]", "weights = [3]");
+        assert!(matches!(
+            Config::parse(&short),
+            Err(Error::WeightsLength { .. })
+        ));
+
+        let zero = base.replace("weights = [3, 1]", "weights = [3, 0]");
+        assert!(matches!(
+            Config::parse(&zero),
+            Err(Error::ZeroWeight { .. })
+        ));
+
+        let hash = base.replace("weights = [3, 1]", "weights = [3, 1]\nbalance = \"hash\"");
+        assert!(matches!(
+            Config::parse(&hash),
+            Err(Error::WeightsWithHash { .. })
+        ));
     }
 
     #[test]

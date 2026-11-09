@@ -978,6 +978,44 @@ upstream = "app"
 }
 
 #[tokio::test]
+async fn weighted_round_robin_follows_the_configured_ratio() {
+    let first = labeled_upstream("one").await;
+    let second = labeled_upstream("two").await;
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[upstreams]]
+name = "app"
+servers = ["{first}", "{second}"]
+weights = [3, 1]
+
+[[routes]]
+host = "example.com"
+upstream = "app"
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let mut one = 0;
+    let mut two = 0;
+    for _ in 0..8 {
+        let response = roundtrip(
+            addr,
+            "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert_eq!(status(&response), "HTTP/1.1 200 OK", "{response}");
+        if response.ends_with("one") {
+            one += 1;
+        } else if response.ends_with("two") {
+            two += 1;
+        }
+    }
+    assert_eq!((one, two), (6, 2));
+}
+
+#[tokio::test]
 async fn retries_a_dead_upstream_for_get() {
     let upstream = upstream().await;
     let config = format!(

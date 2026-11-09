@@ -546,6 +546,7 @@ advisory-lock `.elira-cache.lock`, а `max_bytes` считается по все
 | --- | --- | --- | --- |
 | `name` | строка | нет, обязательна | имя, на которое ссылаются маршруты |
 | `servers` | массив строк | нет, обязателен и непуст | адреса бэкендов `host:port` или `unix:/path` |
+| `weights` | массив целых > 0 | `[]` (все 1) | относительные веса для `round_robin` и `least_conn` |
 | `balance` | `round_robin` \| `least_conn` \| `hash` | `round_robin` | как выбирать сервер |
 | `hash_key` | строка | `"ip"` | ключ для `balance = "hash"`: `ip`, `authorization`, `header:NAME`, `cookie:NAME`, `uri` |
 | `retries` | целое 0..5 | `0` | дополнительные попытки на ошибку соединения |
@@ -571,6 +572,11 @@ advisory-lock `.elira-cache.lock`, а `max_bytes` считается по все
   как мёртвые. `least_conn` выбирает живого с наименьшим числом активных
   запросов; счётчик держится от приёма запроса до возврата заголовков ответа,
   поэтому потоковое тело в нём уже не учитывается.
+- `weights` задаёт относительную нагрузку: `[3, 1]` отправляет три запроса из
+  четырёх на первый сервер и один на второй. `round_robin` раскладывает слоты
+  по весам, `least_conn` сравнивает `active / weight`. Веса должны совпадать по
+  длине с `servers`, быть больше нуля, а сумма — не больше 10000. С
+  `balance = "hash"` веса не сочетаются.
 - `balance = "hash"` использует rendezvous hashing: один и тот же `hash_key`
   остаётся на одном сервере, а добавление или удаление сервера перераспределяет
   только ключи, которые были на нём. `hash_key = "uri"` хеширует путь с query;
@@ -929,6 +935,8 @@ elira check --config elira.toml
 | `"..." is not a hash key` | неизвестный ключ | `ip`, `authorization`, `header:NAME`, `cookie:NAME`, `uri` |
 | `unix_tls needs listen_unix` | TLS на сокете без сокета | задайте `listen_unix` |
 | `unix_tls needs a [tls] section...` | Unix TLS без сертификата | добавьте `[tls]` |
+| `weights must contain one positive value per server` | длина не совпала | выровняйте `weights` и `servers` |
+| `weights and balance = "hash" cannot be combined` | веса с hash | уберите `weights` |
 | `route N: timeout_secs must be greater than zero` | нулевой таймаут | уберите поле или поставьте больше нуля |
 | `http3.cert must not be empty` | `[http3]` без сертификата | задайте `cert` и `key` |
 | `health.path must start with '/'...` | путь без `/` | `/health` |

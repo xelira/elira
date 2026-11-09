@@ -377,6 +377,9 @@ struct Pool {
     started: Instant,
     hash_key: RequestKey,
     server_labels: Vec<String>,
+    weights: Vec<u32>,
+    total_weight: u64,
+    weighted: bool,
     next: AtomicUsize,
     balance: Balance,
     retries: u32,
@@ -417,8 +420,7 @@ impl Pool {
         match self.balance {
             Balance::RoundRobin => self.pick_round_robin(start, now),
             Balance::LeastConn => {
-                let mut best = None;
-                let mut best_active = usize::MAX;
+                let mut best: Option<(usize, usize, u32)> = None;
 
                 for offset in 0..count {
                     let index = (start + offset) % count;
@@ -426,13 +428,20 @@ impl Pool {
                         continue;
                     }
                     let active = self.active[index].load(Ordering::Relaxed);
-                    if active < best_active {
-                        best = Some(index);
-                        best_active = active;
+                    let weight = self.weights[index];
+                    let better = match best {
+                        None => true,
+                        Some((_, best_active, best_weight)) => {
+                            (active as u128) * u128::from(best_weight)
+                                < (best_active as u128) * u128::from(weight)
+                        }
+                    };
+                    if better {
+                        best = Some((index, active, weight));
                     }
                 }
 
-                best.unwrap_or(start % count)
+                best.map(|(index, _, _)| index).unwrap_or(start % count)
             }
             Balance::Hash => {
                 let Some(key) = key else {
@@ -445,15 +454,31 @@ impl Pool {
 
     fn pick_round_robin(&self, start: usize, now: u64) -> usize {
         let count = self.servers.len();
+        let base = if self.weighted {
+            self.weighted_index((start as u64) % self.total_weight)
+        } else {
+            start % count
+        };
         for offset in 0..count {
-            let index = (start + offset) % count;
+            let index = (base + offset) % count;
             if self.available(index, now) {
                 return index;
             }
         }
         // Everything looks down. Send traffic anyway: a broken probe or a
         // stale ejection must not turn into an outage.
-        start % count
+        base
+    }
+
+    fn weighted_index(&self, mut slot: u64) -> usize {
+        for (index, weight) in self.weights.iter().enumerate() {
+            let weight = u64::from(*weight);
+            if slot < weight {
+                return index;
+            }
+            slot -= weight;
+        }
+        0
     }
 
     fn pick_rendezvous(&self, key: &str, now: u64) -> usize {
@@ -581,6 +606,7 @@ impl Proxy {
                             "address": server.to_string(),
                             "healthy": pool.health[index].load(Ordering::Relaxed),
                             "active": pool.active[index].load(Ordering::Relaxed),
+                            "weight": pool.weights[index],
                             "ejected_for_ms": pool.passive[index]
                                 .ejected_until_ms
                                 .load(Ordering::Relaxed)
@@ -649,6 +675,13 @@ impl Proxy {
                 })
                 .collect();
             let server_labels = servers.iter().map(ToString::to_string).collect();
+            let weights = if up.weights.is_empty() {
+                vec![1; servers.len()]
+            } else {
+                up.weights.clone()
+            };
+            let total_weight: u64 = weights.iter().map(|weight| u64::from(*weight)).sum();
+            let weighted = weights.iter().any(|weight| *weight != 1);
 
             // Each pool gets its own connector: trust and ALPN may differ
             // between upstreams.
@@ -681,6 +714,9 @@ impl Proxy {
                     started: Instant::now(),
                     hash_key: parse_request_key(up.hash_key.as_deref()),
                     server_labels,
+                    weights,
+                    total_weight,
+                    weighted,
                     next: AtomicUsize::new(0),
                     balance: up.balance,
                     retries: up.retries,
@@ -3833,6 +3869,9 @@ mod tests {
             started: Instant::now(),
             hash_key: RequestKey::Ip,
             server_labels: vec!["127.0.0.1:1".to_owned(), "127.0.0.1:2".to_owned()],
+            weights: vec![1, 1],
+            total_weight: 2,
+            weighted: false,
             next: AtomicUsize::new(0),
             balance: Balance::LeastConn,
             retries: 0,
@@ -3847,6 +3886,55 @@ mod tests {
         assert_eq!(pool.pick(), 0);
         pool.active[0].store(10, Ordering::Relaxed);
         assert_eq!(pool.pick(), 1);
+    }
+
+    #[test]
+    fn weighted_least_conn_compares_active_over_weight() {
+        let tls = TlsOptions::default();
+        let client =
+            Client::builder(TokioExecutor::new()).build(https_connector(&tls).expect("connector"));
+        let pool = Pool {
+            name: "test".to_owned(),
+            servers: vec![
+                ServerAddr::Tcp("127.0.0.1:1".parse().unwrap()),
+                ServerAddr::Tcp("127.0.0.1:2".parse().unwrap()),
+            ],
+            health: vec![AtomicBool::new(true), AtomicBool::new(true)],
+            active: vec![AtomicUsize::new(3), AtomicUsize::new(3)],
+            passive: vec![
+                Passive {
+                    failures: AtomicU32::new(0),
+                    ejected_until_ms: AtomicU64::new(0),
+                },
+                Passive {
+                    failures: AtomicU32::new(0),
+                    ejected_until_ms: AtomicU64::new(0),
+                },
+            ],
+            failures_before_eject: 0,
+            eject_for: Duration::from_secs(30),
+            started: Instant::now(),
+            hash_key: RequestKey::Ip,
+            server_labels: vec!["127.0.0.1:1".to_owned(), "127.0.0.1:2".to_owned()],
+            weights: vec![1, 3],
+            total_weight: 4,
+            weighted: true,
+            next: AtomicUsize::new(0),
+            balance: Balance::LeastConn,
+            retries: 0,
+            scheme: "http",
+            client,
+            tls,
+            health_path: None,
+            h2: None,
+            h3: None,
+        };
+
+        assert_eq!(pool.pick(), 1, "3/3 beats 3/1");
+        pool.active[0].store(0, Ordering::Relaxed);
+        pool.active[1].store(0, Ordering::Relaxed);
+        pool.next.store(0, Ordering::Relaxed);
+        assert_eq!(pool.pick(), 0);
     }
 
     #[test]
@@ -3877,6 +3965,9 @@ mod tests {
             started: Instant::now(),
             hash_key: RequestKey::Ip,
             server_labels: vec!["127.0.0.1:1".to_owned(), "127.0.0.1:2".to_owned()],
+            weights: vec![1, 1],
+            total_weight: 2,
+            weighted: false,
             next: AtomicUsize::new(0),
             balance: Balance::RoundRobin,
             retries: 0,
