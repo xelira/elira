@@ -1512,6 +1512,13 @@ impl Proxy {
             }
         }
 
+        let body_limit = entry.body_limit.unwrap_or(self.inner.max_body_bytes);
+        let body_limit_hit = Arc::new(AtomicBool::new(false));
+        if body_limit > 0 {
+            let hit = body_limit_hit.clone();
+            req = req.map(|body| capped_request_body(body, body_limit, hit));
+        }
+
         let pool = match &entry.target {
             Target::Proxy(pool) => pool,
             Target::Files(files) => {
@@ -1546,6 +1553,9 @@ impl Proxy {
             }
             Target::FastCgi { .. } => {
                 let mut response = self.serve_fastcgi(req, entry, peer, scheme).await;
+                if body_limit_hit.load(Ordering::Relaxed) {
+                    return Err(self.body_too_large(entry, peer).await);
+                }
                 response.extensions_mut().insert(Labels {
                     route: entry.label.clone(),
                     upstream: None,
@@ -1558,6 +1568,9 @@ impl Proxy {
             }
             Target::Cgi { .. } => {
                 let mut response = self.serve_cgi(req, entry, peer, scheme).await;
+                if body_limit_hit.load(Ordering::Relaxed) {
+                    return Err(self.body_too_large(entry, peer).await);
+                }
                 response.extensions_mut().insert(Labels {
                     route: entry.label.clone(),
                     upstream: None,
@@ -1570,6 +1583,9 @@ impl Proxy {
             }
             Target::Module(_) | Target::Wasm(_) => {
                 let mut response = self.serve_app(req, entry, peer, scheme).await;
+                if body_limit_hit.load(Ordering::Relaxed) {
+                    return Err(self.body_too_large(entry, peer).await);
+                }
                 response.extensions_mut().insert(Labels {
                     route: entry.label.clone(),
                     upstream: None,
@@ -1807,6 +1823,9 @@ impl Proxy {
                     break;
                 }
                 Err(SendError::Failed(err)) => {
+                    if body_limit_hit.load(Ordering::Relaxed) {
+                        return Err(self.body_too_large(entry, peer).await);
+                    }
                     pool.record_failure(index);
                     tracing::warn!(upstream = %server, error = %err, "upstream request failed");
                     if attempt + 1 == attempts {
@@ -1814,6 +1833,9 @@ impl Proxy {
                     }
                 }
                 Err(SendError::Timeout) => {
+                    if body_limit_hit.load(Ordering::Relaxed) {
+                        return Err(self.body_too_large(entry, peer).await);
+                    }
                     pool.record_failure(index);
                     tracing::warn!(upstream = %server, "upstream timed out");
                     if attempt + 1 == attempts {
@@ -2550,6 +2572,12 @@ impl Proxy {
 
     async fn apply_global_error_page(&self, response: &mut Response<Body>, peer: SocketAddr) {
         self.apply_page(response, None, peer).await;
+    }
+
+    async fn body_too_large(&self, entry: &RouteEntry, peer: SocketAddr) -> Response<Body> {
+        let mut response = text(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
+        self.apply_error_page(&mut response, entry, peer).await;
+        response
     }
 
     async fn apply_page(
@@ -3624,6 +3652,19 @@ fn capped_body(body: Body, limit: usize) -> Body {
         inner: body,
         limit,
         seen: 0,
+        message: "upstream response too large",
+        flag: None,
+    }
+    .boxed()
+}
+
+fn capped_request_body(body: Body, limit: usize, flag: Arc<AtomicBool>) -> Body {
+    CappedBody {
+        inner: body,
+        limit,
+        seen: 0,
+        message: "request body too large",
+        flag: Some(flag),
     }
     .boxed()
 }
@@ -3632,6 +3673,8 @@ struct CappedBody {
     inner: Body,
     limit: usize,
     seen: usize,
+    message: &'static str,
+    flag: Option<Arc<AtomicBool>>,
 }
 
 impl HttpBody for CappedBody {
@@ -3648,9 +3691,12 @@ impl HttpBody for CappedBody {
                 if let Some(data) = frame.data_ref() {
                     this.seen = this.seen.saturating_add(data.len());
                     if this.seen > this.limit {
+                        if let Some(flag) = &this.flag {
+                            flag.store(true, Ordering::Relaxed);
+                        }
                         return Poll::Ready(Some(Err(Box::new(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
-                            "upstream response too large",
+                            this.message,
                         )))));
                     }
                 }

@@ -228,7 +228,8 @@ HTTP:
 - HTTP/1.1, HTTP/2 (TLS or h2c with prior knowledge), HTTP/3 over QUIC
 - response trailers (gRPC `grpc-status`) forwarded end to end
 - optional TLS and HTTP/2 on the unix listener, using the same `[tls]`
-- body progress timeouts, websocket/CONNECT idle timeout
+- body progress timeouts, websocket/CONNECT idle timeout and request-body caps
+  enforced on streamed uploads, not only `Content-Length`
 - optional memory or temporary-file buffering of upstream responses
 - gzip/brotli, `Alt-Svc`, `Server` hiding, `X-Request-Id`
 

@@ -143,6 +143,29 @@ async fn labeled_upstream(label: &'static str) -> SocketAddr {
     addr
 }
 
+/// An upstream that accepts a request and never answers, so a test can
+/// exercise what the proxy does while a body is still being sent.
+async fn silent_upstream() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind silent upstream");
+    let addr = listener.local_addr().expect("silent addr");
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut chunk = [0u8; 4096];
+                while matches!(stream.read(&mut chunk).await, Ok(read) if read > 0) {}
+            });
+        }
+    });
+
+    addr
+}
+
 /// A TCP server that echoes bytes back. Used by the CONNECT tests.
 async fn tcp_echo() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind echo");
@@ -778,6 +801,28 @@ async fn rejects_bodies_over_the_limit() {
     )
     .await;
     assert_eq!(status(&response), "HTTP/1.1 413 Payload Too Large");
+}
+
+#[tokio::test]
+async fn rejects_a_chunked_body_over_the_limit() {
+    let upstream = silent_upstream().await;
+    let mut config = NO_DEFAULT.replace("{upstream}", &upstream.to_string());
+    config.push_str("\n[limits]\nmax_body_bytes = 10\n");
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let response = roundtrip(
+        addr,
+        "POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\
+         Connection: close\r\n\r\n\
+         5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n",
+    )
+    .await;
+    assert_eq!(
+        status(&response),
+        "HTTP/1.1 413 Payload Too Large",
+        "{response}"
+    );
+    assert!(response.contains("request body too large"), "{response}");
 }
 
 #[tokio::test]
