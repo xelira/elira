@@ -78,8 +78,8 @@ Living list for the self-improvement loop. One item per session.
 - [x] Upstream HTTP/3 pool (`h3_pool`).
 - [x] Prometheus gauges for the HTTP/3 upstream pool.
 - [x] Custom FastCGI/CGI params.
-- [ ] DNS-01 against a real production CA: blocked on an externally managed
-  zone for TXT records.
+- [x] DNS-01 against a real production CA, verified on
+  `elira-dns-prod.owaw.online` through Cloudflare and Let's Encrypt.
 - [x] Scripted-peer tests for truncated and trailing FastCGI/CGI streaming
   framing.
 
