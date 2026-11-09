@@ -43,7 +43,7 @@ use tokio_util::io::{ReaderStream, StreamReader};
 
 use elira_auth::{BasicAuth, IpAcl};
 use elira_cache::Cache;
-use elira_config::{Balance, Compression, Config, Health, RewriteFlag};
+use elira_config::{Balance, Compression, Config, Health, Map, RewriteFlag};
 use elira_limit::RateLimiter;
 use elira_tls::ClientIdentity;
 use elira_upstream::{https_connector, TlsOptions};
@@ -235,6 +235,7 @@ impl SpoolLease {
 struct Inner {
     routers: HashMap<String, Router>,
     rewrites: Vec<CompiledRewrite>,
+    maps: Vec<Map>,
     pools: Vec<Arc<Pool>>,
     tunnels: Arc<Semaphore>,
     connect: Option<Vec<Authority>>,
@@ -317,6 +318,7 @@ struct RequestVars {
     port: u16,
     request_id: String,
     headers: HeaderMap,
+    mapped: HashMap<String, String>,
 }
 
 impl RequestVars {
@@ -332,6 +334,9 @@ impl RequestVars {
             "server_port" => Some(Cow::Owned(self.port.to_string())),
             "request_id" => Some(Cow::Borrowed(&self.request_id)),
             _ => {
+                if let Some(value) = self.mapped.get(name) {
+                    return Some(Cow::Borrowed(value));
+                }
                 if let Some(header) = name.strip_prefix("http_") {
                     let header = header.replace('_', "-");
                     return self
@@ -357,6 +362,23 @@ impl RequestVars {
                 }
                 None
             }
+        }
+    }
+
+    fn apply_maps(&mut self, maps: &[Map]) {
+        for map in maps {
+            let source = map.source.strip_prefix('$').unwrap_or(&map.source);
+            let key = self
+                .value(source)
+                .map(|value| value.into_owned())
+                .unwrap_or_default();
+            let value = map
+                .values
+                .get(&key)
+                .cloned()
+                .or_else(|| map.default.clone())
+                .unwrap_or_default();
+            self.mapped.insert(map.name.clone(), value);
         }
     }
 
@@ -1516,6 +1538,7 @@ impl Proxy {
             inner: Arc::new(Inner {
                 routers,
                 rewrites,
+                maps: cfg.maps.clone(),
                 pools: all_pools,
                 tunnels: Arc::new(Semaphore::new(cfg.limits.max_connections)),
                 connect,
@@ -2053,7 +2076,7 @@ impl Proxy {
             .rsplit_once(':')
             .and_then(|(_, port)| port.parse::<u16>().ok())
             .unwrap_or(if scheme == "https" { 443 } else { 80 });
-        let vars = RequestVars {
+        let mut vars = RequestVars {
             remote_addr: peer.ip(),
             host: key.clone(),
             path: req.uri().path().to_owned(),
@@ -2064,7 +2087,9 @@ impl Proxy {
             port: request_port,
             request_id: request_id.clone(),
             headers: req.headers().clone(),
+            mapped: HashMap::new(),
         };
+        vars.apply_maps(&self.inner.maps);
 
         if let Some(rule) = &entry.client_auth {
             if !rule.allows(req.extensions().get::<ClientIdentity>()) {

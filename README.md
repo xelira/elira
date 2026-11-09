@@ -193,7 +193,7 @@ Routing:
 
 - exact hosts, `*.example.com`, `host = "*"`, longest path prefix and
   `path_regex` after prefixes- `strip_prefix`, redirect routes, fixed `return` responses, regex `rewrites`,
-  `try_files`, SPA fallback, directory listings
+  `map` variables, `try_files`, SPA fallback, directory listings
 - per-route `add_headers`/`remove_headers` for responses and
   `request_headers`/`request_remove_headers` for upstream requests, with
   `$variable` expansion, plus `timeout_secs`, token bucket, concurrency limit,

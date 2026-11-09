@@ -2,7 +2,7 @@
 //!
 //! Everything here is plain data plus checks. No sockets, no async.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -35,6 +35,10 @@ pub struct Config {
     /// Server-level path rewrites applied before route selection.
     #[serde(default)]
     pub rewrites: Vec<Rewrite>,
+
+    /// Named variables computed from one source variable and a value table.
+    #[serde(default)]
+    pub maps: Vec<Map>,
 
     /// Permission bits for the unix socket, for example `0o660`.
     #[serde(default)]
@@ -188,6 +192,18 @@ pub enum RewriteFlag {
     Break,
     Redirect,
     Permanent,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Map {
+    pub name: String,
+    /// Source variable including the leading `$`.
+    pub source: String,
+    #[serde(default)]
+    pub default: Option<String>,
+    #[serde(default)]
+    pub values: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1532,6 +1548,26 @@ impl Config {
             }
         }
 
+        let mut map_names = HashSet::new();
+        for map in &self.maps {
+            if map.name.is_empty()
+                || !map
+                    .name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            {
+                return Err(Error::BadMapName);
+            }
+            if !map.source.starts_with('$') || map.source.len() < 2 {
+                return Err(Error::BadMapSource);
+            }
+            if !map_names.insert(map.name.as_str()) {
+                return Err(Error::DuplicateMapName {
+                    name: map.name.clone(),
+                });
+            }
+        }
+
         let mut listener_names = HashSet::new();
         listener_names.insert("default".to_owned());
         if self.listen_unix.is_some() {
@@ -2467,6 +2503,15 @@ pub enum Error {
 
     #[error("rewrite pattern and replacement must not be empty")]
     BadRewrite,
+
+    #[error("map name must be a non-empty identifier")]
+    BadMapName,
+
+    #[error("map source must be a $variable")]
+    BadMapSource,
+
+    #[error("map name {name:?} is used twice")]
+    DuplicateMapName { name: String },
 
     #[error("stream needs at least one upstream")]
     EmptyStream,
@@ -4314,6 +4359,35 @@ root = "/srv/www"
         assert!(matches!(
             Config::parse(&no_tls),
             Err(Error::UnixTlsWithoutTls)
+        ));
+    }
+
+    #[test]
+    fn map_variables_are_validated() {
+        let base = r#"
+listen = "127.0.0.1:8080"
+
+[[maps]]
+name = "tenant"
+source = "$http_x_tenant"
+default = "guest"
+values = { acme = "gold" }
+
+[[routes]]
+host = "*"
+root = "/srv/www"
+"#;
+        let cfg = Config::parse(base).expect("valid");
+        assert_eq!(cfg.maps.len(), 1);
+        assert_eq!(cfg.maps[0].name, "tenant");
+
+        let bad_name = base.replace("name = \"tenant\"", "name = \"bad name\"");
+        assert!(matches!(Config::parse(&bad_name), Err(Error::BadMapName)));
+
+        let bad_source = base.replace("source = \"$http_x_tenant\"", "source = \"http\"");
+        assert!(matches!(
+            Config::parse(&bad_source),
+            Err(Error::BadMapSource)
         ));
     }
 

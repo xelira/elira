@@ -161,6 +161,7 @@
 - `alias`, `expires_secs` и `etag = false` для статики.
 - `return` с переменными в теле и `content_type`.
 - `[[rewrites]]`: regex-замены пути с `last`/`break`/`redirect`/`permanent`.
+- `[[maps]]`: именованные переменные из таблицы значений.
 - `Cache-Control: must-revalidate` запрещает stale-выдачу; `Expires`/`Date`
   задают TTL, если `max-age` нет. Запросы с `no-cache`/`no-store` обходят кэш.
 - Заголовки `Forwarded` и `X-Forwarded-Port` к upstream.

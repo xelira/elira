@@ -1297,6 +1297,46 @@ root = "{}"
 }
 
 #[tokio::test]
+async fn map_variables_resolve_in_headers() {
+    let upstream = upstream().await;
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[maps]]
+name = "tenant"
+source = "$http_x_tenant"
+default = "guest"
+values = {{ acme = "gold", beta = "silver" }}
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "example.com"
+upstream = "app"
+add_headers = ["X-Tenant: $tenant"]
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let gold = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nX-Tenant: acme\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(gold.contains("x-tenant: gold"), "{gold}");
+
+    let guest = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(guest.contains("x-tenant: guest"), "{guest}");
+}
+
+#[tokio::test]
 async fn route_request_headers_are_set_and_removed() {
     let upstream = upstream().await;
     let config = format!(

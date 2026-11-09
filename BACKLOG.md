@@ -125,7 +125,8 @@ Living list for the self-improvement loop. One item per session.
 - [x] Variables in `error_pages` paths.
 - [x] `return` with variables.
 - [x] `rewrite` rules.
-- [ ] `if`, `map`, `geo`, `split_clients`.
+- [x] `map` variables.
+- [ ] `if`, `geo`, `split_clients`.
 - [ ] `location =`, `^~`, nested and named locations, `internal`.
 - [x] `alias` (distinct from `root`).
 - [x] `expires` and `etag off` for static responses.
