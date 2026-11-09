@@ -28,6 +28,10 @@ pub struct Config {
     #[serde(default)]
     pub listeners: Vec<Listener>,
 
+    /// Layer-4 TCP/UDP proxy listeners.
+    #[serde(default)]
+    pub streams: Vec<Stream>,
+
     /// Permission bits for the unix socket, for example `0o660`.
     #[serde(default)]
     pub listen_unix_mode: Option<u32>,
@@ -110,6 +114,44 @@ pub struct Listener {
     /// Terminate TLS on this listener with the shared `[tls]` settings.
     #[serde(default)]
     pub tls: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Stream {
+    pub listen: SocketAddr,
+    /// `tcp` (default) or `udp`.
+    #[serde(default)]
+    pub transport: StreamTransport,
+    pub upstreams: Vec<String>,
+    #[serde(default)]
+    pub balance: Balance,
+    /// Terminate TLS on a TCP stream with the shared `[tls]` settings.
+    #[serde(default)]
+    pub tls: bool,
+    #[serde(default = "Stream::default_connect_secs")]
+    pub connect_timeout_secs: u64,
+    /// Drop an idle TCP tunnel or UDP session after this long. Zero disables.
+    #[serde(default = "Stream::default_idle_secs")]
+    pub idle_timeout_secs: u64,
+}
+
+impl Stream {
+    fn default_connect_secs() -> u64 {
+        5
+    }
+
+    fn default_idle_secs() -> u64 {
+        300
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamTransport {
+    #[default]
+    Tcp,
+    Udp,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1369,6 +1411,44 @@ impl Config {
                 return Err(Error::ListenerTlsWithoutConfig);
             }
         }
+
+        let mut udp_addresses = HashSet::new();
+        if let Some(http3) = &self.http3 {
+            udp_addresses.insert(http3.listen);
+        }
+        for stream in &self.streams {
+            let duplicate = match stream.transport {
+                StreamTransport::Tcp => !addresses.insert(stream.listen),
+                StreamTransport::Udp => !udp_addresses.insert(stream.listen),
+            };
+            if duplicate {
+                return Err(Error::DuplicateStreamListen {
+                    listen: stream.listen.to_string(),
+                });
+            }
+            if stream.upstreams.is_empty() {
+                return Err(Error::EmptyStream);
+            }
+            if stream.listen.port() == 0 {
+                return Err(Error::BadStreamListen);
+            }
+            if stream.connect_timeout_secs == 0 {
+                return Err(Error::BadStreamConnect);
+            }
+            if stream.tls {
+                if stream.transport != StreamTransport::Tcp {
+                    return Err(Error::StreamTlsOnUdp);
+                }
+                if self.tls.is_none() && self.acme.is_none() {
+                    return Err(Error::StreamTlsWithoutConfig);
+                }
+            }
+            for addr in &stream.upstreams {
+                if addr.starts_with("unix:") || check_server(addr).is_err() {
+                    return Err(Error::BadStreamUpstream { addr: addr.clone() });
+                }
+            }
+        }
         if self.unix_tls && self.listen_unix.is_none() {
             return Err(Error::UnixTlsWithoutListener);
         }
@@ -2209,6 +2289,27 @@ pub enum Error {
 
     #[error("a TCP listener with tls = true needs [tls] or [acme]")]
     ListenerTlsWithoutConfig,
+
+    #[error("stream listener {listen} is configured twice")]
+    DuplicateStreamListen { listen: String },
+
+    #[error("stream listen must not use port 0")]
+    BadStreamListen,
+
+    #[error("stream needs at least one upstream")]
+    EmptyStream,
+
+    #[error("stream connect_timeout_secs must be greater than zero")]
+    BadStreamConnect,
+
+    #[error("TLS termination is only supported on TCP streams")]
+    StreamTlsOnUdp,
+
+    #[error("a stream with tls = true needs [tls] or [acme]")]
+    StreamTlsWithoutConfig,
+
+    #[error("stream upstream {addr:?} must be a TCP host:port address")]
+    BadStreamUpstream { addr: String },
 
     #[error("unix_tls needs listen_unix")]
     UnixTlsWithoutListener,
@@ -3762,6 +3863,57 @@ root = "/srv/www"
 
         let empty = base.replace("client_crl = \"/tmp/ca.crl.pem\"", "client_crl = \"\"");
         assert!(matches!(Config::parse(&empty), Err(Error::EmptyClientCrl)));
+    }
+
+    #[test]
+    fn stream_listeners_are_validated() {
+        let base = r#"
+listen = "127.0.0.1:8080"
+
+[[streams]]
+listen = "127.0.0.1:9000"
+upstreams = ["127.0.0.1:9001", "127.0.0.1:9002"]
+
+[[streams]]
+listen = "127.0.0.1:9003"
+transport = "udp"
+upstreams = ["127.0.0.1:9004"]
+
+[[routes]]
+host = "*"
+root = "/srv/www"
+"#;
+        let cfg = Config::parse(base).expect("valid");
+        assert_eq!(cfg.streams.len(), 2);
+
+        let bad_upstream = base.replace("\"127.0.0.1:9001\"", "\"unix:/tmp/x\"");
+        assert!(matches!(
+            Config::parse(&bad_upstream),
+            Err(Error::BadStreamUpstream { .. })
+        ));
+
+        let duplicate = format!(
+            "{base}\n[[streams]]\nlisten = \"127.0.0.1:9000\"\nupstreams = [\"127.0.0.1:9005\"]\n"
+        );
+        assert!(matches!(
+            Config::parse(&duplicate),
+            Err(Error::DuplicateStreamListen { .. })
+        ));
+
+        let udp_tls = base.replace("transport = \"udp\"", "transport = \"udp\"\ntls = true");
+        assert!(matches!(
+            Config::parse(&udp_tls),
+            Err(Error::StreamTlsOnUdp)
+        ));
+
+        let no_upstreams = base.replace(
+            "upstreams = [\"127.0.0.1:9001\", \"127.0.0.1:9002\"]",
+            "upstreams = []",
+        );
+        assert!(matches!(
+            Config::parse(&no_upstreams),
+            Err(Error::EmptyStream)
+        ));
     }
 
     #[test]

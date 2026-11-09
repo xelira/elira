@@ -58,6 +58,7 @@ Living list for the self-improvement loop. One item per session.
 - [x] Prefix replay for known-length bodies above the spool limit.
 - [x] Additional TCP listeners with per-listener TLS.
 - [x] Privilege drop, RLIMIT_NOFILE and PID file.
+- [x] L4 TCP/UDP stream proxying with TLS termination.
 - [x] Per-route FastCGI pool size.
 - [x] Purge tests through the admin listener in both single and worker mode.
 - [x] Per-route cache enable/TTL overrides.

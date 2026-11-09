@@ -276,7 +276,28 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
         None => None,
     };
 
+    let mut stream_bounds = Vec::new();
+    for stream in &cfg.streams {
+        stream_bounds.push(
+            elira::stream::bind(stream)
+                .await
+                .with_context(|| format!("cannot bind stream listener {}", stream.listen))?,
+        );
+        tracing::info!(listen = %stream.listen, transport = ?stream.transport, "stream listener");
+    }
+
     apply_privileges(&cfg)?;
+
+    let mut stream_serving = Vec::new();
+    for bound in stream_bounds {
+        stream_serving.push(elira::stream::spawn(
+            bound,
+            runtime.clone(),
+            cfg.limits.max_connections,
+            metrics.clone(),
+            stop_rx.clone(),
+        ));
+    }
 
     let mut serving = Vec::new();
     serving.push(tokio::spawn(server::serve(
@@ -364,6 +385,12 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
     for task in serving {
         if tokio::time::timeout_at(deadline, task).await.is_err() {
             tracing::warn!("server did not stop in time");
+            break;
+        }
+    }
+    for task in stream_serving {
+        if tokio::time::timeout_at(deadline, task).await.is_err() {
+            tracing::warn!("stream listener did not stop in time");
             break;
         }
     }

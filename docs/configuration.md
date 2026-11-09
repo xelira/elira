@@ -105,6 +105,7 @@ tls = true   # использует общий [tls] или [acme]
 | `listen_unix_owner` | строка | нет | владелец сокета `"uid:gid"` |
 | `h2c` | bool | `false` | HTTP/2 prior knowledge без TLS |
 | `listeners` | массив таблиц | `[]` | дополнительные TCP-листенеры |
+| `streams` | массив таблиц | `[]` | L4 TCP/UDP-прокси |
 | `user` | строка | нет | сбросить привилегии на пользователя после bind |
 | `worker_rlimit_nofile` | целое > 0 | нет | поднять `RLIMIT_NOFILE` |
 | `pid_file` | путь | нет | записать PID супервизора или single-process |
@@ -690,6 +691,24 @@ advisory-lock `.elira-cache.lock`, а `max_bytes` считается по все
   проверках reload сначала опрашивает серверы, а потом публикует новое
   состояние.
 - Один upstream можно использовать в нескольких маршрутах.
+
+## `[[streams]]`
+
+| Поле | Тип | По умолчанию | Что делает |
+| --- | --- | --- | --- |
+| `listen` | `IP:порт` | обязательно | адрес L4-листенера |
+| `transport` | `tcp` \| `udp` | `tcp` | транспорт |
+| `upstreams` | массив строк | обязательно, непусто | адреса `host:port` |
+| `balance` | `round_robin` \| `least_conn` \| `hash` | `round_robin` | выбор upstream; hash — по IP клиента |
+| `tls` | bool | `false` | терминировать TLS на TCP-листенере |
+| `connect_timeout_secs` | целое > 0 | `5` | таймаут подключения к upstream |
+| `idle_timeout_secs` | целое ≥ 0 | `300` | простой TCP-туннеля или UDP-сессии; `0` выключает |
+
+TCP-поток копирует байты в обе стороны, переподключаясь к следующему
+upstream при ошибке соединения. `tls = true` использует сертификаты, SNI и
+mTLS из `[tls]`/`[acme]`; ALPN для L4 не важен. UDP-сессии привязаны к адресу
+клиента, получают отдельный сокет к upstream и истекают по `idle_timeout_secs`.
+`transport = "udp"` с `tls = true` отклоняется.
 
 ## `[[routes]]`
 
