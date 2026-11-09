@@ -68,6 +68,7 @@ impl Runtime {
                     default,
                     named: &named,
                     client_ca: tls.client_ca.as_deref(),
+                    client_crl: tls.client_crl.as_deref(),
                     client_auth: mode,
                     tls13_only: tls.min_version == TlsVersion::Tls13,
                     ocsp: tls.ocsp.as_deref(),

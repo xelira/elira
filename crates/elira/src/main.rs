@@ -439,6 +439,7 @@ fn spawn_h3(
             key: http3.key,
             reuse_port,
             client_ca: http3.client_ca,
+            client_crl: http3.client_crl,
             client_auth,
             cipher_suites: http3.cipher_suites,
             curves: http3.curves,

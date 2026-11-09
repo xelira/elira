@@ -222,7 +222,7 @@ TLS:
 - SNI-selected certificates on TCP and QUIC, minimum TLS version, and
   explicit cipher-suite/curve policy per listener
 - mutual TLS on TCP and QUIC, optional or required, with per-route
-  subject/issuer CN checks
+  subject/issuer CN checks and client CRLs
 
 HTTP:
 

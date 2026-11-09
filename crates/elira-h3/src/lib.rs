@@ -29,6 +29,7 @@ pub struct Config {
     pub key: PathBuf,
     pub reuse_port: bool,
     pub client_ca: Option<PathBuf>,
+    pub client_crl: Option<PathBuf>,
     pub client_auth: elira_tls::ClientAuth,
     pub cipher_suites: Option<Vec<String>>,
     pub curves: Option<Vec<String>>,
@@ -55,6 +56,7 @@ pub async fn serve(
         if cfg.early_data { u32::MAX } else { 0 },
         cfg.cipher_suites.as_deref(),
         cfg.curves.as_deref(),
+        cfg.client_crl.as_deref(),
     )?;
     let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls)?;
     let mut transport = quinn::TransportConfig::default();

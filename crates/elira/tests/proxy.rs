@@ -2694,6 +2694,141 @@ root = "{root}"
     );
 }
 
+#[tokio::test]
+async fn client_crl_rejects_a_revoked_certificate() {
+    use rcgen::{
+        date_time_ymd, BasicConstraints, CertificateParams, CertificateRevocationListParams, IsCa,
+        KeyIdMethod, KeyPair, RevocationReason, RevokedCertParams, SerialNumber,
+    };
+
+    let ca_key = KeyPair::generate().expect("ca key");
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca = ca_params.self_signed(&ca_key).expect("ca");
+
+    let server_key = KeyPair::generate().expect("server key");
+    let server_params =
+        CertificateParams::new(vec!["localhost".to_owned()]).expect("server params");
+    let server = server_params
+        .signed_by(&server_key, &ca, &ca_key)
+        .expect("server cert");
+
+    let make_client = |serial: u64| {
+        let key = KeyPair::generate().expect("client key");
+        let mut params = CertificateParams::new(Vec::<String>::new()).expect("client params");
+        params.serial_number = Some(SerialNumber::from(serial));
+        let cert = params.signed_by(&key, &ca, &ca_key).expect("client cert");
+        (cert, key)
+    };
+    let (revoked, revoked_key) = make_client(42);
+    let (allowed, allowed_key) = make_client(43);
+
+    let crl = CertificateRevocationListParams {
+        this_update: date_time_ymd(2026, 1, 1),
+        next_update: date_time_ymd(2027, 1, 1),
+        crl_number: SerialNumber::from(1u64),
+        issuing_distribution_point: None,
+        revoked_certs: vec![RevokedCertParams {
+            serial_number: SerialNumber::from(42u64),
+            revocation_time: date_time_ymd(2026, 1, 1),
+            reason_code: Some(RevocationReason::KeyCompromise),
+            invalidity_date: None,
+        }],
+        key_identifier_method: KeyIdMethod::Sha256,
+    }
+    .signed_by(&ca, &ca_key)
+    .expect("crl");
+
+    let root = temp_root("client-crl");
+    std::fs::write(root.join("server.pem"), server.pem()).unwrap();
+    std::fs::write(root.join("server.key"), server_key.serialize_pem()).unwrap();
+    std::fs::write(root.join("ca.pem"), ca.pem()).unwrap();
+    std::fs::write(root.join("ca.crl.pem"), crl.pem().unwrap()).unwrap();
+    std::fs::write(root.join("index.html"), "allowed").unwrap();
+
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[tls]
+cert = "{cert}"
+key = "{key}"
+client_ca = "{ca}"
+client_crl = "{crl}"
+client_auth = "required"
+
+[[routes]]
+host = "*"
+root = "{root}"
+"#,
+        cert = root.join("server.pem").display(),
+        key = root.join("server.key").display(),
+        ca = root.join("ca.pem").display(),
+        crl = root.join("ca.crl.pem").display(),
+        root = root.display()
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let ca_der = ca.der().clone();
+
+    async fn handshake(
+        addr: SocketAddr,
+        cert: &rcgen::Certificate,
+        key: rcgen::KeyPair,
+        ca: rustls::pki_types::CertificateDer<'static>,
+        provider: Arc<rustls::crypto::CryptoProvider>,
+    ) -> bool {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca).expect("add ca");
+        let client = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("versions")
+            .with_root_certificates(roots)
+            .with_client_auth_cert(
+                vec![rustls::pki_types::CertificateDer::from(cert.der().to_vec())],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()),
+            )
+            .expect("client auth config");
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
+        let name = rustls::pki_types::ServerName::try_from("localhost").expect("server name");
+        let tcp = TcpStream::connect(addr).await.expect("connect");
+        match connector.connect(name, tcp).await {
+            Err(_) => false,
+            Ok(mut tls) => {
+                if tls
+                    .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                    .await
+                    .is_err()
+                {
+                    return false;
+                }
+                let mut buf = [0u8; 256];
+                matches!(
+                    tokio::time::timeout(Duration::from_secs(2), tls.read(&mut buf)).await,
+                    Ok(Ok(read)) if read > 0
+                )
+            }
+        }
+    }
+
+    assert!(
+        !handshake(
+            addr,
+            &revoked,
+            revoked_key,
+            ca_der.clone(),
+            provider.clone()
+        )
+        .await,
+        "a revoked certificate must be rejected"
+    );
+    assert!(
+        handshake(addr, &allowed, allowed_key, ca_der, provider).await,
+        "a non-revoked certificate must pass"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn proxies_to_a_unix_socket_upstream() {

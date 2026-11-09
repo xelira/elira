@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rustls::crypto::CryptoProvider;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKeyDer};
 use rustls::server::danger::ClientCertVerifier;
 use rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
 use rustls::sign::CertifiedKey;
@@ -33,6 +33,8 @@ pub struct ServerOptions<'a> {
     pub default: Option<(&'a Path, &'a Path)>,
     pub named: &'a [NamedCert],
     pub client_ca: Option<&'a Path>,
+    /// Pem bundle of CRLs used when a client certificate is presented.
+    pub client_crl: Option<&'a Path>,
     pub client_auth: ClientAuth,
     pub tls13_only: bool,
     /// DER OCSP response for the default certificate.
@@ -88,6 +90,16 @@ pub enum Error {
         #[source]
         source: io::Error,
     },
+
+    #[error("parse CRLs in {path}: {source}")]
+    Crls {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("no CRLs in {path}")]
+    NoCrls { path: PathBuf },
 
     #[error("no certificates in {path}")]
     NoCertificates { path: PathBuf },
@@ -148,6 +160,7 @@ pub fn server_config(cert: &Path, key: &Path) -> Result<ServerConfig, Error> {
         default: Some((cert, key)),
         named: &[],
         client_ca: None,
+        client_crl: None,
         client_auth: ClientAuth::Off,
         tls13_only: false,
         ocsp: None,
@@ -181,6 +194,7 @@ pub fn server_config_with_client_auth(
         default: Some((cert, key)),
         named: &[],
         client_ca,
+        client_crl: None,
         client_auth: mode,
         tls13_only: false,
         ocsp: None,
@@ -205,7 +219,7 @@ pub fn quic_server_config_with_client_auth(
     client_ca: Option<&Path>,
     mode: ClientAuth,
 ) -> Result<ServerConfig, Error> {
-    quic_server_config_full(cert, key, &[], client_ca, mode, 0, None, None)
+    quic_server_config_full(cert, key, &[], client_ca, mode, 0, None, None, None)
 }
 
 /// QUIC listener with SNI-selected certificates as well as client auth.
@@ -219,12 +233,14 @@ pub fn quic_server_config_full(
     early_data: u32,
     cipher_suites: Option<&[String]>,
     curves: Option<&[String]>,
+    client_crl: Option<&Path>,
 ) -> Result<ServerConfig, Error> {
     build(
         &ServerOptions {
             default: Some((cert, key)),
             named,
             client_ca,
+            client_crl,
             client_auth: mode,
             tls13_only: true,
             ocsp: None,
@@ -312,8 +328,12 @@ fn build(options: &ServerOptions<'_>, alpn: &[&[u8]]) -> Result<ServerConfig, Er
     {
         return Err(Error::QuicNeedsTls13Suite);
     }
-    let client_verifier =
-        client_verifier(options.client_ca, options.client_auth, provider.clone())?;
+    let client_verifier = client_verifier(
+        options.client_ca,
+        options.client_auth,
+        options.client_crl,
+        provider.clone(),
+    )?;
 
     let versions: &[&rustls::SupportedProtocolVersion] = if options.tls13_only {
         &[&rustls::version::TLS13]
@@ -444,6 +464,7 @@ impl ResolvesServerCert for NamedResolver {
 fn client_verifier(
     client_ca: Option<&Path>,
     mode: ClientAuth,
+    client_crl: Option<&Path>,
     provider: Arc<CryptoProvider>,
 ) -> Result<Option<Arc<dyn ClientCertVerifier>>, Error> {
     if mode == ClientAuth::Off {
@@ -456,6 +477,10 @@ fn client_verifier(
     // The two modes differ only in whether a client may omit its certificate.
     // `build` is the strict path, which is also what Required needs.
     let builder = WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider);
+    let builder = match client_crl {
+        Some(path) => builder.with_crls(load_crls(path)?),
+        None => builder,
+    };
     let built = match mode {
         ClientAuth::Optional => builder.allow_unauthenticated().build(),
         ClientAuth::Off | ClientAuth::Required => builder.build(),
@@ -466,6 +491,23 @@ fn client_verifier(
         source,
     })?;
     Ok(Some(verifier))
+}
+
+fn load_crls(path: &Path) -> Result<Vec<CertificateRevocationListDer<'static>>, Error> {
+    let pem = read(path)?;
+    let mut reader = pem.as_slice();
+    let crls = rustls_pemfile::crls(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| Error::Crls {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if crls.is_empty() {
+        return Err(Error::NoCrls {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(crls)
 }
 
 fn load_client_ca(path: &Path) -> Result<RootCertStore, Error> {
@@ -899,6 +941,7 @@ mod tests {
             default: Some((&fixtures.join("cert.pem"), &fixtures.join("key.pem"))),
             named: &[],
             client_ca: None,
+            client_crl: None,
             client_auth: ClientAuth::Off,
             tls13_only: true,
             ocsp: None,
@@ -928,6 +971,7 @@ mod tests {
             default: Some((&fixtures.join("cert.pem"), &fixtures.join("key.pem"))),
             named: &[],
             client_ca: None,
+            client_crl: None,
             client_auth: ClientAuth::Off,
             tls13_only: false,
             ocsp: None,
@@ -945,6 +989,7 @@ mod tests {
             default: Some((&fixtures.join("cert.pem"), &fixtures.join("key.pem"))),
             named: &[],
             client_ca: None,
+            client_crl: None,
             client_auth: ClientAuth::Off,
             tls13_only: false,
             ocsp: None,
@@ -970,6 +1015,7 @@ mod tests {
             ClientAuth::Off,
             0,
             Some(&suites),
+            None,
             None,
         )
         .expect_err("TLS 1.2 suite on QUIC");

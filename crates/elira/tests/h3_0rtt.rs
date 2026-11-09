@@ -46,6 +46,7 @@ root = "{}"
             key: fixtures.join("key.pem"),
             reuse_port: false,
             client_ca: None,
+            client_crl: None,
             client_auth: elira_tls::ClientAuth::Off,
             cipher_suites: None,
             curves: None,

@@ -380,6 +380,9 @@ pub struct Http3 {
     /// PEM roots for client certificates on the QUIC listener.
     #[serde(default)]
     pub client_ca: Option<PathBuf>,
+    /// PEM revocation lists for client certificates on QUIC.
+    #[serde(default)]
+    pub client_crl: Option<PathBuf>,
     #[serde(default)]
     pub client_auth: ClientAuthMode,
     /// Cipher suites to offer on QUIC, in preference order.
@@ -857,6 +860,10 @@ pub struct Tls {
     /// PEM bundle of roots a client certificate must chain to.
     #[serde(default)]
     pub client_ca: Option<PathBuf>,
+
+    /// PEM bundle of certificate revocation lists for client certificates.
+    #[serde(default)]
+    pub client_crl: Option<PathBuf>,
 
     /// Whether to ask clients for a certificate.
     #[serde(default)]
@@ -1449,6 +1456,14 @@ impl Config {
                     _ => return Err(Error::Http3ClientCaRequired),
                 }
             }
+            if let Some(crl) = &http3.client_crl {
+                if crl.as_os_str().is_empty() {
+                    return Err(Error::EmptyClientCrl);
+                }
+                if http3.client_auth == ClientAuthMode::Off {
+                    return Err(Error::ClientCrlWithoutAuth);
+                }
+            }
             let mut seen: Vec<String> = Vec::new();
             for (index, entry) in http3.certificates.iter().enumerate() {
                 if entry.cert.as_os_str().is_empty() || entry.key.as_os_str().is_empty() {
@@ -1523,6 +1538,14 @@ impl Config {
                 }
                 None if wants_clients => return Err(Error::TlsClientCaRequired),
                 _ => {}
+            }
+            if let Some(crl) = &tls.client_crl {
+                if crl.as_os_str().is_empty() {
+                    return Err(Error::EmptyClientCrl);
+                }
+                if !wants_clients {
+                    return Err(Error::ClientCrlWithoutAuth);
+                }
             }
 
             if tls
@@ -2162,6 +2185,12 @@ pub enum Error {
 
     #[error("tls.client_ca must not be empty")]
     TlsClientCaEmpty,
+
+    #[error("client_crl must not be empty")]
+    EmptyClientCrl,
+
+    #[error("client_crl needs client_auth = \"optional\" or \"required\"")]
+    ClientCrlWithoutAuth,
 
     #[error("tls.certificates[{index}] needs both cert and key")]
     TlsCertificatePair { index: usize },
@@ -3546,6 +3575,34 @@ upstream = "app"
             Config::parse(&with_round_robin),
             Err(Error::HashKeyWithoutHashBalance { .. })
         ));
+    }
+
+    #[test]
+    fn client_crl_needs_client_auth() {
+        let base = r#"
+listen = "127.0.0.1:8443"
+
+[tls]
+cert = "/tmp/cert.pem"
+key = "/tmp/key.pem"
+client_ca = "/tmp/ca.pem"
+client_crl = "/tmp/ca.crl.pem"
+client_auth = "required"
+
+[[routes]]
+host = "*"
+root = "/srv/www"
+"#;
+        assert!(Config::parse(base).is_ok());
+
+        let no_auth = base.replace("client_auth = \"required\"\n", "");
+        assert!(matches!(
+            Config::parse(&no_auth),
+            Err(Error::ClientCrlWithoutAuth)
+        ));
+
+        let empty = base.replace("client_crl = \"/tmp/ca.crl.pem\"", "client_crl = \"\"");
+        assert!(matches!(Config::parse(&empty), Err(Error::EmptyClientCrl)));
     }
 
     #[test]

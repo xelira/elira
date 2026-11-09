@@ -220,6 +220,7 @@ upstream. Нужен `error_root`; задавать их можно только
 | `cert` | путь | нет, обязательно | PEM-цепочка сертификатов |
 | `key` | путь | нет, обязательно | PEM-приватный ключ |
 | `client_ca` | путь | нет | PEM-корни для проверки клиентских сертификатов |
+| `client_crl` | путь | нет | PEM-списки отзыва клиентских сертификатов |
 | `client_auth` | `off` \| `optional` \| `required` | `off` | запрашивать ли клиентский сертификат |
 | `min_version` | `tls12` \| `tls13` | `tls12` | минимальная версия TLS |
 | `cipher_suites` | массив строк | по умолчанию rustls | cipher suites в порядке предпочтения |
@@ -264,6 +265,10 @@ upstream. Нужен `error_root`; задавать их можно только
 - `client_auth = "optional"` принимает клиентский сертификат, если он прислан
   и валиден, но пускает и без него. `required` без сертификата не пускает.
   Оба режима требуют `client_ca`; при `off` файл не читается вовсе.
+- `client_crl` добавляет проверку отзыва. Файл — PEM с одним или несколькими
+  CRL; пустой или битый файл отклоняется при сборке runtime. CRL применяется
+  только при `client_auth = "optional"` или `"required"`; при `off` комбинация
+  отклоняется. Обновлённый CRL подхватывается по `SIGHUP`.
 - mTLS, SNI-сертификаты и их `ocsp` действуют и на QUIC-слушателе: `client_ca`,
   `client_auth` и `certificates` задаются в `[http3]` независимо от `[tls]`.
 - Сертификат и ключ перечитываются по `SIGHUP`. Уже установленные соединения
@@ -346,6 +351,7 @@ dns_cleanup_hook = "/usr/local/lib/elira/cloudflare-dns.sh"
 | `cert` | путь | нет, обязательно непустое | PEM-сертификат для QUIC |
 | `key` | путь | нет, обязательно непустой | PEM-ключ для QUIC |
 | `client_ca` | путь | нет | PEM-корни клиентских сертификатов |
+| `client_crl` | путь | нет | PEM-списки отзыва клиентских сертификатов |
 | `client_auth` | `off` \| `optional` \| `required` | `off` | клиентские сертификаты на QUIC |
 | `cipher_suites` | массив строк | по умолчанию rustls | TLS 1.3 suites для QUIC |
 | `curves` | массив строк | по умолчанию rustls | key exchange groups для QUIC |
@@ -937,6 +943,8 @@ elira check --config elira.toml
 | `tls.cert is required...` / `tls.key is required...` | пустое поле в `[tls]` | укажите непустой путь |
 | `tls.client_ca is required...` | `client_auth` включён без CA | добавьте `client_ca` или верните `off` |
 | `http3.client_ca is required...` | `http3.client_auth` включён без CA | добавьте `http3.client_ca` |
+| `client_crl needs client_auth...` | CRL без mTLS | включите `client_auth` |
+| `no CRLs in ...` | пустой CRL-файл | положите хотя бы один CRL |
 | `acme HTTP-01 needs a listener on port 80 or acme.http01_listen` | HTTP-01 без порта 80 | задайте `http01_listen` |
 | `cache.dir must not be empty` | пустой путь кэша | уберите поле или задайте каталог |
 | `tls certificate name "..." is used twice` | одно имя в двух сертификатах | оставьте одно |
