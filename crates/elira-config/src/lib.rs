@@ -24,6 +24,10 @@ pub struct Config {
     #[serde(default)]
     pub unix_tls: bool,
 
+    /// Additional TCP listeners. The primary `listen` above stays bound.
+    #[serde(default)]
+    pub listeners: Vec<Listener>,
+
     /// Permission bits for the unix socket, for example `0o660`.
     #[serde(default)]
     pub listen_unix_mode: Option<u32>,
@@ -40,6 +44,18 @@ pub struct Config {
     /// the default; more needs `reuse_port = true`.
     #[serde(default = "Config::default_workers")]
     pub workers: usize,
+
+    /// Drop to this user after binding sockets. A name or `uid:gid`.
+    #[serde(default)]
+    pub user: Option<String>,
+
+    /// Raise RLIMIT_NOFILE for each process.
+    #[serde(default)]
+    pub worker_rlimit_nofile: Option<u64>,
+
+    /// Write the supervisor (or single-process) PID here.
+    #[serde(default)]
+    pub pid_file: Option<PathBuf>,
     #[serde(default)]
     pub limits: Limits,
     /// Send our `Server: elira` header and keep the upstream one.
@@ -85,6 +101,15 @@ pub struct Config {
     #[serde(default)]
     pub upstreams: Vec<Upstream>,
     pub routes: Vec<Route>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Listener {
+    pub listen: SocketAddr,
+    /// Terminate TLS on this listener with the shared `[tls]` settings.
+    #[serde(default)]
+    pub tls: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1332,6 +1357,18 @@ impl Config {
                 return Err(Error::EmptyUnixListen);
             }
         }
+        let mut addresses = HashSet::new();
+        addresses.insert(self.listen);
+        for listener in &self.listeners {
+            if !addresses.insert(listener.listen) {
+                return Err(Error::DuplicateListener {
+                    listen: listener.listen.to_string(),
+                });
+            }
+            if listener.tls && self.tls.is_none() && self.acme.is_none() {
+                return Err(Error::ListenerTlsWithoutConfig);
+            }
+        }
         if self.unix_tls && self.listen_unix.is_none() {
             return Err(Error::UnixTlsWithoutListener);
         }
@@ -1374,6 +1411,21 @@ impl Config {
         }
         if self.workers > 1 && !self.reuse_port {
             return Err(Error::WorkersNeedReusePort);
+        }
+        if let Some(user) = &self.user {
+            if user.trim().is_empty() || user.chars().any(|c| c.is_control() || c.is_whitespace()) {
+                return Err(Error::BadUser);
+            }
+        }
+        if self.worker_rlimit_nofile == Some(0) {
+            return Err(Error::BadRlimit);
+        }
+        if self
+            .pid_file
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            return Err(Error::EmptyPidFile);
         }
 
         if !self.log.sample.is_finite() || !(0.0..=1.0).contains(&self.log.sample) {
@@ -2152,6 +2204,12 @@ pub enum Error {
     #[error("listen_unix must not be empty")]
     EmptyUnixListen,
 
+    #[error("listener {listen} is configured twice")]
+    DuplicateListener { listen: String },
+
+    #[error("a TCP listener with tls = true needs [tls] or [acme]")]
+    ListenerTlsWithoutConfig,
+
     #[error("unix_tls needs listen_unix")]
     UnixTlsWithoutListener,
 
@@ -2187,6 +2245,15 @@ pub enum Error {
 
     #[error("workers > 1 requires reuse_port = true")]
     WorkersNeedReusePort,
+
+    #[error("user must not be empty or contain whitespace")]
+    BadUser,
+
+    #[error("worker_rlimit_nofile must be greater than zero")]
+    BadRlimit,
+
+    #[error("pid_file must not be empty")]
+    EmptyPidFile,
 
     #[error("health.path must start with '/' and contain no spaces or control characters")]
     BadHealthPath,
@@ -3695,6 +3762,80 @@ root = "/srv/www"
 
         let empty = base.replace("client_crl = \"/tmp/ca.crl.pem\"", "client_crl = \"\"");
         assert!(matches!(Config::parse(&empty), Err(Error::EmptyClientCrl)));
+    }
+
+    #[test]
+    fn process_settings_are_validated() {
+        let base = r#"
+listen = "127.0.0.1:8080"
+user = "nobody"
+worker_rlimit_nofile = 65536
+pid_file = "/run/elira.pid"
+
+[[routes]]
+host = "*"
+root = "/srv/www"
+"#;
+        let cfg = Config::parse(base).expect("valid");
+        assert_eq!(cfg.user.as_deref(), Some("nobody"));
+        assert_eq!(cfg.worker_rlimit_nofile, Some(65536));
+
+        let empty_user = base.replace("user = \"nobody\"", "user = \" \"");
+        assert!(matches!(Config::parse(&empty_user), Err(Error::BadUser)));
+
+        let zero_rlimit = base.replace("worker_rlimit_nofile = 65536", "worker_rlimit_nofile = 0");
+        assert!(matches!(Config::parse(&zero_rlimit), Err(Error::BadRlimit)));
+
+        let empty_pid = base.replace("pid_file = \"/run/elira.pid\"", "pid_file = \"\"");
+        assert!(matches!(
+            Config::parse(&empty_pid),
+            Err(Error::EmptyPidFile)
+        ));
+    }
+
+    #[test]
+    fn additional_listeners_are_validated() {
+        let base = r#"
+listen = "127.0.0.1:8080"
+
+[[listeners]]
+listen = "127.0.0.1:8081"
+
+[tls]
+cert = "/tmp/cert.pem"
+key = "/tmp/key.pem"
+
+[[routes]]
+host = "*"
+root = "/srv/www"
+"#;
+        let cfg = Config::parse(base).expect("valid");
+        assert_eq!(cfg.listeners.len(), 1);
+
+        let tls_listener = base.replace(
+            "listen = \"127.0.0.1:8081\"",
+            "listen = \"127.0.0.1:8081\"\ntls = true",
+        );
+        assert!(Config::parse(&tls_listener).is_ok());
+
+        let duplicate = base.replace("listen = \"127.0.0.1:8081\"", "listen = \"127.0.0.1:8080\"");
+        assert!(matches!(
+            Config::parse(&duplicate),
+            Err(Error::DuplicateListener { .. })
+        ));
+
+        let no_tls = base.replace(
+            "[tls]\ncert = \"/tmp/cert.pem\"\nkey = \"/tmp/key.pem\"\n",
+            "",
+        );
+        let no_tls = no_tls.replace(
+            "listen = \"127.0.0.1:8081\"",
+            "listen = \"127.0.0.1:8081\"\ntls = true",
+        );
+        assert!(matches!(
+            Config::parse(&no_tls),
+            Err(Error::ListenerTlsWithoutConfig)
+        ));
     }
 
     #[test]

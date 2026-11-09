@@ -151,6 +151,8 @@
 - Права и владелец unix-сокета (`listen_unix_mode`, `listen_unix_owner`).
 - Буферизация chunked-тел запроса с replay префикса при переполнении.
 - Replay префикса для тел с `Content-Length` выше spool-лимита.
+- Дополнительные TCP-листенеры с отдельным TLS.
+- `user`, `worker_rlimit_nofile` и `pid_file`.
 - `Cache-Control: must-revalidate` запрещает stale-выдачу; `Expires`/`Date`
   задают TTL, если `max-age` нет. Запросы с `no-cache`/`no-store` обходят кэш.
 - Заголовки `Forwarded` и `X-Forwarded-Port` к upstream.

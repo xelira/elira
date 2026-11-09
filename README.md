@@ -192,8 +192,7 @@ the code is in [docs/architecture.md](docs/architecture.md).
 Routing:
 
 - exact hosts, `*.example.com`, `host = "*"`, longest path prefix and
-  `path_regex` after prefixes
-- `strip_prefix`, redirect routes, `try_files`, SPA fallback, directory listings
+  `path_regex` after prefixes- `strip_prefix`, redirect routes, `try_files`, SPA fallback, directory listings
 - per-route `add_headers`/`remove_headers` for responses and
   `request_headers`/`request_remove_headers` for upstream requests, plus
   `timeout_secs`, token bucket, concurrency limit, body cap and error pages
@@ -259,6 +258,8 @@ Cache:
 
 Ops:
 
+- multiple TCP listeners with per-listener TLS, optional privilege drop,
+  `worker_rlimit_nofile` and a PID file
 - Prometheus metrics plus JSON `/status` and `/config` on the admin listener
 - `POST /reload`, `POST /drain`, `POST /cache/purge`, optional Basic auth
 - text or JSON access log with request id, file rotation, nginx-like templates

@@ -181,6 +181,8 @@ pub struct Options {
     pub sendfile: bool,
     pub h2c: bool,
     pub unix_tls: bool,
+    /// This TCP listener terminates TLS.
+    pub tls: bool,
     pub body_timeout: Option<Duration>,
     pub drain_timeout: Duration,
     pub shutdown_timeout: Duration,
@@ -198,6 +200,7 @@ impl Options {
             sendfile: cfg.sendfile,
             h2c: cfg.h2c,
             unix_tls: cfg.unix_tls,
+            tls: cfg.tls.is_some() || cfg.acme.is_some(),
             body_timeout: match cfg.limits.request_body_timeout_secs {
                 0 => None,
                 secs => Some(Duration::from_secs(secs)),
@@ -535,7 +538,7 @@ async fn serve_stream(
         secure: false,
     };
 
-    if let Some(acme) = &options.acme {
+    if let Some(acme) = options.acme.as_ref().filter(|_| options.tls) {
         // HTTP-01 is validated over plain HTTP; there is no TLS to terminate.
         if acme.uses_http01() {
             let conn = ConnOptions {
@@ -586,7 +589,11 @@ async fn serve_stream(
         return;
     }
 
-    let tls = runtime.load().tls.clone();
+    let tls = if options.tls {
+        runtime.load().tls.clone()
+    } else {
+        None
+    };
     let secure = tls.is_some();
 
     // HTTP/2 with prior knowledge arrives before any TLS or HTTP/1.1 parsing.

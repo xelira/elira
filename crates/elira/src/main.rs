@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Context;
+use anyhow::{bail, Context};
 use arc_swap::ArcSwap;
 use clap::{Parser, Subcommand};
 use elira::config::Config;
@@ -136,6 +136,14 @@ fn init_tracing() {
 
 async fn run(path: PathBuf) -> anyhow::Result<()> {
     let cfg = Config::load(&path)?;
+    let _pid_guard = if std::env::var_os("ELIRA_WORKER").is_none() {
+        match &cfg.pid_file {
+            Some(path) => Some(write_pid_file(path)?),
+            None => None,
+        }
+    } else {
+        None
+    };
     if std::env::var_os("ELIRA_WORKER").is_none() {
         if let Some(hook) = cfg.tls.as_ref().and_then(|tls| tls.ocsp_hook.as_ref()) {
             run_ocsp_hook(hook).await;
@@ -268,13 +276,30 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
         None => None,
     };
 
-    let serving = tokio::spawn(server::serve(
+    apply_privileges(&cfg)?;
+
+    let mut serving = Vec::new();
+    serving.push(tokio::spawn(server::serve(
         listener,
         runtime.clone(),
         options.clone(),
         metrics.clone(),
         stop_rx.clone(),
-    ));
+    )));
+    for entry in &cfg.listeners {
+        let listener = server::bind_tcp(entry.listen, cfg.reuse_port)
+            .with_context(|| format!("cannot bind {}", entry.listen))?;
+        let mut listener_options = options.clone();
+        listener_options.tls = entry.tls;
+        tracing::info!(listen = %entry.listen, tls = entry.tls, "additional listener");
+        serving.push(tokio::spawn(server::serve(
+            listener,
+            runtime.clone(),
+            listener_options,
+            metrics.clone(),
+            stop_rx.clone(),
+        )));
+    }
 
     // Both the readiness file (seen by the old process during SIGUSR2) and
     // the systemd notification mean the same thing: all listeners are bound.
@@ -334,14 +359,13 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
     tracing::info!("shutting down");
     let _ = stop_tx.send(true);
 
-    if tokio::time::timeout(
-        Duration::from_secs(cfg.limits.shutdown_timeout_secs),
-        serving,
-    )
-    .await
-    .is_err()
-    {
-        tracing::warn!("server did not stop in time");
+    let deadline =
+        tokio::time::Instant::now() + Duration::from_secs(cfg.limits.shutdown_timeout_secs);
+    for task in serving {
+        if tokio::time::timeout_at(deadline, task).await.is_err() {
+            tracing::warn!("server did not stop in time");
+            break;
+        }
     }
     if let Some(task) = unix_serving {
         if tokio::time::timeout(Duration::from_secs(cfg.limits.shutdown_timeout_secs), task)
@@ -383,6 +407,103 @@ fn reload_counter() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|delta| delta.as_nanos() as u64)
         .unwrap_or(0)
+}
+
+struct PidFile(PathBuf);
+
+impl Drop for PidFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn write_pid_file(path: &Path) -> anyhow::Result<PidFile> {
+    std::fs::write(path, format!("{}\n", std::process::id()))
+        .with_context(|| format!("cannot write pid file {}", path.display()))?;
+    Ok(PidFile(path.to_path_buf()))
+}
+
+fn resolve_user(value: &str) -> anyhow::Result<(u32, u32)> {
+    if let Some((uid, gid)) = value.split_once(':') {
+        let uid: u32 = uid
+            .parse()
+            .map_err(|_| anyhow::anyhow!("bad uid in {value:?}"))?;
+        let gid: u32 = gid
+            .parse()
+            .map_err(|_| anyhow::anyhow!("bad gid in {value:?}"))?;
+        return Ok((uid, gid));
+    }
+
+    let name = std::ffi::CString::new(value)
+        .map_err(|_| anyhow::anyhow!("user name contains a NUL byte"))?;
+    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buffer = vec![0 as libc::c_char; 4096];
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: all pointers are valid for the call and the result is copied
+    // before the buffer goes out of scope.
+    let status = unsafe {
+        libc::getpwnam_r(
+            name.as_ptr(),
+            &mut entry,
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            &mut result,
+        )
+    };
+    if status != 0 || result.is_null() {
+        bail!("unknown user {value:?}");
+    }
+    Ok((entry.pw_uid, entry.pw_gid))
+}
+
+fn apply_rlimit(limit: Option<u64>) -> anyhow::Result<()> {
+    let Some(limit) = limit else {
+        return Ok(());
+    };
+    let limits = libc::rlimit {
+        rlim_cur: limit,
+        rlim_max: limit,
+    };
+    // SAFETY: setrlimit only reads the struct passed to it.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limits) } != 0 {
+        bail!(
+            "cannot raise RLIMIT_NOFILE to {limit}: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(())
+}
+
+fn apply_privileges(cfg: &Config) -> anyhow::Result<()> {
+    apply_rlimit(cfg.worker_rlimit_nofile)?;
+
+    let Some(user) = &cfg.user else {
+        return Ok(());
+    };
+    let (uid, gid) = resolve_user(user)?;
+    // SAFETY: these calls have no pointer arguments and are standard
+    // process-wide privilege changes.
+    let root = unsafe { libc::geteuid() } == 0;
+    if !root {
+        if unsafe { libc::getuid() } == uid && unsafe { libc::getgid() } == gid {
+            return Ok(());
+        }
+        bail!("only root can switch to user {user:?}");
+    }
+
+    // SAFETY: a null supplementary-group list with length zero is valid and
+    // drops all inherited groups before the uid change.
+    if unsafe { libc::setgroups(0, std::ptr::null()) } != 0 {
+        bail!("setgroups: {}", std::io::Error::last_os_error());
+    }
+    if unsafe { libc::setgid(gid) } != 0 {
+        bail!("setgid({gid}): {}", std::io::Error::last_os_error());
+    }
+    if unsafe { libc::setuid(uid) } != 0 {
+        bail!("setuid({uid}): {}", std::io::Error::last_os_error());
+    }
+    tracing::info!(user, uid, gid, "dropped privileges");
+    Ok(())
 }
 
 async fn run_ocsp_hook(hook: &Path) {
@@ -575,6 +696,11 @@ async fn supervise(config: PathBuf, workers: usize) -> anyhow::Result<()> {
     use tokio::sync::mpsc;
 
     let cfg = Config::load(&config)?;
+    let _pid_guard = match &cfg.pid_file {
+        Some(path) => Some(write_pid_file(path)?),
+        None => None,
+    };
+    apply_rlimit(cfg.worker_rlimit_nofile)?;
     if let Some(hook) = cfg.tls.as_ref().and_then(|tls| tls.ocsp_hook.as_ref()) {
         run_ocsp_hook(hook).await;
     }
