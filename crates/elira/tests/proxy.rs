@@ -731,6 +731,58 @@ async fn trusted_proxies_extend_the_forwarded_chain() {
 }
 
 #[tokio::test]
+async fn route_request_headers_are_set_and_removed() {
+    let upstream = upstream().await;
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "example.com"
+upstream = "app"
+request_headers = ["X-Service-Token: secret"]
+request_remove_headers = ["X-Client-Secret"]
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let response = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nX-Client-Secret: leak\r\n\
+         X-Service-Token: client-value\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+
+    assert!(
+        response
+            .to_ascii_lowercase()
+            .contains("x-service-token: secret"),
+        "{response}"
+    );
+    assert!(
+        !response
+            .to_ascii_lowercase()
+            .contains("x-service-token: client-value"),
+        "{response}"
+    );
+    assert!(
+        !response.to_ascii_lowercase().contains("x-client-secret"),
+        "{response}"
+    );
+    // The canonical Host and forwarding headers still win unless the
+    // operator overrides them explicitly.
+    assert!(response.contains("host: example.com"), "{response}");
+    assert!(
+        response.contains("x-forwarded-for: 127.0.0.1"),
+        "{response}"
+    );
+}
+
+#[tokio::test]
 async fn retries_a_dead_upstream_for_get() {
     let upstream = upstream().await;
     let config = format!(

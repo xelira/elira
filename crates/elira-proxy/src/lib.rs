@@ -234,6 +234,8 @@ struct RouteEntry {
     strip_prefix: bool,
     add_headers: Vec<(HeaderName, HeaderValue)>,
     remove_headers: Vec<HeaderName>,
+    request_headers: Vec<(HeaderName, HeaderValue)>,
+    request_remove_headers: Vec<HeaderName>,
     auth: Option<Arc<BasicAuth>>,
     acl: Option<Arc<IpAcl>>,
     timeout: Option<Duration>,
@@ -759,6 +761,16 @@ impl Proxy {
                     .collect(),
                 remove_headers: route
                     .remove_headers
+                    .iter()
+                    .filter_map(|name| HeaderName::from_bytes(name.as_bytes()).ok())
+                    .collect(),
+                request_headers: route
+                    .request_headers
+                    .iter()
+                    .filter_map(|line| parse_header_line(line))
+                    .collect(),
+                request_remove_headers: route
+                    .request_remove_headers
                     .iter()
                     .filter_map(|name| HeaderName::from_bytes(name.as_bytes()).ok())
                     .collect(),
@@ -1480,6 +1492,13 @@ impl Proxy {
         if let Some(upgrade) = &requested_upgrade {
             template.insert(CONNECTION, HeaderValue::from_static("upgrade"));
             template.insert(UPGRADE, upgrade.clone());
+        }
+
+        for name in &entry.request_remove_headers {
+            template.remove(name);
+        }
+        for (name, value) in &entry.request_headers {
+            template.insert(name, value.clone());
         }
 
         let route_timeout = entry.timeout.unwrap_or(self.inner.timeout);

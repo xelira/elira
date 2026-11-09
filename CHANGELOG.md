@@ -128,6 +128,7 @@
   после `END_REQUEST`.
 - DNS-01 проверен на production CA Let's Encrypt через Cloudflare-зону
   (`elira-dns-prod.owaw.online`).
+- `request_headers`/`request_remove_headers` на маршруте.
 - `Cache-Control: must-revalidate` запрещает stale-выдачу; `Expires`/`Date`
   задают TTL, если `max-age` нет. Запросы с `no-cache`/`no-store` обходят кэш.
 - Заголовки `Forwarded` и `X-Forwarded-Port` к upstream.

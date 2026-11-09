@@ -608,6 +608,8 @@ advisory-lock `.elira-cache.lock`, а `max_bytes` считается по все
 | `strip_prefix` | bool | `false` | срезать `path` перед отправкой в upstream |
 | `add_headers` | массив строк | `[]` | заголовки ответа в виде `Name: value` |
 | `remove_headers` | массив строк | `[]` | заголовки ответа, которые надо убрать |
+| `request_headers` | массив строк | `[]` | заголовки запроса к upstream в виде `Name: value` |
+| `request_remove_headers` | массив строк | `[]` | заголовки запроса, которые надо убрать |
 | `try_files` | массив строк | `[]` | кандидаты, если путь не найден; `$uri` подставляется |
 | `autoindex` | bool | `false` | генерировать листинг каталога |
 | `auth_file` | путь | нет | htpasswd с bcrypt-хешами |
@@ -681,6 +683,13 @@ advisory-lock `.elira-cache.lock`, а `max_bytes` считается по все
 - `add_headers` и `remove_headers` применяются к ответу после проксирования
   или статики. Формат `add_headers` — `"Name: value"`; строка без двоеточия
   или с невалидным именем отклоняется.
+- `request_headers` заменяет одноимённые заголовки клиента перед отправкой в
+  upstream, `request_remove_headers` удаляет их. Значения задаются литералами.
+  `Host`, `X-Forwarded-*` и `X-Request-Id` формируются автоматически, но
+  `request_headers` может переопределить их явно. Hop-by-hop и framing
+  заголовки (`Connection`, `Transfer-Encoding`, `Content-Length`, `Upgrade`,
+  `TE`, `Trailer`, `Keep-Alive`, `Proxy-Connection`) менять нельзя — конфиг
+  отклоняется.
 - `index` — имена файлов, а не пути: элемент не может быть пустым, содержать
   `/` или `..`. Для каталога файлы перебираются по порядку. Запрос каталога
   без завершающего `/` получает `301`.
@@ -885,6 +894,7 @@ elira check --config elira.toml
 | `unknown cipher suite "..."` | опечатка в имени suite | сверьтесь с именами rustls |
 | `unknown key exchange group "..."` | опечатка в имени curve | `X25519`, `secp256r1`, ... |
 | `QUIC requires TLS 1.3 cipher suites` | TLS 1.2 suite в `[http3]` | оставьте только `TLS13_*` |
+| `request headers cannot override hop-by-hop...` | `Connection`/`Transfer-Encoding` в request-заголовках | уберите framing-заголовки |
 | `route N: timeout_secs must be greater than zero` | нулевой таймаут | уберите поле или поставьте больше нуля |
 | `http3.cert must not be empty` | `[http3]` без сертификата | задайте `cert` и `key` |
 | `health.path must start with '/'...` | путь без `/` | `/health` |

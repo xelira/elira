@@ -678,6 +678,14 @@ pub struct Route {
     /// Response headers to drop.
     #[serde(default)]
     pub remove_headers: Vec<String>,
+
+    /// Request headers to set or replace before forwarding, as `Name: value`.
+    #[serde(default)]
+    pub request_headers: Vec<String>,
+
+    /// Request headers to drop before forwarding.
+    #[serde(default)]
+    pub request_remove_headers: Vec<String>,
 }
 
 impl Route {
@@ -1796,6 +1804,25 @@ impl Config {
                     header: name.clone(),
                 })?;
             }
+            for header in &route.request_headers {
+                let (name, _) = parse_header_line(header).ok_or_else(|| Error::BadHeader {
+                    index,
+                    header: header.clone(),
+                })?;
+                if reserved_request_header(&name) {
+                    return Err(Error::ReservedRequestHeader { index });
+                }
+            }
+            for name in &route.request_remove_headers {
+                let name =
+                    HeaderName::from_bytes(name.as_bytes()).map_err(|_| Error::BadHeader {
+                        index,
+                        header: name.clone(),
+                    })?;
+                if reserved_request_header(&name) {
+                    return Err(Error::ReservedRequestHeader { index });
+                }
+            }
 
             if host != "*" {
                 if let Some(suffix) = host.strip_prefix('*') {
@@ -1817,6 +1844,20 @@ fn parse_header_line(line: &str) -> Option<(HeaderName, HeaderValue)> {
     let name = HeaderName::from_bytes(name.trim().as_bytes()).ok()?;
     let value = HeaderValue::from_str(value.trim()).ok()?;
     Some((name, value))
+}
+
+fn reserved_request_header(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "connection"
+            | "content-length"
+            | "keep-alive"
+            | "proxy-connection"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
 }
 
 fn check_server(addr: &str) -> Result<(), ()> {
@@ -2168,6 +2209,9 @@ pub enum Error {
 
     #[error("route {index}: \"{header}\" is not a `Name: value` header")]
     BadHeader { index: usize, header: String },
+
+    #[error("route {index}: request headers cannot override hop-by-hop or framing headers")]
+    ReservedRequestHeader { index: usize },
 
     #[error("route {index}: host wildcard must look like `*.example.com`")]
     BadWildcardHost { index: usize },
@@ -3048,6 +3092,40 @@ root = "/srv/www"
         assert!(matches!(
             Config::parse(&bad),
             Err(Error::BadGlobalErrorPage { .. })
+        ));
+    }
+
+    #[test]
+    fn request_headers_are_validated() {
+        let text = r#"
+listen = "127.0.0.1:8080"
+
+[[upstreams]]
+name = "app"
+servers = ["127.0.0.1:9000"]
+
+[[routes]]
+host = "*"
+upstream = "app"
+request_headers = ["X-Service-Token: secret"]
+request_remove_headers = ["X-Client-Secret"]
+"#;
+        let cfg = Config::parse(text).expect("valid");
+        assert_eq!(cfg.routes[0].request_headers.len(), 1);
+
+        let bad = text.replace("X-Service-Token: secret", "nope");
+        assert!(matches!(Config::parse(&bad), Err(Error::BadHeader { .. })));
+
+        let reserved = text.replace("X-Service-Token: secret", "Transfer-Encoding: chunked");
+        assert!(matches!(
+            Config::parse(&reserved),
+            Err(Error::ReservedRequestHeader { .. })
+        ));
+
+        let reserved_remove = text.replace("X-Client-Secret", "Connection");
+        assert!(matches!(
+            Config::parse(&reserved_remove),
+            Err(Error::ReservedRequestHeader { .. })
         ));
     }
 
