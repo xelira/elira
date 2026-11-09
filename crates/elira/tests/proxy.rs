@@ -1751,6 +1751,112 @@ error_pages = ["404 /404.html"]
 }
 
 #[tokio::test]
+async fn global_error_page_replaces_the_default_404() {
+    let root = temp_root("global-error");
+    let pages = temp_root("global-pages");
+    std::fs::write(pages.join("404.html"), "global not found").unwrap();
+
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+error_root = "{pages}"
+error_pages = ["404 /404.html"]
+
+[[routes]]
+host = "known.local"
+root = "{root}"
+"#,
+        pages = pages.display(),
+        root = root.display()
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let response = roundtrip(
+        addr,
+        "GET /missing HTTP/1.1\r\nHost: other.local\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&response), "HTTP/1.1 404 Not Found");
+    assert!(response.ends_with("global not found"), "{response}");
+}
+
+#[tokio::test]
+async fn route_error_page_covers_auth_and_rate_limit() {
+    let upstream = upstream().await;
+    let root = temp_root("local-errors");
+    let htpasswd = root.join("htpasswd");
+    let hash = bcrypt::hash("secret", 4).expect("bcrypt");
+    std::fs::write(&htpasswd, format!("user:{hash}\n")).unwrap();
+    std::fs::write(root.join("401.html"), "login required").unwrap();
+    std::fs::write(root.join("429.html"), "slow down").unwrap();
+
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "auth.local"
+upstream = "app"
+auth_file = "{htpasswd}"
+error_root = "{root}"
+error_pages = ["401 /401.html", "429 /429.html"]
+
+[[routes]]
+host = "limited.local"
+upstream = "app"
+requests_per_second = 1
+burst = 1
+error_root = "{root}"
+error_pages = ["401 /401.html", "429 /429.html"]
+"#,
+        htpasswd = htpasswd.display(),
+        root = root.display()
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let unauth = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: auth.local\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&unauth), "HTTP/1.1 401 Unauthorized");
+    assert!(unauth.ends_with("login required"), "{unauth}");
+    assert!(
+        unauth
+            .to_ascii_lowercase()
+            .contains("www-authenticate: basic"),
+        "{unauth}"
+    );
+
+    let first = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: limited.local\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&first), "HTTP/1.1 200 OK", "{first}");
+
+    let limited = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: limited.local\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(
+        status(&limited),
+        "HTTP/1.1 429 Too Many Requests",
+        "{limited}"
+    );
+    assert!(limited.ends_with("slow down"), "{limited}");
+    assert!(
+        limited.to_ascii_lowercase().contains("retry-after: 1"),
+        "{limited}"
+    );
+}
+
+#[tokio::test]
 async fn route_rate_limit_and_body_cap_apply() {
     let upstream = upstream().await;
     let config = format!(

@@ -26,6 +26,7 @@ Living list for the self-improvement loop. One item per session.
   sandboxing is off.
 - [x] Per-route `max_response_bytes`.
 - [x] Per-route/global cap on proxied upstream responses.
+- [x] Error pages for local errors and a global fallback.
 - [x] Per-route FastCGI pool size.
 - [x] Purge tests through the admin listener in both single and worker mode.
 - [x] Per-route cache enable/TTL overrides.

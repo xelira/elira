@@ -60,6 +60,12 @@ pub struct Config {
     pub connect: Connect,
     #[serde(default)]
     pub compression: Compression,
+    /// Global error pages as `STATUS /path`, served from `error_root`.
+    #[serde(default)]
+    pub error_pages: Vec<String>,
+    /// Directory for global `error_pages`.
+    #[serde(default)]
+    pub error_root: Option<PathBuf>,
     #[serde(default)]
     pub http3: Option<Http3>,
     #[serde(default)]
@@ -1132,6 +1138,28 @@ impl Config {
             return Err(Error::WorkersNeedReusePort);
         }
 
+        if self.error_pages.is_empty() {
+            if self.error_root.is_some() {
+                return Err(Error::GlobalErrorRootWithoutPages);
+            }
+        } else {
+            if self.error_root.is_none() {
+                return Err(Error::GlobalErrorPagesNeedRoot);
+            }
+            for page in &self.error_pages {
+                let mut parts = page.splitn(2, char::is_whitespace);
+                let status = parts.next().unwrap_or_default();
+                let path = parts.next().unwrap_or_default().trim();
+                if status.parse::<u16>().is_err()
+                    || !(100..=599).contains(&status.parse::<u16>().unwrap_or(0))
+                    || !path.starts_with('/')
+                    || path.contains("..")
+                {
+                    return Err(Error::BadGlobalErrorPage { page: page.clone() });
+                }
+            }
+        }
+
         if self.health.enabled {
             if !self.health.path.starts_with('/')
                 || self.health.path.chars().any(|c| c.is_control() || c == ' ')
@@ -1878,6 +1906,15 @@ pub enum Error {
 
     #[error("route {index}: requests_per_second must be greater than zero")]
     BadRouteRate { index: usize },
+
+    #[error("error_root needs at least one error_pages entry")]
+    GlobalErrorRootWithoutPages,
+
+    #[error("global error_pages need error_root")]
+    GlobalErrorPagesNeedRoot,
+
+    #[error("{page:?} is not \"STATUS /path\"")]
+    BadGlobalErrorPage { page: String },
 
     #[error("route {index}: error_root needs at least one error_pages entry")]
     ErrorRootWithoutPages { index: usize },
@@ -2669,6 +2706,40 @@ error_pages = ["404 nope"]
         assert!(matches!(
             Config::parse(text),
             Err(Error::BadErrorPage { .. })
+        ));
+    }
+
+    #[test]
+    fn global_error_pages_are_validated() {
+        let valid = r#"
+listen = "127.0.0.1:8080"
+error_root = "/srv/errors"
+error_pages = ["404 /404.html", "429 /429.html"]
+
+[[routes]]
+host = "*"
+root = "/srv/www"
+"#;
+        let cfg = Config::parse(valid).expect("valid");
+        assert_eq!(cfg.error_pages.len(), 2);
+        assert_eq!(cfg.error_root.as_deref(), Some(Path::new("/srv/errors")));
+
+        let no_root = valid.replace("error_root = \"/srv/errors\"\n", "");
+        assert!(matches!(
+            Config::parse(&no_root),
+            Err(Error::GlobalErrorPagesNeedRoot)
+        ));
+
+        let no_pages = valid.replace("error_pages = [\"404 /404.html\", \"429 /429.html\"]\n", "");
+        assert!(matches!(
+            Config::parse(&no_pages),
+            Err(Error::GlobalErrorRootWithoutPages)
+        ));
+
+        let bad = valid.replace("\"404 /404.html\"", "\"404 nope\"");
+        assert!(matches!(
+            Config::parse(&bad),
+            Err(Error::BadGlobalErrorPage { .. })
         ));
     }
 

@@ -70,6 +70,10 @@ pub struct Labels {
     pub upstream: Option<String>,
     pub access_log: bool,
 }
+
+/// Marks a response whose body already came from an error page.
+#[derive(Clone, Copy)]
+struct ErrorPageApplied;
 pub type Body = BoxBody<Bytes, BoxError>;
 
 #[derive(Clone)]
@@ -96,6 +100,7 @@ struct Inner {
     buffer_bytes: usize,
     max_app_response: usize,
     max_upstream_response: usize,
+    error_pages: Vec<(StatusCode, String, Arc<Files>)>,
     fastcgi_pool: elira_fastcgi::Pool,
     refreshing: Arc<Mutex<HashSet<String>>>,
 }
@@ -619,28 +624,8 @@ impl Proxy {
 
             let error_root = route.error_root.clone().or_else(|| route.root.clone());
             let error_pages = match error_root {
-                Some(root) if !route.error_pages.is_empty() => {
-                    let files = Arc::new(Files::new(
-                        root,
-                        route.index.clone(),
-                        false,
-                        Vec::new(),
-                        false,
-                        false,
-                        0,
-                    ));
-                    let mut pages = Vec::new();
-                    for page in &route.error_pages {
-                        let mut parts = page.splitn(2, char::is_whitespace);
-                        let status = parts.next().and_then(|s| s.parse::<u16>().ok());
-                        let path = parts.next().unwrap_or_default().trim();
-                        if let Some(status) = status.and_then(|s| StatusCode::from_u16(s).ok()) {
-                            pages.push((status, path.to_owned(), files.clone()));
-                        }
-                    }
-                    pages
-                }
-                _ => Vec::new(),
+                Some(root) => error_page_set(root, route.index.clone(), &route.error_pages),
+                None => Vec::new(),
             };
 
             let app_permits = match &target {
@@ -812,6 +797,14 @@ impl Proxy {
                 buffer_bytes: cfg.limits.response_buffer_bytes,
                 max_app_response: cfg.limits.max_response_bytes,
                 max_upstream_response: cfg.limits.max_upstream_response_bytes,
+                error_pages: match &cfg.error_root {
+                    Some(root) => error_page_set(
+                        root.clone(),
+                        vec!["index.html".to_owned()],
+                        &cfg.error_pages,
+                    ),
+                    None => Vec::new(),
+                },
                 fastcgi_pool: elira_fastcgi::Pool::new(
                     cfg.limits.fastcgi_pool_idle,
                     Duration::from_secs(cfg.limits.fastcgi_pool_idle_secs),
@@ -979,13 +972,18 @@ impl Proxy {
                 response
                     .headers_mut()
                     .insert(http::header::RETRY_AFTER, HeaderValue::from_static("1"));
+                self.apply_global_error_page(&mut response, peer).await;
                 return response;
             }
         }
 
-        self.forward(req, peer, scheme)
-            .await
-            .unwrap_or_else(|err| err)
+        match self.forward(req, peer, scheme).await {
+            Ok(response) => response,
+            Err(mut response) => {
+                self.apply_global_error_page(&mut response, peer).await;
+                response
+            }
+        }
     }
 
     /// Only a trusted peer may extend the chain; everyone else starts a new
@@ -1174,10 +1172,10 @@ impl Proxy {
                     .and_then(|value| value.parse::<u64>().ok())
                 {
                     if length > limit as u64 {
-                        return Err(text(
-                            StatusCode::PAYLOAD_TOO_LARGE,
-                            "request body too large",
-                        ));
+                        let mut response =
+                            text(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
+                        self.apply_error_page(&mut response, entry, peer).await;
+                        return Err(response);
                     }
                 }
             }
@@ -1189,13 +1187,16 @@ impl Proxy {
                 response
                     .headers_mut()
                     .insert(http::header::RETRY_AFTER, HeaderValue::from_static("1"));
+                self.apply_error_page(&mut response, entry, peer).await;
                 return Err(response);
             }
         }
 
         if let Some(acl) = &entry.acl {
             if !acl.allows(peer.ip()) {
-                return Err(text(StatusCode::FORBIDDEN, "forbidden"));
+                let mut response = text(StatusCode::FORBIDDEN, "forbidden");
+                self.apply_error_page(&mut response, entry, peer).await;
+                return Err(response);
             }
         }
 
@@ -1211,6 +1212,7 @@ impl Proxy {
                     WWW_AUTHENTICATE,
                     HeaderValue::from_static("Basic realm=\"elira\""),
                 );
+                self.apply_error_page(&mut response, entry, peer).await;
                 return Err(response);
             }
         }
@@ -1252,6 +1254,7 @@ impl Proxy {
                     upstream: None,
                     access_log: entry.access_log,
                 });
+                self.apply_error_page(&mut response, entry, peer).await;
                 self.apply_route(&mut response, entry, &request_id);
                 return Ok(response);
             }
@@ -1262,6 +1265,7 @@ impl Proxy {
                     upstream: None,
                     access_log: entry.access_log,
                 });
+                self.apply_error_page(&mut response, entry, peer).await;
                 self.apply_route(&mut response, entry, &request_id);
                 return Ok(response);
             }
@@ -2201,12 +2205,37 @@ impl Proxy {
         entry: &RouteEntry,
         peer: SocketAddr,
     ) {
+        self.apply_page(response, Some(entry), peer).await;
+    }
+
+    async fn apply_global_error_page(&self, response: &mut Response<Body>, peer: SocketAddr) {
+        self.apply_page(response, None, peer).await;
+    }
+
+    async fn apply_page(
+        &self,
+        response: &mut Response<Body>,
+        entry: Option<&RouteEntry>,
+        peer: SocketAddr,
+    ) {
+        if response.extensions().get::<ErrorPageApplied>().is_some() {
+            return;
+        }
         let status = response.status();
-        let Some((_, path, files)) = entry
-            .error_pages
-            .iter()
-            .find(|(code, _, _)| *code == status)
-        else {
+        let page = entry
+            .and_then(|entry| {
+                entry
+                    .error_pages
+                    .iter()
+                    .find(|(code, _, _)| *code == status)
+            })
+            .or_else(|| {
+                self.inner
+                    .error_pages
+                    .iter()
+                    .find(|(code, _, _)| *code == status)
+            });
+        let Some((_, path, files)) = page else {
             return;
         };
 
@@ -2222,6 +2251,17 @@ impl Proxy {
         if page.status().is_success() {
             *page.status_mut() = status;
         }
+        // These describe the error itself, not the page body.
+        for name in [
+            WWW_AUTHENTICATE,
+            http::header::RETRY_AFTER,
+            http::header::ALLOW,
+        ] {
+            if let Some(value) = response.headers().get(&name) {
+                page.headers_mut().insert(name, value.clone());
+            }
+        }
+        page.extensions_mut().insert(ErrorPageApplied);
         *response = page;
     }
 
@@ -2976,6 +3016,27 @@ fn validators_from_entry(entry: &elira_cache::Entry) -> HeaderMap {
         }
     }
     validators
+}
+
+fn error_page_set(
+    root: std::path::PathBuf,
+    index: Vec<String>,
+    pages: &[String],
+) -> Vec<(StatusCode, String, Arc<Files>)> {
+    if pages.is_empty() {
+        return Vec::new();
+    }
+    let files = Arc::new(Files::new(root, index, false, Vec::new(), false, false, 0));
+    let mut out = Vec::new();
+    for page in pages {
+        let mut parts = page.splitn(2, char::is_whitespace);
+        let status = parts.next().and_then(|s| s.parse::<u16>().ok());
+        let path = parts.next().unwrap_or_default().trim();
+        if let Some(status) = status.and_then(|s| StatusCode::from_u16(s).ok()) {
+            out.push((status, path.to_owned(), files.clone()));
+        }
+    }
+    out
 }
 
 fn parse_param(value: &str) -> Option<(String, String)> {

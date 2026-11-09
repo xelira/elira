@@ -114,6 +114,8 @@
 - `fastcgi_param` и `cgi_param` на маршруте.
 - `limits.max_upstream_response_bytes` и одноимённый per-route предел ответа
   проксируемого upstream.
+- Глобальные `error_pages`/`error_root`: страницы для `401`, `403`, `404` без
+  маршрута, `429` и ошибок upstream.
 - `Cache-Control: must-revalidate` запрещает stale-выдачу; `Expires`/`Date`
   задают TTL, если `max-age` нет. Запросы с `no-cache`/`no-store` обходят кэш.
 - Заголовки `Forwarded` и `X-Forwarded-Port` к upstream.
