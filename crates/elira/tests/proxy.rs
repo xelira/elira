@@ -1337,6 +1337,83 @@ add_headers = ["X-Tenant: $tenant"]
 }
 
 #[tokio::test]
+async fn geo_and_split_variables_resolve() {
+    let upstream = upstream().await;
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[geos]]
+name = "zone"
+default = "other"
+values = {{ "127.0.0.0/8" = "loopback" }}
+
+[[splits]]
+name = "variant"
+source = "$http_x_user"
+buckets = [{{ percent = 100, value = "only" }}]
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "example.com"
+upstream = "app"
+add_headers = ["X-Zone: $zone", "X-Variant: $variant"]
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let response = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(response.contains("x-zone: loopback"), "{response}");
+    assert!(response.contains("x-variant: only"), "{response}");
+}
+
+#[tokio::test]
+async fn route_if_returns_on_a_matching_variable() {
+    let upstream = upstream().await;
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "example.com"
+upstream = "app"
+if = [{{ variable = "$http_x_debug", equals = "1", return = {{ status = 503, body = "blocked" }} }}]
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let blocked = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nX-Debug: 1\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(
+        status(&blocked),
+        "HTTP/1.1 503 Service Unavailable",
+        "{blocked}"
+    );
+    assert!(blocked.ends_with("blocked"), "{blocked}");
+
+    let allowed = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&allowed), "HTTP/1.1 200 OK", "{allowed}");
+}
+
+#[tokio::test]
 async fn route_request_headers_are_set_and_removed() {
     let upstream = upstream().await;
     let config = format!(

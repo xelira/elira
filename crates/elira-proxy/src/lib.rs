@@ -236,6 +236,8 @@ struct Inner {
     routers: HashMap<String, Router>,
     rewrites: Vec<CompiledRewrite>,
     maps: Vec<Map>,
+    geos: Vec<CompiledGeo>,
+    splits: Vec<CompiledSplit>,
     pools: Vec<Arc<Pool>>,
     tunnels: Arc<Semaphore>,
     connect: Option<Vec<Authority>>,
@@ -365,7 +367,7 @@ impl RequestVars {
         }
     }
 
-    fn apply_maps(&mut self, maps: &[Map]) {
+    fn apply_derived(&mut self, maps: &[Map], geos: &[CompiledGeo], splits: &[CompiledSplit]) {
         for map in maps {
             let source = map.source.strip_prefix('$').unwrap_or(&map.source);
             let key = self
@@ -379,6 +381,35 @@ impl RequestVars {
                 .or_else(|| map.default.clone())
                 .unwrap_or_default();
             self.mapped.insert(map.name.clone(), value);
+        }
+
+        for geo in geos {
+            let value = geo
+                .networks
+                .iter()
+                .find(|(network, _)| network.contains(&self.remote_addr))
+                .map(|(_, value)| value.clone())
+                .unwrap_or_else(|| geo.default.clone());
+            self.mapped.insert(geo.name.clone(), value);
+        }
+
+        for split in splits {
+            let source = split.source.strip_prefix('$').unwrap_or(&split.source);
+            let key = self
+                .value(source)
+                .map(|value| value.into_owned())
+                .unwrap_or_default();
+            let bucket = (stable_hash(&key) % 100) as u8;
+            let mut cumulative = 0u16;
+            let mut value = String::new();
+            for (percent, bucket_value) in &split.buckets {
+                cumulative = cumulative.saturating_add(u16::from(*percent));
+                if u16::from(bucket) < cumulative {
+                    value = bucket_value.clone();
+                    break;
+                }
+            }
+            self.mapped.insert(split.name.clone(), value);
         }
     }
 
@@ -572,6 +603,7 @@ struct RouteEntry {
     remove_headers: Vec<HeaderName>,
     request_headers: Vec<(HeaderName, String)>,
     request_remove_headers: Vec<HeaderName>,
+    if_conditions: Vec<CompiledIf>,
     auth: Option<Arc<BasicAuth>>,
     acl: Option<Arc<IpAcl>>,
     timeout: Option<Duration>,
@@ -595,10 +627,32 @@ struct RouteEntry {
     cgi_param: Vec<(String, String)>,
 }
 
+#[derive(Clone)]
+struct CompiledIf {
+    variable: String,
+    equals: Option<String>,
+    regex: Option<regex::Regex>,
+    status: StatusCode,
+    body: String,
+    content_type: Option<String>,
+}
+
 struct CompiledRewrite {
     regex: regex::Regex,
     replacement: String,
     flag: RewriteFlag,
+}
+
+struct CompiledGeo {
+    name: String,
+    default: String,
+    networks: Vec<(ipnet::IpNet, String)>,
+}
+
+struct CompiledSplit {
+    name: String,
+    source: String,
+    buckets: Vec<(u8, String)>,
 }
 
 struct Router {
@@ -1339,6 +1393,39 @@ impl Proxy {
                 _ => None,
             };
 
+            let if_conditions = route
+                .if_conditions
+                .iter()
+                .map(|condition| {
+                    let regex =
+                        match &condition.matches {
+                            Some(pattern) => Some(regex::Regex::new(pattern).map_err(|err| {
+                                Error::RouteConfig {
+                                    host: route.host.clone(),
+                                    reason: err.to_string(),
+                                }
+                            })?),
+                            None => None,
+                        };
+                    let ret = condition
+                        .return_response
+                        .as_ref()
+                        .expect("if return is validated");
+                    Ok(CompiledIf {
+                        variable: condition
+                            .variable
+                            .strip_prefix('$')
+                            .unwrap_or(&condition.variable)
+                            .to_owned(),
+                        equals: condition.equals.clone(),
+                        regex,
+                        status: StatusCode::from_u16(ret.status).expect("if status is validated"),
+                        body: ret.body.clone().unwrap_or_default(),
+                        content_type: ret.content_type.clone(),
+                    })
+                })
+                .collect::<Result<Vec<_>, Error>>()?;
+
             let entry = RouteEntry {
                 label: format!(
                     "{}{}",
@@ -1389,6 +1476,7 @@ impl Proxy {
                     .iter()
                     .filter_map(|name| HeaderName::from_bytes(name.as_bytes()).ok())
                     .collect(),
+                if_conditions,
                 auth,
                 acl,
                 timeout: route.timeout_secs.map(Duration::from_secs),
@@ -1485,6 +1573,45 @@ impl Proxy {
             })
             .collect::<Result<Vec<_>, Error>>()?;
 
+        let mut geos = Vec::with_capacity(cfg.geos.len());
+        for geo in &cfg.geos {
+            let mut networks = Vec::with_capacity(geo.values.len());
+            for (network, value) in &geo.values {
+                let network = if let Ok(network) = network.parse::<ipnet::IpNet>() {
+                    network
+                } else if let Ok(ip) = network.parse::<std::net::IpAddr>() {
+                    let prefix = if ip.is_ipv4() { 32 } else { 128 };
+                    match ipnet::IpNet::new(ip, prefix) {
+                        Ok(network) => network,
+                        Err(_) => continue,
+                    }
+                } else {
+                    continue;
+                };
+                networks.push((network, value.clone()));
+            }
+            networks.sort_by_key(|(network, _)| std::cmp::Reverse(network.prefix_len()));
+            geos.push(CompiledGeo {
+                name: geo.name.clone(),
+                default: geo.default.clone().unwrap_or_default(),
+                networks,
+            });
+        }
+
+        let splits = cfg
+            .splits
+            .iter()
+            .map(|split| CompiledSplit {
+                name: split.name.clone(),
+                source: split.source.clone(),
+                buckets: split
+                    .buckets
+                    .iter()
+                    .map(|bucket| (bucket.percent, bucket.value.clone()))
+                    .collect(),
+            })
+            .collect();
+
         let connect =
             if cfg.connect.enabled {
                 let mut allowed = Vec::with_capacity(cfg.connect.allow.len());
@@ -1539,6 +1666,8 @@ impl Proxy {
                 routers,
                 rewrites,
                 maps: cfg.maps.clone(),
+                geos,
+                splits,
                 pools: all_pools,
                 tunnels: Arc::new(Semaphore::new(cfg.limits.max_connections)),
                 connect,
@@ -2089,7 +2218,32 @@ impl Proxy {
             headers: req.headers().clone(),
             mapped: HashMap::new(),
         };
-        vars.apply_maps(&self.inner.maps);
+        vars.apply_derived(&self.inner.maps, &self.inner.geos, &self.inner.splits);
+
+        for condition in &entry.if_conditions {
+            let value = vars
+                .value(&condition.variable)
+                .map(|value| value.into_owned())
+                .unwrap_or_default();
+            let matched = condition
+                .equals
+                .as_ref()
+                .is_some_and(|expected| value == *expected)
+                || condition
+                    .regex
+                    .as_ref()
+                    .is_some_and(|regex| regex.is_match(&value));
+            if matched {
+                return Ok(self.fixed_response(
+                    condition.status,
+                    &condition.body,
+                    condition.content_type.as_deref(),
+                    &vars,
+                    entry,
+                    &request_id,
+                ));
+            }
+        }
 
         if let Some(rule) = &entry.client_auth {
             if !rule.allows(req.extensions().get::<ClientIdentity>()) {
@@ -2263,41 +2417,14 @@ impl Proxy {
                 body,
                 content_type,
             } => {
-                let rendered = vars.render(body);
-                let has_body = !rendered.is_empty()
-                    && *status != StatusCode::NO_CONTENT
-                    && *status != StatusCode::NOT_MODIFIED;
-                let body = if has_body {
-                    Full::new(Bytes::from(rendered))
-                        .map_err(|never| match never {})
-                        .boxed()
-                } else {
-                    empty()
-                };
-                let mut response =
-                    Response::builder()
-                        .status(*status)
-                        .body(body)
-                        .map_err(|_| {
-                            text(StatusCode::INTERNAL_SERVER_ERROR, "response build failed")
-                        })?;
-                if has_body {
-                    let value = content_type
-                        .as_deref()
-                        .map(|value| vars.render(value))
-                        .unwrap_or_else(|| "text/plain; charset=utf-8".to_owned());
-                    if let Ok(value) = HeaderValue::from_str(&value) {
-                        response.headers_mut().insert(CONTENT_TYPE, value);
-                    }
-                }
-                response.extensions_mut().insert(Labels {
-                    route: entry.label.clone(),
-                    upstream: None,
-                    access_log: entry.access_log,
-                    access_log_sample: entry.access_log_sample,
-                });
-                self.apply_route(&mut response, entry, &vars, &request_id);
-                return Ok(response);
+                return Ok(self.fixed_response(
+                    *status,
+                    body,
+                    content_type.as_deref(),
+                    &vars,
+                    entry,
+                    &request_id,
+                ));
             }
             Target::FastCgi { .. } => {
                 let mut response = self.serve_fastcgi(req, entry, peer, scheme).await;
@@ -3454,6 +3581,48 @@ impl Proxy {
         *response = page;
     }
 
+    fn fixed_response(
+        &self,
+        status: StatusCode,
+        body: &str,
+        content_type: Option<&str>,
+        vars: &RequestVars,
+        entry: &RouteEntry,
+        request_id: &str,
+    ) -> Response<Body> {
+        let rendered = vars.render(body);
+        let has_body = !rendered.is_empty()
+            && status != StatusCode::NO_CONTENT
+            && status != StatusCode::NOT_MODIFIED;
+        let body = if has_body {
+            Full::new(Bytes::from(rendered))
+                .map_err(|never| match never {})
+                .boxed()
+        } else {
+            empty()
+        };
+        let mut response = match Response::builder().status(status).body(body) {
+            Ok(response) => response,
+            Err(_) => return text(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"),
+        };
+        if has_body {
+            let value = content_type
+                .map(|value| vars.render(value))
+                .unwrap_or_else(|| "text/plain; charset=utf-8".to_owned());
+            if let Ok(value) = HeaderValue::from_str(&value) {
+                response.headers_mut().insert(CONTENT_TYPE, value);
+            }
+        }
+        response.extensions_mut().insert(Labels {
+            route: entry.label.clone(),
+            upstream: None,
+            access_log: entry.access_log,
+            access_log_sample: entry.access_log_sample,
+        });
+        self.apply_route(&mut response, entry, vars, request_id);
+        response
+    }
+
     fn apply_route(
         &self,
         response: &mut Response<Body>,
@@ -4243,6 +4412,15 @@ fn headers_within_limits(headers: &HeaderMap, max_headers: usize, max_bytes: usi
         .map(|(name, value)| name.as_str().len() + value.as_bytes().len() + 4)
         .sum();
     bytes <= max_bytes
+}
+
+fn stable_hash(value: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in value.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 fn rendezvous(key: &str, server: &str) -> u64 {

@@ -40,6 +40,14 @@ pub struct Config {
     #[serde(default)]
     pub maps: Vec<Map>,
 
+    /// Named variables matched against client IP networks.
+    #[serde(default)]
+    pub geos: Vec<Geo>,
+
+    /// Named variables bucketed by a deterministic percentage split.
+    #[serde(default)]
+    pub splits: Vec<Split>,
+
     /// Permission bits for the unix socket, for example `0o660`.
     #[serde(default)]
     pub listen_unix_mode: Option<u32>,
@@ -204,6 +212,33 @@ pub struct Map {
     pub default: Option<String>,
     #[serde(default)]
     pub values: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Geo {
+    pub name: String,
+    #[serde(default)]
+    pub default: Option<String>,
+    /// Network or address to value.
+    pub values: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Split {
+    pub name: String,
+    /// Source variable including the leading `$`.
+    pub source: String,
+    pub buckets: Vec<SplitBucket>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SplitBucket {
+    /// Percentage of the hash space, 1..100.
+    pub percent: u8,
+    pub value: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -773,6 +808,10 @@ pub struct Route {
     #[serde(default, rename = "return")]
     pub return_response: Option<RouteReturn>,
 
+    /// Conditional returns evaluated before the route target.
+    #[serde(default, rename = "if")]
+    pub if_conditions: Vec<RouteIf>,
+
     /// FastCGI target: `host:port` or `unix:/path`.
     #[serde(default)]
     pub fastcgi_pass: Option<String>,
@@ -969,6 +1008,19 @@ pub struct RouteReturn {
     pub body: Option<String>,
     #[serde(default)]
     pub content_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteIf {
+    /// Variable including the leading `$`.
+    pub variable: String,
+    #[serde(default)]
+    pub equals: Option<String>,
+    #[serde(default)]
+    pub matches: Option<String>,
+    #[serde(default, rename = "return")]
+    pub return_response: Option<RouteReturn>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1548,7 +1600,7 @@ impl Config {
             }
         }
 
-        let mut map_names = HashSet::new();
+        let mut variable_names = HashSet::new();
         for map in &self.maps {
             if map.name.is_empty()
                 || !map
@@ -1561,10 +1613,69 @@ impl Config {
             if !map.source.starts_with('$') || map.source.len() < 2 {
                 return Err(Error::BadMapSource);
             }
-            if !map_names.insert(map.name.as_str()) {
+            if !variable_names.insert(map.name.as_str()) {
                 return Err(Error::DuplicateMapName {
                     name: map.name.clone(),
                 });
+            }
+        }
+        for geo in &self.geos {
+            if geo.name.is_empty()
+                || !geo
+                    .name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            {
+                return Err(Error::BadMapName);
+            }
+            if !variable_names.insert(geo.name.as_str()) {
+                return Err(Error::DuplicateMapName {
+                    name: geo.name.clone(),
+                });
+            }
+            if geo.values.is_empty() {
+                return Err(Error::BadGeo);
+            }
+            for network in geo.values.keys() {
+                if network.parse::<ipnet::IpNet>().is_err()
+                    && network.parse::<std::net::IpAddr>().is_err()
+                {
+                    return Err(Error::BadGeo);
+                }
+            }
+        }
+        for split in &self.splits {
+            if split.name.is_empty()
+                || !split
+                    .name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            {
+                return Err(Error::BadMapName);
+            }
+            if !split.source.starts_with('$') || split.source.len() < 2 {
+                return Err(Error::BadMapSource);
+            }
+            if !variable_names.insert(split.name.as_str()) {
+                return Err(Error::DuplicateMapName {
+                    name: split.name.clone(),
+                });
+            }
+            if split.buckets.is_empty()
+                || split
+                    .buckets
+                    .iter()
+                    .any(|bucket| bucket.percent == 0 || bucket.percent > 100)
+            {
+                return Err(Error::BadSplit);
+            }
+            let total: u16 = split
+                .buckets
+                .iter()
+                .map(|bucket| u16::from(bucket.percent))
+                .sum();
+            if total > 100 {
+                return Err(Error::BadSplit);
             }
         }
 
@@ -2129,6 +2240,25 @@ impl Config {
                     }
                 }
             }
+            for condition in &route.if_conditions {
+                if !condition.variable.starts_with('$')
+                    || condition.variable.len() < 2
+                    || condition.equals.is_some() == condition.matches.is_some()
+                {
+                    return Err(Error::BadIf { index });
+                }
+                let Some(ret) = &condition.return_response else {
+                    return Err(Error::BadIf { index });
+                };
+                if !(200..=599).contains(&ret.status) {
+                    return Err(Error::BadReturnStatus { index });
+                }
+                if let Some(content_type) = &ret.content_type {
+                    if HeaderValue::from_str(content_type).is_err() {
+                        return Err(Error::BadReturnContentType { index });
+                    }
+                }
+            }
 
             if route.fastcgi_pool_idle.is_some() && route.fastcgi_pass.is_none() {
                 return Err(Error::PoolWithoutFastCgi { index });
@@ -2513,6 +2643,12 @@ pub enum Error {
     #[error("map name {name:?} is used twice")]
     DuplicateMapName { name: String },
 
+    #[error("geo needs at least one valid IP or CIDR value")]
+    BadGeo,
+
+    #[error("split needs buckets with 1..100 percent and a total of at most 100")]
+    BadSplit,
+
     #[error("stream needs at least one upstream")]
     EmptyStream,
 
@@ -2739,6 +2875,9 @@ pub enum Error {
 
     #[error("route {index}: return.content_type is not a valid header value")]
     BadReturnContentType { index: usize },
+
+    #[error("route {index}: if needs a $variable, exactly one of equals/matches, and a return")]
+    BadIf { index: usize },
 
     #[error("route {index}: index file \"{entry}\" must be a plain file name")]
     BadIndexEntry { index: usize, entry: String },
@@ -4363,6 +4502,36 @@ root = "/srv/www"
     }
 
     #[test]
+    fn geo_and_split_variables_are_validated() {
+        let base = r#"
+listen = "127.0.0.1:8080"
+
+[[geos]]
+name = "zone"
+default = "other"
+values = { "127.0.0.0/8" = "loopback" }
+
+[[splits]]
+name = "variant"
+source = "$http_x_user"
+buckets = [{ percent = 40, value = "a" }, { percent = 60, value = "b" }]
+
+[[routes]]
+host = "*"
+root = "/srv/www"
+"#;
+        let cfg = Config::parse(base).expect("valid");
+        assert_eq!(cfg.geos.len(), 1);
+        assert_eq!(cfg.splits.len(), 1);
+
+        let bad_geo = base.replace("\"127.0.0.0/8\"", "\"not-a-network\"");
+        assert!(matches!(Config::parse(&bad_geo), Err(Error::BadGeo)));
+
+        let bad_split = base.replace("percent = 60", "percent = 70");
+        assert!(matches!(Config::parse(&bad_split), Err(Error::BadSplit)));
+    }
+
+    #[test]
     fn map_variables_are_validated() {
         let base = r#"
 listen = "127.0.0.1:8080"
@@ -4411,6 +4580,29 @@ root = "/srv/www"
 
         let empty = base.replace("^/old/(.*)$", "");
         assert!(matches!(Config::parse(&empty), Err(Error::BadRewrite)));
+    }
+
+    #[test]
+    fn route_if_conditions_are_validated() {
+        let base = r#"
+listen = "127.0.0.1:8080"
+
+[[routes]]
+host = "*"
+root = "/srv/www"
+if = [{ variable = "$http_x_debug", equals = "1", return = { status = 503, body = "blocked" } }]
+"#;
+        let cfg = Config::parse(base).expect("valid");
+        assert_eq!(cfg.routes[0].if_conditions.len(), 1);
+
+        let both = base.replace("equals = \"1\"", "equals = \"1\", matches = \"^1$\"");
+        assert!(matches!(Config::parse(&both), Err(Error::BadIf { .. })));
+
+        let no_return = base.replace(", return = { status = 503, body = \"blocked\" }", "");
+        assert!(matches!(
+            Config::parse(&no_return),
+            Err(Error::BadIf { .. })
+        ));
     }
 
     #[test]
