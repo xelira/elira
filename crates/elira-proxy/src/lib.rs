@@ -19,7 +19,7 @@ use bytes::Bytes;
 use futures_util::Stream;
 use http::header::{
     HeaderName, HeaderValue, AUTHORIZATION, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH,
-    CONTENT_TYPE, HOST, LOCATION, SERVER, TRANSFER_ENCODING, UPGRADE, VARY, WWW_AUTHENTICATE,
+    CONTENT_TYPE, HOST, LOCATION, SERVER, TRANSFER_ENCODING, UPGRADE, VARY,
 };
 use http::uri::Authority;
 use http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
@@ -49,6 +49,7 @@ mod health;
 mod helpers;
 mod pool;
 mod response;
+mod serve;
 mod tunnel;
 mod variables;
 pub(crate) use build::*;
@@ -989,78 +990,8 @@ impl Proxy {
             }
         }
 
-        if let Some(rule) = &entry.client_auth {
-            if !rule.allows(req.extensions().get::<ClientIdentity>()) {
-                let mut response = text(StatusCode::FORBIDDEN, "client certificate required");
-                self.apply_error_page(&mut response, entry, &vars, peer)
-                    .await;
-                return Err(response);
-            }
-        }
-
-        // A route may set a stricter cap than the global one.
-        if let Some(limit) = entry.body_limit {
-            if limit > 0 {
-                if let Some(length) = req
-                    .headers()
-                    .get(CONTENT_LENGTH)
-                    .and_then(|value| value.to_str().ok())
-                    .and_then(|value| value.parse::<u64>().ok())
-                {
-                    if length > limit as u64 {
-                        let mut response =
-                            text(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
-                        self.apply_error_page(&mut response, entry, &vars, peer)
-                            .await;
-                        return Err(response);
-                    }
-                }
-            }
-        }
-
-        if let Some(limiter) = &entry.limiter {
-            let key_path = req
-                .uri()
-                .path_and_query()
-                .map(|value| value.as_str())
-                .unwrap_or("/");
-            let bucket = request_key_value(&entry.rate_key, req.headers(), peer.ip(), key_path);
-            if !limiter.check(bucket.as_ref(), Instant::now()) {
-                let mut response = text(StatusCode::TOO_MANY_REQUESTS, "too many requests");
-                response
-                    .headers_mut()
-                    .insert(http::header::RETRY_AFTER, HeaderValue::from_static("1"));
-                self.apply_error_page(&mut response, entry, &vars, peer)
-                    .await;
-                return Err(response);
-            }
-        }
-
-        if let Some(acl) = &entry.acl {
-            if !acl.allows(peer.ip()) {
-                let mut response = text(StatusCode::FORBIDDEN, "forbidden");
-                self.apply_error_page(&mut response, entry, &vars, peer)
-                    .await;
-                return Err(response);
-            }
-        }
-
-        if let Some(auth) = &entry.auth {
-            let header = req
-                .headers()
-                .get(AUTHORIZATION)
-                .and_then(|value| value.to_str().ok());
-
-            if !auth.check(header) {
-                let mut response = text(StatusCode::UNAUTHORIZED, "authentication required");
-                response.headers_mut().insert(
-                    WWW_AUTHENTICATE,
-                    HeaderValue::from_static("Basic realm=\"elira\""),
-                );
-                self.apply_error_page(&mut response, entry, &vars, peer)
-                    .await;
-                return Err(response);
-            }
+        if let Some(response) = self.check_access(&req, entry, &vars, peer).await {
+            return Err(response);
         }
 
         let body_limit = entry.body_limit.unwrap_or(self.inner.max_body_bytes);
@@ -1119,104 +1050,18 @@ impl Proxy {
 
         let pool = match &entry.target {
             Target::Proxy(pool) => pool,
-            Target::Files(files) => {
-                let mut response = files.serve(&req, peer).await;
-                response.extensions_mut().insert(Labels {
-                    route: entry.label.clone(),
-                    upstream: None,
-                    access_log: entry.access_log,
-                    access_log_sample: entry.access_log_sample,
-                });
-                self.apply_error_page(&mut response, entry, &vars, peer)
+            _ => {
+                return self
+                    .serve_non_proxy(
+                        req,
+                        entry,
+                        &vars,
+                        peer,
+                        scheme,
+                        &request_id,
+                        &body_limit_hit,
+                    )
                     .await;
-                self.apply_route(&mut response, entry, &vars, &request_id);
-                return Ok(response);
-            }
-            Target::Redirect { status, location } => {
-                let Ok(location) = HeaderValue::from_str(&vars.render(location)) else {
-                    return Err(text(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "redirect target is not a valid header value",
-                    ));
-                };
-                let mut response =
-                    Response::builder()
-                        .status(*status)
-                        .body(empty())
-                        .map_err(|_| {
-                            text(StatusCode::INTERNAL_SERVER_ERROR, "response build failed")
-                        })?;
-                response.headers_mut().insert(LOCATION, location);
-                response.extensions_mut().insert(Labels {
-                    route: entry.label.clone(),
-                    upstream: None,
-                    access_log: entry.access_log,
-                    access_log_sample: entry.access_log_sample,
-                });
-                self.apply_route(&mut response, entry, &vars, &request_id);
-                return Ok(response);
-            }
-            Target::Return {
-                status,
-                body,
-                content_type,
-            } => {
-                return Ok(self.fixed_response(
-                    *status,
-                    body,
-                    content_type.as_deref(),
-                    &vars,
-                    entry,
-                    &request_id,
-                ));
-            }
-            Target::FastCgi { .. } => {
-                let mut response = self.serve_fastcgi(req, entry, peer, scheme).await;
-                if body_limit_hit.load(Ordering::Relaxed) {
-                    return Err(self.body_too_large(entry, &vars, peer).await);
-                }
-                response.extensions_mut().insert(Labels {
-                    route: entry.label.clone(),
-                    upstream: None,
-                    access_log: entry.access_log,
-                    access_log_sample: entry.access_log_sample,
-                });
-                self.apply_error_page(&mut response, entry, &vars, peer)
-                    .await;
-                self.apply_route(&mut response, entry, &vars, &request_id);
-                return Ok(response);
-            }
-            Target::Cgi { .. } => {
-                let mut response = self.serve_cgi(req, entry, peer, scheme).await;
-                if body_limit_hit.load(Ordering::Relaxed) {
-                    return Err(self.body_too_large(entry, &vars, peer).await);
-                }
-                response.extensions_mut().insert(Labels {
-                    route: entry.label.clone(),
-                    upstream: None,
-                    access_log: entry.access_log,
-                    access_log_sample: entry.access_log_sample,
-                });
-                self.apply_error_page(&mut response, entry, &vars, peer)
-                    .await;
-                self.apply_route(&mut response, entry, &vars, &request_id);
-                return Ok(response);
-            }
-            Target::Module(_) | Target::Wasm(_) => {
-                let mut response = self.serve_app(req, entry, peer, scheme).await;
-                if body_limit_hit.load(Ordering::Relaxed) {
-                    return Err(self.body_too_large(entry, &vars, peer).await);
-                }
-                response.extensions_mut().insert(Labels {
-                    route: entry.label.clone(),
-                    upstream: None,
-                    access_log: entry.access_log,
-                    access_log_sample: entry.access_log_sample,
-                });
-                self.apply_error_page(&mut response, entry, &vars, peer)
-                    .await;
-                self.apply_route(&mut response, entry, &vars, &request_id);
-                return Ok(response);
             }
         };
         let path = req
