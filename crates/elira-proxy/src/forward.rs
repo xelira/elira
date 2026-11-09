@@ -421,93 +421,23 @@ impl Proxy {
         let cache_allowed = entry.cache != Some(false);
         let mut _cache_flight: Option<CacheFlightGuard> = None;
         if is_get && requested_upgrade.is_none() && cache_allowed {
-            if let Some(cache) = &self.inner.cache {
-                let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-                loop {
-                    let now = Instant::now();
-                    if let Some((hit, stale)) = cache.get_stale(&cache_key, &request_headers, now) {
-                        let age = hit.age(now);
-                        let body_len = hit.body.len();
-                        let cached_status = hit.status;
-                        let cached_type = hit
-                            .headers
-                            .iter()
-                            .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
-                            .map(|(_, value)| value.clone())
-                            .unwrap_or_default();
-                        let cached_encoding = hit
-                            .headers
-                            .iter()
-                            .any(|(name, _)| name.eq_ignore_ascii_case("content-encoding"));
-                        let validators = validators_from_entry(&hit);
-                        let mut response = cache_response(hit);
-
-                        // A cached body is stored identity-encoded, so it still
-                        // has to go through the same negotiation as a fresh one.
-                        if !is_head
-                            && !cached_encoding
-                            && cached_status == StatusCode::OK.as_u16()
-                            && self.inner.compression.enabled
-                            && body_len >= self.inner.compression.min_bytes
-                            && compressible(&cached_type)
-                        {
-                            if let Some(encoding) = preferred_encoding(&request_headers) {
-                                let headers = response.headers_mut();
-                                headers.remove(CONTENT_LENGTH);
-                                headers.remove(http::header::ETAG);
-                                headers
-                                    .insert(CONTENT_ENCODING, HeaderValue::from_static(encoding));
-                                headers.append(VARY, HeaderValue::from_static("accept-encoding"));
-                                let body = std::mem::replace(response.body_mut(), empty());
-                                *response.body_mut() = compress(body, encoding);
-                            }
-                        }
-
-                        if let Ok(value) = HeaderValue::from_str(&age.to_string()) {
-                            response.headers_mut().insert("age", value);
-                        }
-                        response.headers_mut().insert(
-                            "x-cache",
-                            HeaderValue::from_static(if stale { "STALE" } else { "HIT" }),
-                        );
-                        response.extensions_mut().insert(Labels {
-                            route: entry.label.clone(),
-                            upstream: Some(pool.name.clone()),
-                            access_log: entry.access_log,
-                            access_log_sample: entry.access_log_sample,
-                        });
-                        if stale {
-                            self.refresh(
-                                cache.clone(),
-                                cache_key.clone(),
-                                template.clone(),
-                                request_headers.clone(),
-                                validators,
-                                upstream_path.clone(),
-                                pool.clone(),
-                                route_timeout,
-                                entry.cache_ttl,
-                            );
-                        }
-                        self.apply_route(&mut response, entry, &vars, &request_id);
-                        return Ok(response);
-                    }
-
-                    match self.inner.cache_flights.enter(&cache_key) {
-                        CacheFlight::Leader(guard) => {
-                            _cache_flight = Some(guard);
-                            break;
-                        }
-                        CacheFlight::Follower(mut done) => {
-                            if tokio::time::Instant::now() >= deadline {
-                                break;
-                            }
-                            if !*done.borrow() {
-                                let _ = tokio::time::timeout_at(deadline, done.changed()).await;
-                            }
-                        }
-                    }
-                }
+            let (hit, flight) = self
+                .cache_lookup(
+                    entry,
+                    &vars,
+                    &request_id,
+                    pool,
+                    &cache_key,
+                    &request_headers,
+                    &template,
+                    &upstream_path,
+                    is_head,
+                    route_timeout,
+                )
+                .await;
+            _cache_flight = flight;
+            if let Some(response) = hit {
+                return Ok(response);
             }
         }
 
@@ -545,6 +475,169 @@ impl Proxy {
             }
             return result;
         }
+        let response = self
+            .send_upstream(
+                pool,
+                &parts.method,
+                &upstream_path,
+                &template,
+                hash_key.as_deref(),
+                buffered.as_ref(),
+                &mut body,
+                can_retry,
+                route_timeout,
+                &body_limit_hit,
+                entry,
+                &vars,
+                peer,
+            )
+            .await?;
+
+        self.finalize_response(
+            response,
+            pool,
+            entry,
+            &vars,
+            &request_id,
+            peer,
+            is_head,
+            is_get,
+            requested_upgrade.as_ref(),
+            encoding,
+            cache_allowed,
+            &cache_key,
+            &request_headers,
+            proxy_permit,
+        )
+        .await
+    }
+
+    /// Look up a cached representation, including the stale path. Returns the
+    /// response to send, or nothing plus the single-flight guard the caller
+    /// must keep for the duration of the upstream request.
+    #[allow(clippy::too_many_arguments)]
+    async fn cache_lookup(
+        &self,
+        entry: &RouteEntry,
+        vars: &RequestVars,
+        request_id: &str,
+        pool: &Arc<Pool>,
+        cache_key: &str,
+        request_headers: &HeaderMap,
+        template: &HeaderMap,
+        upstream_path: &str,
+        is_head: bool,
+        route_timeout: Duration,
+    ) -> (Option<Response<Body>>, Option<CacheFlightGuard>) {
+        let mut flight = None;
+        if let Some(cache) = &self.inner.cache {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                let now = Instant::now();
+                if let Some((hit, stale)) = cache.get_stale(cache_key, request_headers, now) {
+                    let age = hit.age(now);
+                    let body_len = hit.body.len();
+                    let cached_status = hit.status;
+                    let cached_type = hit
+                        .headers
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+                        .map(|(_, value)| value.clone())
+                        .unwrap_or_default();
+                    let cached_encoding = hit
+                        .headers
+                        .iter()
+                        .any(|(name, _)| name.eq_ignore_ascii_case("content-encoding"));
+                    let validators = validators_from_entry(&hit);
+                    let mut response = cache_response(hit);
+
+                    // A cached body is stored identity-encoded, so it still
+                    // has to go through the same negotiation as a fresh one.
+                    if !is_head
+                        && !cached_encoding
+                        && cached_status == StatusCode::OK.as_u16()
+                        && self.inner.compression.enabled
+                        && body_len >= self.inner.compression.min_bytes
+                        && compressible(&cached_type)
+                    {
+                        if let Some(encoding) = preferred_encoding(request_headers) {
+                            let headers = response.headers_mut();
+                            headers.remove(CONTENT_LENGTH);
+                            headers.remove(http::header::ETAG);
+                            headers.insert(CONTENT_ENCODING, HeaderValue::from_static(encoding));
+                            headers.append(VARY, HeaderValue::from_static("accept-encoding"));
+                            let body = std::mem::replace(response.body_mut(), empty());
+                            *response.body_mut() = compress(body, encoding);
+                        }
+                    }
+
+                    if let Ok(value) = HeaderValue::from_str(&age.to_string()) {
+                        response.headers_mut().insert("age", value);
+                    }
+                    response.headers_mut().insert(
+                        "x-cache",
+                        HeaderValue::from_static(if stale { "STALE" } else { "HIT" }),
+                    );
+                    response.extensions_mut().insert(Labels {
+                        route: entry.label.clone(),
+                        upstream: Some(pool.name.clone()),
+                        access_log: entry.access_log,
+                        access_log_sample: entry.access_log_sample,
+                    });
+                    if stale {
+                        self.refresh(
+                            cache.clone(),
+                            cache_key.to_owned(),
+                            template.clone(),
+                            request_headers.clone(),
+                            validators,
+                            upstream_path.to_owned(),
+                            pool.clone(),
+                            route_timeout,
+                            entry.cache_ttl,
+                        );
+                    }
+                    self.apply_route(&mut response, entry, vars, request_id);
+                    return (Some(response), flight);
+                }
+
+                match self.inner.cache_flights.enter(cache_key) {
+                    CacheFlight::Leader(guard) => {
+                        flight = Some(guard);
+                        break;
+                    }
+                    CacheFlight::Follower(mut done) => {
+                        if tokio::time::Instant::now() >= deadline {
+                            break;
+                        }
+                        if !*done.borrow() {
+                            let _ = tokio::time::timeout_at(deadline, done.changed()).await;
+                        }
+                    }
+                }
+            }
+        }
+        (None, flight)
+    }
+
+    /// Pick upstream servers and retry according to the pool policy.
+    #[allow(clippy::too_many_arguments)]
+    async fn send_upstream(
+        &self,
+        pool: &Pool,
+        method: &Method,
+        upstream_path: &str,
+        template: &HeaderMap,
+        hash_key: Option<&str>,
+        buffered: Option<&BufferedBody>,
+        body: &mut Option<Body>,
+        can_retry: bool,
+        route_timeout: Duration,
+        body_limit_hit: &AtomicBool,
+        entry: &RouteEntry,
+        vars: &RequestVars,
+        peer: SocketAddr,
+    ) -> Result<Response<Body>, Response<Body>> {
         let attempts = if can_retry {
             pool.retries as usize + 1
         } else {
@@ -553,11 +646,11 @@ impl Proxy {
         let mut response = None;
 
         for attempt in 0..attempts {
-            let index = pool.pick_key(hash_key.as_deref());
+            let index = pool.pick_key(hash_key);
             let server = pool.servers[index].clone();
             let _active = pool.enter(index);
 
-            let uri = upstream_uri(&server, &upstream_path, pool.scheme)
+            let uri = upstream_uri(&server, upstream_path, pool.scheme)
                 .ok_or_else(|| text(StatusCode::BAD_GATEWAY, "bad upstream address"))?;
             let payload = match &buffered {
                 Some(buffered) => buffered.body(),
@@ -566,7 +659,7 @@ impl Proxy {
             };
 
             let mut upstream = Request::builder()
-                .method(parts.method.clone())
+                .method(method.clone())
                 .uri(uri)
                 .body(payload)
                 .map_err(|_| text(StatusCode::BAD_GATEWAY, "bad request"))?;
@@ -589,7 +682,7 @@ impl Proxy {
                 }
                 Err(SendError::Failed(err)) => {
                     if body_limit_hit.load(Ordering::Relaxed) {
-                        return Err(self.body_too_large(entry, &vars, peer).await);
+                        return Err(self.body_too_large(entry, vars, peer).await);
                     }
                     pool.record_failure(index);
                     tracing::warn!(upstream = %server, error = %err, "upstream request failed");
@@ -599,7 +692,7 @@ impl Proxy {
                 }
                 Err(SendError::Timeout) => {
                     if body_limit_hit.load(Ordering::Relaxed) {
-                        return Err(self.body_too_large(entry, &vars, peer).await);
+                        return Err(self.body_too_large(entry, vars, peer).await);
                     }
                     pool.record_failure(index);
                     tracing::warn!(upstream = %server, "upstream timed out");
@@ -610,8 +703,29 @@ impl Proxy {
             }
         }
 
-        let response = response.ok_or_else(|| text(StatusCode::BAD_GATEWAY, "bad gateway"))?;
+        response.ok_or_else(|| text(StatusCode::BAD_GATEWAY, "bad gateway"))
+    }
 
+    /// Turn the upstream response into the client response: transfer coding,
+    /// headers, cache insertion, buffering and compression.
+    #[allow(clippy::too_many_arguments)]
+    async fn finalize_response(
+        &self,
+        response: Response<Body>,
+        pool: &Pool,
+        entry: &RouteEntry,
+        vars: &RequestVars,
+        request_id: &str,
+        peer: SocketAddr,
+        is_head: bool,
+        is_get: bool,
+        requested_upgrade: Option<&HeaderValue>,
+        encoding: Option<&'static str>,
+        cache_allowed: bool,
+        cache_key: &str,
+        request_headers: &HeaderMap,
+        proxy_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> Result<Response<Body>, Response<Body>> {
         // Same rule as the request side: hyper only unwraps `chunked`, so
         // anything else would reach the client still transfer-coded.
         if !transfer_encoding_is_plain_chunked(response.headers()) {
@@ -681,7 +795,7 @@ impl Proxy {
             // A 101 without these two headers is a 101 the client cannot
             // act on. They are hop-by-hop, so they were stripped above.
             if parts.status == StatusCode::SWITCHING_PROTOCOLS {
-                if let Some(upgrade) = &requested_upgrade {
+                if let Some(upgrade) = requested_upgrade {
                     headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
                     headers.insert(UPGRADE, upgrade.clone());
                 }
@@ -718,8 +832,8 @@ impl Proxy {
 
             if let Some(cache) = &self.inner.cache {
                 cache.insert_with_ttl(
-                    &cache_key,
-                    &request_headers,
+                    cache_key,
+                    request_headers,
                     &parts.headers,
                     parts.status.as_u16(),
                     collected.to_vec(),
@@ -817,9 +931,9 @@ impl Proxy {
             access_log: entry.access_log,
             access_log_sample: entry.access_log_sample,
         });
-        self.apply_error_page(&mut response, entry, &vars, peer)
+        self.apply_error_page(&mut response, entry, vars, peer)
             .await;
-        self.apply_route(&mut response, entry, &vars, &request_id);
+        self.apply_route(&mut response, entry, vars, request_id);
         Ok(response)
     }
 }
