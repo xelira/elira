@@ -197,6 +197,41 @@ impl Drop for CacheFlightGuard {
     }
 }
 
+impl SpoolPermit {
+    fn grow(&mut self, bytes: u64) -> bool {
+        let mut used = self
+            .budget
+            .used
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.budget.total > 0 && used.saturating_add(bytes) > self.budget.total {
+            return false;
+        }
+        *used = used.saturating_add(bytes);
+        self.bytes = self.bytes.saturating_add(bytes);
+        true
+    }
+}
+
+/// A growable reservation used while the final body size is unknown.
+struct SpoolLease {
+    permit: SpoolPermit,
+}
+
+impl SpoolLease {
+    fn new(budget: &Arc<SpoolBudget>) -> Option<Self> {
+        budget.reserve(0).map(|permit| Self { permit })
+    }
+
+    fn from_permit(permit: SpoolPermit) -> Self {
+        Self { permit }
+    }
+
+    fn grow(&mut self, bytes: u64) -> bool {
+        self.permit.grow(bytes)
+    }
+}
+
 struct Inner {
     router: Router,
     pools: Vec<Arc<Pool>>,
@@ -4027,7 +4062,7 @@ struct BufferedBody {
     data: BufferData,
     trailers: Option<HeaderMap>,
     length: u64,
-    _permit: Option<SpoolPermit>,
+    _lease: Option<SpoolLease>,
 }
 
 impl BufferedBody {
@@ -4041,22 +4076,84 @@ impl BufferedBody {
                 }
                 BodyExt::boxed(StreamBody::new(futures_util::stream::iter(frames)))
             }
-            BufferData::Spool(file) => {
-                let reopened = file.reopen().expect("spool temp file is still open");
-                SpooledBody {
-                    stream: ReaderStream::new(tokio::fs::File::from_std(reopened)),
-                    trailers: self.trailers.clone(),
-                    length: self.length,
-                    _permit: None,
-                }
-                .boxed()
-            }
+            BufferData::Spool(file) => spool_file_body(file, self.length, self.trailers.clone()),
         }
     }
 }
 
-/// Buffer a request body with a known length into memory or a temporary file.
-/// Unknown lengths and bodies above the spool limit keep streaming.
+fn spool_file_body(
+    file: &Arc<tempfile::NamedTempFile>,
+    length: u64,
+    trailers: Option<HeaderMap>,
+) -> Body {
+    let reopened = file.reopen().expect("spool temp file is still open");
+    SpooledBody {
+        stream: ReaderStream::new(tokio::fs::File::from_std(reopened)),
+        trailers,
+        length,
+        _permit: None,
+    }
+    .boxed()
+}
+
+/// A body that yields a buffered prefix and then continues with the rest of
+/// the original stream. Used when an unknown-length request outgrows the
+/// buffering limits.
+struct ConcatBody {
+    first: Option<Body>,
+    rest: Body,
+    _lease: Option<SpoolLease>,
+}
+
+impl HttpBody for ConcatBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.as_mut().get_mut();
+        if let Some(mut first) = this.first.take() {
+            match Pin::new(&mut first).poll_frame(cx) {
+                Poll::Ready(Some(frame)) => {
+                    this.first = Some(first);
+                    return Poll::Ready(Some(frame));
+                }
+                Poll::Ready(None) => {}
+                Poll::Pending => {
+                    this.first = Some(first);
+                    return Poll::Pending;
+                }
+            }
+        }
+        Pin::new(&mut this.rest).poll_frame(cx)
+    }
+}
+
+fn chain_body(first: Body, rest: Body, lease: Option<SpoolLease>) -> Body {
+    ConcatBody {
+        first: Some(first),
+        rest,
+        _lease: lease,
+    }
+    .boxed()
+}
+
+fn memory_body(bytes: Bytes) -> Body {
+    BodyExt::boxed(StreamBody::new(futures_util::stream::iter(vec![Ok::<
+        _,
+        BoxError,
+    >(
+        Frame::data(bytes),
+    )])))
+}
+
+/// Buffer a request body into memory or a temporary file. A body with a known
+/// length is accepted whole when it fits. An unknown-length body is buffered
+/// up to the limits; if it outgrows them, the buffered prefix is replayed and
+/// the original stream continues, so the request still works but is not
+/// retryable.
 async fn buffer_request(
     headers: &HeaderMap,
     body: Body,
@@ -4064,31 +4161,41 @@ async fn buffer_request(
     spool_limit: usize,
     budget: &Arc<SpoolBudget>,
 ) -> Result<RequestBuffer, ()> {
-    let Some(length) = headers
+    let length = headers
         .get(CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<usize>().ok())
-    else {
-        return Ok(RequestBuffer::Stream(body));
-    };
+        .and_then(|value| value.parse::<usize>().ok());
+
+    if let Some(length) = length {
+        return buffer_known_length(body, length, memory_limit, spool_limit, budget).await;
+    }
+    buffer_unknown_length(body, memory_limit, spool_limit, budget).await
+}
+
+async fn buffer_known_length(
+    body: Body,
+    length: usize,
+    memory_limit: usize,
+    spool_limit: usize,
+    budget: &Arc<SpoolBudget>,
+) -> Result<RequestBuffer, ()> {
     if length == 0 {
         return Ok(RequestBuffer::Stream(body));
     }
-
     let memory = memory_limit > 0 && length <= memory_limit;
     let spool = !memory && spool_limit > 0 && length > memory_limit && length <= spool_limit;
     if !memory && !spool {
         return Ok(RequestBuffer::Stream(body));
     }
 
-    let permit = if spool {
-        match budget.reserve(length as u64) {
-            Some(permit) => Some(permit),
-            None => return Ok(RequestBuffer::Stream(body)),
-        }
+    let lease = if spool {
+        budget.reserve(length as u64).map(SpoolLease::from_permit)
     } else {
         None
     };
+    if spool && lease.is_none() {
+        return Ok(RequestBuffer::Stream(body));
+    }
 
     let file = if spool {
         Some(Arc::new(tempfile::NamedTempFile::new().map_err(|_| ())?))
@@ -4141,7 +4248,121 @@ async fn buffer_request(
         data,
         trailers,
         length: length as u64,
-        _permit: permit,
+        _lease: lease,
+    }))
+}
+
+async fn buffer_unknown_length(
+    body: Body,
+    memory_limit: usize,
+    spool_limit: usize,
+    budget: &Arc<SpoolBudget>,
+) -> Result<RequestBuffer, ()> {
+    let total_limit = if spool_limit > 0 {
+        spool_limit
+    } else {
+        memory_limit
+    };
+    if total_limit == 0 {
+        return Ok(RequestBuffer::Stream(body));
+    }
+
+    let mut memory = Vec::new();
+    let mut spool: Option<(
+        Arc<tempfile::NamedTempFile>,
+        tokio::fs::File,
+        SpoolLease,
+        u64,
+    )> = None;
+    let mut trailers = None;
+    let mut body = body;
+
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|_| ())?;
+        let chunk = match frame.into_data() {
+            Ok(chunk) => chunk,
+            Err(frame) => {
+                if let Ok(map) = frame.into_trailers() {
+                    trailers = Some(map);
+                }
+                continue;
+            }
+        };
+
+        if spool.is_none() && (memory_limit == 0 || memory.len() + chunk.len() <= memory_limit) {
+            memory.extend_from_slice(&chunk);
+            continue;
+        }
+
+        if spool.is_none() {
+            if spool_limit == 0 || memory.len() + chunk.len() > spool_limit {
+                memory.extend_from_slice(&chunk);
+                return Ok(RequestBuffer::Stream(chain_body(
+                    memory_body(Bytes::from(memory)),
+                    body,
+                    None,
+                )));
+            }
+
+            let Some(mut lease) = SpoolLease::new(budget) else {
+                memory.extend_from_slice(&chunk);
+                return Ok(RequestBuffer::Stream(chain_body(
+                    memory_body(Bytes::from(memory)),
+                    body,
+                    None,
+                )));
+            };
+            let file = Arc::new(tempfile::NamedTempFile::new().map_err(|_| ())?);
+            let mut writer = tokio::fs::File::from_std(file.reopen().map_err(|_| ())?);
+            let existing = memory.len() as u64;
+            if !lease.grow(existing + chunk.len() as u64) {
+                memory.extend_from_slice(&chunk);
+                return Ok(RequestBuffer::Stream(chain_body(
+                    memory_body(Bytes::from(memory)),
+                    body,
+                    None,
+                )));
+            }
+            writer.write_all(&memory).await.map_err(|_| ())?;
+            writer.write_all(&chunk).await.map_err(|_| ())?;
+            memory.clear();
+            spool = Some((file, writer, lease, existing + chunk.len() as u64));
+            continue;
+        }
+
+        let (_, writer, lease, written) = spool.as_mut().expect("spool is present");
+        if *written + chunk.len() as u64 > spool_limit as u64 || !lease.grow(chunk.len() as u64) {
+            let (file, writer, lease, written) = spool.take().expect("spool is present");
+            drop(writer);
+            let prefix = spool_file_body(&file, written, None);
+            return Ok(RequestBuffer::Stream(chain_body(
+                prefix,
+                chain_body(memory_body(chunk), body, None),
+                Some(lease),
+            )));
+        }
+
+        writer.write_all(&chunk).await.map_err(|_| ())?;
+        *written = written.saturating_add(chunk.len() as u64);
+    }
+
+    if let Some((file, mut writer, lease, written)) = spool {
+        writer.flush().await.map_err(|_| ())?;
+        drop(writer);
+        return Ok(RequestBuffer::Buffered(BufferedBody {
+            data: BufferData::Spool(file),
+            trailers,
+            length: written,
+            _lease: Some(lease),
+        }));
+    }
+
+    let length = memory.len() as u64;
+    Ok(RequestBuffer::Buffered(BufferedBody {
+        data: BufferData::Memory(Bytes::from(memory)),
+        trailers,
+        length,
+        _lease: None,
     }))
 }
 

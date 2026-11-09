@@ -311,6 +311,49 @@ async fn flaky_upstream() -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
     (addr, hits)
 }
 
+/// A hyper HTTP/1.1 upstream that collects the request body and echoes it,
+/// including chunked input.
+async fn hyper_echo_upstream() -> SocketAddr {
+    use http_body_util::{BodyExt, Full};
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind hyper echo");
+    let addr = listener.local_addr().expect("hyper echo addr");
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let service = hyper::service::service_fn(
+                    |request: hyper::Request<hyper::body::Incoming>| async move {
+                        let body = request
+                            .into_body()
+                            .collect()
+                            .await
+                            .expect("request body")
+                            .to_bytes();
+                        Ok::<_, std::convert::Infallible>(
+                            hyper::Response::builder()
+                                .status(200)
+                                .header("content-length", body.len())
+                                .body(Full::new(body))
+                                .expect("response"),
+                        )
+                    },
+                );
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+
+    addr
+}
+
 /// A TCP server that echoes bytes back. Used by the CONNECT tests.
 async fn tcp_echo() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind echo");
@@ -1468,6 +1511,75 @@ upstream = "app"
     .await;
     assert_eq!(status(&response), "HTTP/1.1 502 Bad Gateway", "{response}");
     assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn buffered_chunked_put_is_retried_on_a_dead_upstream() {
+    let healthy = body_echo_upstream().await;
+    let dead = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind dead")
+        .local_addr()
+        .expect("dead addr");
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[limits]
+request_buffer_bytes = 4
+request_spool_bytes = 4096
+
+[[upstreams]]
+name = "app"
+servers = ["{dead}", "{healthy}"]
+retries = 1
+
+[[routes]]
+host = "example.com"
+upstream = "app"
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let response = roundtrip(
+        addr,
+        "PUT / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\
+         Connection: close\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&response), "HTTP/1.1 200 OK", "{response}");
+}
+
+#[tokio::test]
+async fn chunked_body_over_the_spool_limit_still_streams() {
+    let upstream = hyper_echo_upstream().await;
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[limits]
+request_buffer_bytes = 4
+request_spool_bytes = 8
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "example.com"
+upstream = "app"
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let response = roundtrip(
+        addr,
+        "PUT / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\
+         Connection: close\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&response), "HTTP/1.1 200 OK", "{response}");
+    assert!(response.ends_with("hello world"), "{response}");
 }
 
 #[tokio::test]
