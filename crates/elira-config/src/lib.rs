@@ -158,6 +158,16 @@ pub struct Limits {
     #[serde(default)]
     pub max_upstream_response_bytes: usize,
 
+    /// Buffer a request body up to this many bytes in memory before
+    /// forwarding. Zero disables request buffering.
+    #[serde(default)]
+    pub request_buffer_bytes: usize,
+
+    /// Spool a request body up to this many bytes to a temporary file so the
+    /// client connection is free while the upstream reads it.
+    #[serde(default)]
+    pub request_spool_bytes: usize,
+
     /// Buffer an upstream response up to this many bytes before sending it,
     /// so a slow client does not hold the upstream connection. Zero streams
     /// straight through.
@@ -194,6 +204,8 @@ impl Default for Limits {
             connection_drain_secs: Self::default_drain_timeout_secs(),
             shutdown_timeout_secs: Self::default_shutdown_timeout_secs(),
             response_buffer_bytes: 0,
+            request_buffer_bytes: 0,
+            request_spool_bytes: 0,
             response_spool_bytes: 0,
             spool_budget_bytes: 0,
             max_response_bytes: Self::default_max_response_bytes(),
@@ -3647,6 +3659,8 @@ listen = "127.0.0.1:8080"
 response_buffer_bytes = 1024
 response_spool_bytes = 4096
 spool_budget_bytes = 1048576
+request_buffer_bytes = 512
+request_spool_bytes = 2048
 
 [[routes]]
 host = "*"
@@ -3656,6 +3670,8 @@ root = "/srv/www"
         assert_eq!(cfg.limits.response_buffer_bytes, 1024);
         assert_eq!(cfg.limits.response_spool_bytes, 4096);
         assert_eq!(cfg.limits.spool_budget_bytes, 1_048_576);
+        assert_eq!(cfg.limits.request_buffer_bytes, 512);
+        assert_eq!(cfg.limits.request_spool_bytes, 2048);
     }
 
     #[test]

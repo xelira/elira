@@ -159,6 +159,8 @@ struct Inner {
     body_timeout: Option<Duration>,
     tunnel_idle: Option<Duration>,
     buffer_bytes: usize,
+    request_buffer_bytes: usize,
+    request_spool_bytes: usize,
     spool_bytes: usize,
     spool_budget: Arc<SpoolBudget>,
     spooled: AtomicU64,
@@ -1147,6 +1149,8 @@ impl Proxy {
                     secs => Some(Duration::from_secs(secs)),
                 },
                 buffer_bytes: cfg.limits.response_buffer_bytes,
+                request_buffer_bytes: cfg.limits.request_buffer_bytes,
+                request_spool_bytes: cfg.limits.request_spool_bytes,
                 spool_bytes: cfg.limits.response_spool_bytes,
                 spool_budget: Arc::new(SpoolBudget::new(cfg.limits.spool_budget_bytes)),
                 spooled: AtomicU64::new(0),
@@ -1619,6 +1623,34 @@ impl Proxy {
             req = req.map(|body| capped_request_body(body, body_limit, hit));
         }
 
+        let mut buffered = None;
+        if (self.inner.request_buffer_bytes > 0 || self.inner.request_spool_bytes > 0)
+            && requested_upgrade.is_none()
+        {
+            let original = std::mem::replace(req.body_mut(), empty());
+            match buffer_request(
+                req.headers(),
+                original,
+                self.inner.request_buffer_bytes,
+                self.inner.request_spool_bytes,
+                &self.inner.spool_budget,
+            )
+            .await
+            {
+                Ok(RequestBuffer::Stream(body)) => *req.body_mut() = body,
+                Ok(RequestBuffer::Buffered(body)) => {
+                    *req.body_mut() = body.body();
+                    buffered = Some(body);
+                }
+                Err(()) => {
+                    if body_limit_hit.load(Ordering::Relaxed) {
+                        return Err(self.body_too_large(entry, peer).await);
+                    }
+                    return Err(text(StatusCode::BAD_REQUEST, "request body error"));
+                }
+            }
+        }
+
         let proxy_permit = match &entry.proxy_permits {
             Some(permits) => match permits.clone().try_acquire_owned() {
                 Ok(permit) => Some(permit),
@@ -1739,20 +1771,21 @@ impl Proxy {
             path.clone()
         };
 
-        // Retries are only safe when there is nothing to replay: an
-        // idempotent method with no declared body.
-        let can_retry = pool.retries > 0
-            && !req.headers().contains_key(CONTENT_LENGTH)
-            && !req.headers().contains_key(TRANSFER_ENCODING)
-            && (req.method() == Method::GET
-                || req.method() == Method::HEAD
-                || req.method() == Method::OPTIONS);
-
         let (parts, body) = req.into_parts();
         // Kept for Vary matching: the response parts shadow this name later.
         let request_headers = parts.headers.clone();
         let hash_key = (pool.balance == Balance::Hash)
             .then(|| request_key_value(&pool.hash_key, &parts.headers, peer.ip(), &path));
+        let can_retry = pool.retries > 0
+            && match parts.method {
+                Method::GET | Method::HEAD | Method::OPTIONS => {
+                    buffered.is_some()
+                        || (!parts.headers.contains_key(CONTENT_LENGTH)
+                            && !parts.headers.contains_key(TRANSFER_ENCODING))
+                }
+                Method::PUT | Method::DELETE => buffered.is_some(),
+                _ => false,
+            };
         let mut template = HeaderMap::new();
         let drop = connection_tokens(&parts.headers);
         for (name, value) in parts.headers.iter() {
@@ -1928,10 +1961,10 @@ impl Proxy {
 
             let uri = upstream_uri(&server, &upstream_path, pool.scheme)
                 .ok_or_else(|| text(StatusCode::BAD_GATEWAY, "bad upstream address"))?;
-            let payload = if attempt == 0 {
-                body.take().unwrap_or_else(empty)
-            } else {
-                empty()
+            let payload = match &buffered {
+                Some(buffered) => buffered.body(),
+                None if attempt == 0 => body.take().unwrap_or_else(empty),
+                None => empty(),
             };
 
             let mut upstream = Request::builder()
@@ -3788,7 +3821,7 @@ async fn spool_body(
         stream: ReaderStream::new(file),
         trailers,
         length: expected as u64,
-        _permit: permit,
+        _permit: Some(permit),
     }
     .boxed())
 }
@@ -3797,7 +3830,7 @@ struct SpooledBody {
     stream: ReaderStream<tokio::fs::File>,
     trailers: Option<HeaderMap>,
     length: u64,
-    _permit: SpoolPermit,
+    _permit: Option<SpoolPermit>,
 }
 
 impl HttpBody for SpooledBody {
@@ -3848,6 +3881,138 @@ impl HttpBody for PermitBody {
     fn size_hint(&self) -> SizeHint {
         self.inner.size_hint()
     }
+}
+
+enum RequestBuffer {
+    Stream(Body),
+    Buffered(BufferedBody),
+}
+
+enum BufferData {
+    Memory(Bytes),
+    Spool(Arc<tempfile::NamedTempFile>),
+}
+
+struct BufferedBody {
+    data: BufferData,
+    trailers: Option<HeaderMap>,
+    length: u64,
+    _permit: Option<SpoolPermit>,
+}
+
+impl BufferedBody {
+    fn body(&self) -> Body {
+        match &self.data {
+            BufferData::Memory(bytes) => {
+                let mut frames: Vec<Result<Frame<Bytes>, BoxError>> =
+                    vec![Ok(Frame::data(bytes.clone()))];
+                if let Some(trailers) = &self.trailers {
+                    frames.push(Ok(Frame::trailers(trailers.clone())));
+                }
+                BodyExt::boxed(StreamBody::new(futures_util::stream::iter(frames)))
+            }
+            BufferData::Spool(file) => {
+                let reopened = file.reopen().expect("spool temp file is still open");
+                SpooledBody {
+                    stream: ReaderStream::new(tokio::fs::File::from_std(reopened)),
+                    trailers: self.trailers.clone(),
+                    length: self.length,
+                    _permit: None,
+                }
+                .boxed()
+            }
+        }
+    }
+}
+
+/// Buffer a request body with a known length into memory or a temporary file.
+/// Unknown lengths and bodies above the spool limit keep streaming.
+async fn buffer_request(
+    headers: &HeaderMap,
+    body: Body,
+    memory_limit: usize,
+    spool_limit: usize,
+    budget: &Arc<SpoolBudget>,
+) -> Result<RequestBuffer, ()> {
+    let Some(length) = headers
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+    else {
+        return Ok(RequestBuffer::Stream(body));
+    };
+    if length == 0 {
+        return Ok(RequestBuffer::Stream(body));
+    }
+
+    let memory = memory_limit > 0 && length <= memory_limit;
+    let spool = !memory && spool_limit > 0 && length > memory_limit && length <= spool_limit;
+    if !memory && !spool {
+        return Ok(RequestBuffer::Stream(body));
+    }
+
+    let permit = if spool {
+        match budget.reserve(length as u64) {
+            Some(permit) => Some(permit),
+            None => return Ok(RequestBuffer::Stream(body)),
+        }
+    } else {
+        None
+    };
+
+    let file = if spool {
+        Some(Arc::new(tempfile::NamedTempFile::new().map_err(|_| ())?))
+    } else {
+        None
+    };
+    let mut writer = match &file {
+        Some(file) => Some(tokio::fs::File::from_std(file.reopen().map_err(|_| ())?)),
+        None => None,
+    };
+
+    let mut data = Vec::with_capacity(if memory { length } else { 0 });
+    let mut trailers = None;
+    let mut seen = 0usize;
+    let mut body = body;
+
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|_| ())?;
+        match frame.into_data() {
+            Ok(chunk) => {
+                seen = seen.saturating_add(chunk.len());
+                if seen > length {
+                    return Err(());
+                }
+                match &mut writer {
+                    Some(file) => file.write_all(&chunk).await.map_err(|_| ())?,
+                    None => data.extend_from_slice(&chunk),
+                }
+            }
+            Err(frame) => {
+                if let Ok(map) = frame.into_trailers() {
+                    trailers = Some(map);
+                }
+            }
+        }
+    }
+
+    if seen != length {
+        return Err(());
+    }
+    if let Some(mut writer) = writer {
+        writer.flush().await.map_err(|_| ())?;
+    }
+
+    let data = match file {
+        Some(file) => BufferData::Spool(file),
+        None => BufferData::Memory(Bytes::from(data)),
+    };
+    Ok(RequestBuffer::Buffered(BufferedBody {
+        data,
+        trailers,
+        length: length as u64,
+        _permit: permit,
+    }))
 }
 
 fn capped_body(body: Body, limit: usize) -> Body {

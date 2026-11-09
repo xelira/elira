@@ -203,7 +203,8 @@ Upstreams:
   Authorization or URI, with per-server weights for round robin and least
   connections; active health checks with configurable method, expected status
   and Host, passive ejection
-  after repeated transport failures, retries for bodyless idempotent requests
+  after repeated transport failures, retries for idempotent requests,
+  including buffered `PUT`/`DELETE` bodies
 - streaming FastCGI over TCP (including DNS names) or unix sockets with an
   idle connection pool, streaming CGI scripts, and native `.so` modules
   (in-process or in a child runner) and sandboxed WebAssembly modules

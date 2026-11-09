@@ -206,6 +206,63 @@ async fn slow_upstream(delay: Duration) -> SocketAddr {
     addr
 }
 
+/// An HTTP upstream that reads the declared request body and echoes it.
+async fn body_echo_upstream() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind body echo");
+    let addr = listener.local_addr().expect("body echo addr");
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buffer = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let head_end = loop {
+                    let Ok(read) = stream.read(&mut chunk).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        return;
+                    }
+                    buffer.extend_from_slice(&chunk[..read]);
+                    if let Some(index) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break index + 4;
+                    }
+                };
+                let head = String::from_utf8_lossy(&buffer[..head_end]).to_ascii_lowercase();
+                let length: usize = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|value| value.trim().parse().ok())
+                    .unwrap_or(0);
+                let mut body = buffer[head_end..].to_vec();
+                while body.len() < length {
+                    let Ok(read) = stream.read(&mut chunk).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        return;
+                    }
+                    body.extend_from_slice(&chunk[..read]);
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.write_all(&body).await;
+            });
+        }
+    });
+
+    addr
+}
+
 /// A TCP server that echoes bytes back. Used by the CONNECT tests.
 async fn tcp_echo() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind echo");
@@ -1190,6 +1247,44 @@ max_concurrent = 1
     let first = first.await.expect("first request");
     assert_eq!(status(&first), "HTTP/1.1 200 OK", "{first}");
     assert!(first.ends_with("slow"), "{first}");
+}
+
+#[tokio::test]
+async fn buffered_put_is_retried_on_a_dead_upstream() {
+    let healthy = body_echo_upstream().await;
+    let dead = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind dead")
+        .local_addr()
+        .expect("dead addr");
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[limits]
+request_buffer_bytes = 4
+request_spool_bytes = 4096
+
+[[upstreams]]
+name = "app"
+servers = ["{dead}", "{healthy}"]
+retries = 1
+
+[[routes]]
+host = "example.com"
+upstream = "app"
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let response = roundtrip(
+        addr,
+        "PUT / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 11\r\n\
+         Connection: close\r\n\r\nhello world",
+    )
+    .await;
+    assert_eq!(status(&response), "HTTP/1.1 200 OK", "{response}");
+    assert!(response.ends_with("hello world"), "{response}");
 }
 
 #[tokio::test]
