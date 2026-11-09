@@ -1,4 +1,3 @@
-
 use super::*;
 
 const MINIMAL: &str = r#"
