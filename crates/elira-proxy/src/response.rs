@@ -1,11 +1,15 @@
 //! Response finalisation: route headers, fixed returns and error pages.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
-use http::header::{ALT_SVC, CONTENT_TYPE, SERVER, WWW_AUTHENTICATE};
-use http::{HeaderValue, Method, Request, Response, StatusCode};
+use http::header::{ALT_SVC, CONTENT_LENGTH, CONTENT_TYPE, SERVER, WWW_AUTHENTICATE};
+use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
+
+use elira_cache::Cache;
 
 use crate::*;
 
@@ -172,5 +176,107 @@ impl Proxy {
         if let Some(alt) = &self.inner.alt_svc {
             headers.insert(ALT_SVC, alt.clone());
         }
+    }
+
+    /// Fetch a fresh copy in the background after serving a stale entry.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn refresh(
+        &self,
+        cache: Arc<Cache>,
+        key: String,
+        headers: HeaderMap,
+        request_headers: HeaderMap,
+        validators: HeaderMap,
+        path: String,
+        pool: Arc<Pool>,
+        timeout: Duration,
+        cache_ttl: Option<Duration>,
+    ) {
+        {
+            let mut refreshing = self
+                .inner
+                .refreshing
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !refreshing.insert(key.clone()) {
+                return;
+            }
+        }
+
+        let inflight = self.inner.refreshing.clone();
+        let max_item = self.inner.cache_max_item;
+        tokio::spawn(async move {
+            let index = pool.pick();
+            let server = pool.servers[index].clone();
+            let _active = pool.enter(index);
+            let uri = match upstream_uri(&server, &path, pool.scheme) {
+                Some(uri) => uri,
+                None => {
+                    inflight
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(&key);
+                    return;
+                }
+            };
+
+            let fetched = async {
+                let mut request = Request::builder()
+                    .method(Method::GET)
+                    .uri(uri)
+                    .body(empty())
+                    .ok()?;
+                *request.headers_mut() = headers;
+                // Ask the upstream to confirm the stored representation.
+                for (name, value) in &validators {
+                    request.headers_mut().insert(name, value.clone());
+                }
+                let response = send_request(&pool, &server, request, timeout).await.ok()?;
+                if response.status() == StatusCode::NOT_MODIFIED {
+                    return Some((StatusCode::NOT_MODIFIED, HeaderMap::new(), Bytes::new()));
+                }
+                if response.status() != StatusCode::OK {
+                    return None;
+                }
+                let length = response
+                    .headers()
+                    .get(CONTENT_LENGTH)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<usize>().ok())?;
+                if length > max_item {
+                    return None;
+                }
+                let response_headers = response.headers().clone();
+                let body = BodyExt::collect(response.into_body())
+                    .await
+                    .ok()?
+                    .to_bytes();
+                Some((StatusCode::OK, response_headers, body))
+            }
+            .await;
+
+            match fetched {
+                Some((StatusCode::NOT_MODIFIED, _, _)) => {
+                    cache.revalidate(&key, &request_headers, Instant::now());
+                }
+                Some((_, response_headers, body)) => {
+                    cache.insert_with_ttl(
+                        &key,
+                        &request_headers,
+                        &response_headers,
+                        StatusCode::OK.as_u16(),
+                        body.to_vec(),
+                        Instant::now(),
+                        cache_ttl,
+                    );
+                }
+                None => {}
+            }
+
+            inflight
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&key);
+        });
     }
 }

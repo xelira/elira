@@ -5,15 +5,19 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use std::time::{Duration, Instant};
 
 use http::uri::Authority;
+use http::{Request, Response};
+use http_body_util::BodyExt;
 use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
+use hyper_util::rt::TokioIo;
+use tokio::net::UnixStream;
 
 use elira_config::Balance;
 use elira_upstream::TlsOptions;
 
 use crate::variables::RequestKey;
-use crate::Body;
+use crate::{Body, BoxError};
 
 /// A configured backend: TCP authority or a filesystem unix socket.
 #[derive(Clone, Debug)]
@@ -305,4 +309,62 @@ pub(crate) fn rendezvous(key: &str, server: &str) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
+}
+
+/// Why one upstream attempt failed.
+pub(crate) enum SendError {
+    Timeout,
+    Failed(String),
+}
+
+pub(crate) async fn send_request(
+    pool: &Pool,
+    server: &ServerAddr,
+    request: Request<Body>,
+    timeout: Duration,
+) -> Result<Response<Body>, SendError> {
+    let Some(path) = server.unix() else {
+        if let Some(h3) = &pool.h3 {
+            let uri = request.uri().clone();
+            let result = tokio::time::timeout(timeout, h3.request(uri, request)).await;
+            return match result {
+                Ok(Ok(response)) => Ok(response),
+                Ok(Err(err)) => Err(SendError::Failed(err.to_string())),
+                Err(_) => Err(SendError::Timeout),
+            };
+        }
+        if let Some(h2) = &pool.h2 {
+            let uri = request.uri().clone();
+            let result = tokio::time::timeout(timeout, h2.request(uri, request)).await;
+            return match result {
+                Ok(Ok(response)) => Ok(response),
+                Ok(Err(err)) => Err(SendError::Failed(err.to_string())),
+                Err(_) => Err(SendError::Timeout),
+            };
+        }
+        return match tokio::time::timeout(timeout, pool.client.request(request)).await {
+            Ok(Ok(response)) => Ok(response
+                .map(|body| BodyExt::map_err(body, |err| -> BoxError { Box::new(err) }).boxed())),
+            Ok(Err(err)) => Err(SendError::Failed(err.to_string())),
+            Err(_) => Err(SendError::Timeout),
+        };
+    };
+
+    let work = async {
+        let stream = UnixStream::connect(path).await?;
+        let (mut sender, connection) =
+            hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let response = sender.send_request(request).await?;
+        Ok::<_, BoxError>(response)
+    };
+
+    match tokio::time::timeout(timeout, work).await {
+        Ok(Ok(response)) => Ok(response
+            .map(|body| BodyExt::map_err(body, |err| -> BoxError { Box::new(err) }).boxed())),
+        Ok(Err(err)) => Err(SendError::Failed(err.to_string())),
+        Err(_) => Err(SendError::Timeout),
+    }
 }

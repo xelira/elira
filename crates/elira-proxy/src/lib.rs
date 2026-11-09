@@ -22,8 +22,6 @@ use http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::rt::TokioIo;
-use tokio::net::UnixStream;
 use tokio::sync::Semaphore;
 
 use elira_auth::{BasicAuth, IpAcl};
@@ -1412,108 +1410,6 @@ impl Proxy {
         self.apply_route(&mut response, entry, &vars, &request_id);
         Ok(response)
     }
-
-    /// Fetch a fresh copy in the background after serving a stale entry.
-    #[allow(clippy::too_many_arguments)]
-    fn refresh(
-        &self,
-        cache: Arc<Cache>,
-        key: String,
-        headers: HeaderMap,
-        request_headers: HeaderMap,
-        validators: HeaderMap,
-        path: String,
-        pool: Arc<Pool>,
-        timeout: Duration,
-        cache_ttl: Option<Duration>,
-    ) {
-        {
-            let mut refreshing = self
-                .inner
-                .refreshing
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if !refreshing.insert(key.clone()) {
-                return;
-            }
-        }
-
-        let inflight = self.inner.refreshing.clone();
-        let max_item = self.inner.cache_max_item;
-        tokio::spawn(async move {
-            let index = pool.pick();
-            let server = pool.servers[index].clone();
-            let _active = pool.enter(index);
-            let uri = match upstream_uri(&server, &path, pool.scheme) {
-                Some(uri) => uri,
-                None => {
-                    inflight
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .remove(&key);
-                    return;
-                }
-            };
-
-            let fetched = async {
-                let mut request = Request::builder()
-                    .method(Method::GET)
-                    .uri(uri)
-                    .body(empty())
-                    .ok()?;
-                *request.headers_mut() = headers;
-                // Ask the upstream to confirm the stored representation.
-                for (name, value) in &validators {
-                    request.headers_mut().insert(name, value.clone());
-                }
-                let response = send_request(&pool, &server, request, timeout).await.ok()?;
-                if response.status() == StatusCode::NOT_MODIFIED {
-                    return Some((StatusCode::NOT_MODIFIED, HeaderMap::new(), Bytes::new()));
-                }
-                if response.status() != StatusCode::OK {
-                    return None;
-                }
-                let length = response
-                    .headers()
-                    .get(CONTENT_LENGTH)
-                    .and_then(|value| value.to_str().ok())
-                    .and_then(|value| value.parse::<usize>().ok())?;
-                if length > max_item {
-                    return None;
-                }
-                let response_headers = response.headers().clone();
-                let body = BodyExt::collect(response.into_body())
-                    .await
-                    .ok()?
-                    .to_bytes();
-                Some((StatusCode::OK, response_headers, body))
-            }
-            .await;
-
-            match fetched {
-                Some((StatusCode::NOT_MODIFIED, _, _)) => {
-                    cache.revalidate(&key, &request_headers, Instant::now());
-                }
-                Some((_, response_headers, body)) => {
-                    cache.insert_with_ttl(
-                        &key,
-                        &request_headers,
-                        &response_headers,
-                        StatusCode::OK.as_u16(),
-                        body.to_vec(),
-                        Instant::now(),
-                        cache_ttl,
-                    );
-                }
-                None => {}
-            }
-
-            inflight
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .remove(&key);
-        });
-    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1538,65 +1434,6 @@ pub enum Error {
 
     #[error("route for \"{host}\": {reason}")]
     RouteConfig { host: String, reason: String },
-}
-
-/// Transport used by the raw upgrade path. Both variants behave the same for
-/// the handshake and the tunnel.
-enum SendError {
-    Timeout,
-    Failed(String),
-}
-
-async fn send_request(
-    pool: &Pool,
-    server: &ServerAddr,
-    request: Request<Body>,
-    timeout: Duration,
-) -> Result<Response<Body>, SendError> {
-    let Some(path) = server.unix() else {
-        if let Some(h3) = &pool.h3 {
-            let uri = request.uri().clone();
-            let result = tokio::time::timeout(timeout, h3.request(uri, request)).await;
-            return match result {
-                Ok(Ok(response)) => Ok(response),
-                Ok(Err(err)) => Err(SendError::Failed(err.to_string())),
-                Err(_) => Err(SendError::Timeout),
-            };
-        }
-        if let Some(h2) = &pool.h2 {
-            let uri = request.uri().clone();
-            let result = tokio::time::timeout(timeout, h2.request(uri, request)).await;
-            return match result {
-                Ok(Ok(response)) => Ok(response),
-                Ok(Err(err)) => Err(SendError::Failed(err.to_string())),
-                Err(_) => Err(SendError::Timeout),
-            };
-        }
-        return match tokio::time::timeout(timeout, pool.client.request(request)).await {
-            Ok(Ok(response)) => Ok(response
-                .map(|body| BodyExt::map_err(body, |err| -> BoxError { Box::new(err) }).boxed())),
-            Ok(Err(err)) => Err(SendError::Failed(err.to_string())),
-            Err(_) => Err(SendError::Timeout),
-        };
-    };
-
-    let work = async {
-        let stream = UnixStream::connect(path).await?;
-        let (mut sender, connection) =
-            hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
-        let response = sender.send_request(request).await?;
-        Ok::<_, BoxError>(response)
-    };
-
-    match tokio::time::timeout(timeout, work).await {
-        Ok(Ok(response)) => Ok(response
-            .map(|body| BodyExt::map_err(body, |err| -> BoxError { Box::new(err) }).boxed())),
-        Ok(Err(err)) => Err(SendError::Failed(err.to_string())),
-        Err(_) => Err(SendError::Timeout),
-    }
 }
 
 #[cfg(test)]
