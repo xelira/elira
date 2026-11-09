@@ -4167,6 +4167,14 @@ async fn buffer_request(
         .and_then(|value| value.parse::<usize>().ok());
 
     if let Some(length) = length {
+        let total_limit = if spool_limit > 0 {
+            spool_limit
+        } else {
+            memory_limit
+        };
+        if total_limit > 0 && length > total_limit {
+            return buffer_unknown_length(body, memory_limit, spool_limit, budget).await;
+        }
         return buffer_known_length(body, length, memory_limit, spool_limit, budget).await;
     }
     buffer_unknown_length(body, memory_limit, spool_limit, budget).await

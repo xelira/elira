@@ -55,6 +55,7 @@ Living list for the self-improvement loop. One item per session.
 - [x] `retry_on` policy for transport errors, timeouts and 5xx responses.
 - [x] Unix socket mode and numeric owner configuration.
 - [x] Buffering for chunked request bodies with a replayed prefix on overflow.
+- [x] Prefix replay for known-length bodies above the spool limit.
 - [x] Per-route FastCGI pool size.
 - [x] Purge tests through the admin listener in both single and worker mode.
 - [x] Per-route cache enable/TTL overrides.

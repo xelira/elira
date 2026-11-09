@@ -1583,6 +1583,38 @@ upstream = "app"
 }
 
 #[tokio::test]
+async fn known_body_over_the_spool_limit_still_streams() {
+    let upstream = hyper_echo_upstream().await;
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[limits]
+request_buffer_bytes = 4
+request_spool_bytes = 8
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "example.com"
+upstream = "app"
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let response = roundtrip(
+        addr,
+        "PUT / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 11\r\n\
+         Connection: close\r\n\r\nhello world",
+    )
+    .await;
+    assert_eq!(status(&response), "HTTP/1.1 200 OK", "{response}");
+    assert!(response.ends_with("hello world"), "{response}");
+}
+
+#[tokio::test]
 async fn retries_a_dead_upstream_for_get() {
     let upstream = upstream().await;
     let config = format!(
