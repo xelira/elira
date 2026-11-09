@@ -307,6 +307,17 @@ The listener has no TLS. Put it on loopback or set `auth_file`.
 - `crates/elira-acme` — TLS-ALPN-01 certificate state machine
 - `crates/elira-migrate` — nginx config to TOML
 
+## Development artifacts
+
+`target/debug` can grow past tens of gigabytes because of debug info and
+incremental state. The workspace disables both for `dev` and `test`. To trim an
+existing tree:
+
+```
+make prune-target             # remove debug artifacts above 20 GiB
+make prune-target LIMIT_GB=8  # or another limit
+```
+
 ## Tests and benchmarks
 
 ```

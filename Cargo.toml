@@ -61,3 +61,13 @@ ipnet = "2"
 socket2 = { version = "0.5", features = ["all"] }
 libc = "0.2"
 async-compression = { version = "0.4", features = ["tokio", "gzip", "brotli"] }
+
+[profile.dev]
+# Build artifacts are not shipped; debug info and incremental state are the
+# bulk of target/debug. Keep them off so a workspace build stays bounded.
+debug = 0
+incremental = false
+
+[profile.test]
+debug = 0
+incremental = false

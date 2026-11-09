@@ -5,7 +5,7 @@ URL ?= http://127.0.0.1:8080/
 FUZZ_TARGET ?= config
 FUZZ_TIME ?= 60
 
-.PHONY: build fmt lint test check config-check audit deny fuzz load bench next-task run docker
+.PHONY: build fmt lint test check config-check audit deny fuzz load bench next-task prune-target run docker
 
 build:
 	$(CARGO) build --workspace --locked
@@ -48,6 +48,9 @@ bench:
 
 next-task:
 	./scripts/backlog.sh
+
+prune-target:
+	./scripts/prune-target.sh $(LIMIT_GB)
 
 run:
 	$(CARGO) run -p elira -- run --config $(CONFIG)
