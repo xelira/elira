@@ -548,6 +548,14 @@ async fn reload(
     tracing::info!("config reloaded");
 }
 
+fn update_config_json(target: &std::sync::Mutex<String>, config: &Config) {
+    if let Ok(json) = serde_json::to_string_pretty(config) {
+        *target
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = json;
+    }
+}
+
 struct WorkerSlot {
     pid: u32,
     ready: PathBuf,
@@ -575,6 +583,10 @@ async fn supervise(config: PathBuf, workers: usize) -> anyhow::Result<()> {
     // metrics listener in multi-process mode.
     let mut metrics_socket = None;
     let mut gauge_state: Option<(Arc<Metrics>, WorkerGauges)> = None;
+    let config_json = Arc::new(std::sync::Mutex::new(
+        serde_json::to_string_pretty(&cfg)
+            .unwrap_or_else(|_| "{\"error\":\"config unavailable\"}".to_owned()),
+    ));
     if let Some(metrics_cfg) = cfg.metrics.as_ref() {
         let listener = server::bind_tcp(metrics_cfg.listen, cfg.reuse_port)
             .with_context(|| format!("cannot bind metrics on {}", metrics_cfg.listen))?;
@@ -599,7 +611,14 @@ async fn supervise(config: PathBuf, workers: usize) -> anyhow::Result<()> {
             Some(path) => Some(Arc::new(elira_auth::BasicAuth::from_file(path)?)),
             None => None,
         };
-        server::spawn_metrics_aggregate(listener, aggregate, statuses, auth, admin_tx.clone());
+        server::spawn_metrics_aggregate(
+            listener,
+            aggregate,
+            statuses,
+            config_json.clone(),
+            auth,
+            admin_tx.clone(),
+        );
         metrics_socket = Some(path);
     }
     if let Some(path) = &metrics_socket {
@@ -658,6 +677,9 @@ async fn supervise(config: PathBuf, workers: usize) -> anyhow::Result<()> {
             Some(command) = admin_rx.recv() => match command {
                 server::AdminCommand::Drain => break,
                 server::AdminCommand::Reload => {
+                    if let Ok(next) = Config::load(&config) {
+                        update_config_json(&config_json, &next);
+                    }
                     for slot in &slots {
                         kill(slot.pid, libc::SIGHUP);
                     }
@@ -684,28 +706,29 @@ async fn supervise(config: PathBuf, workers: usize) -> anyhow::Result<()> {
                     kill(slot.pid, libc::SIGHUP);
                 }
                 match Config::load(&config) {
-                    Ok(next) if next.workers > slots.len() => {
-                        let extra = next.workers - slots.len();
-                        for _ in 0..extra {
-                            let index = slots.len();
-                            let slot = spawn_worker(index, &config)?;
-                            watch_worker(index, &slot, exit_tx.clone());
-                            pids
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .push(slot.pid);
-                            slots.push(slot);
-                            wait_worker_ready(&slots[index]).await?;
-                            tracing::info!(worker = index, "added a worker on reload");
+                    Ok(next) => {
+                        update_config_json(&config_json, &next);
+                        if next.workers > slots.len() {
+                            let extra = next.workers - slots.len();
+                            for _ in 0..extra {
+                                let index = slots.len();
+                                let slot = spawn_worker(index, &config)?;
+                                watch_worker(index, &slot, exit_tx.clone());
+                                pids
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .push(slot.pid);
+                                slots.push(slot);
+                                wait_worker_ready(&slots[index]).await?;
+                                tracing::info!(worker = index, "added a worker on reload");
+                            }
+                        } else if next.workers < slots.len() {
+                            tracing::warn!(
+                                "reducing worker count needs a restart; keeping {} workers",
+                                slots.len()
+                            );
                         }
                     }
-                    Ok(next) if next.workers < slots.len() => {
-                        tracing::warn!(
-                            "reducing worker count needs a restart; keeping {} workers",
-                            slots.len()
-                        );
-                    }
-                    Ok(_) => {}
                     Err(err) => {
                         tracing::error!(error = %err, "cannot read the config for worker scaling");
                     }

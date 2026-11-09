@@ -243,7 +243,7 @@ Cache:
 
 Ops:
 
-- Prometheus metrics plus JSON `/status` on the admin listener
+- Prometheus metrics plus JSON `/status` and `/config` on the admin listener
 - `POST /reload`, `POST /drain`, `POST /cache/purge`, optional Basic auth
 - text or JSON access log with request id, file rotation, nginx-like templates
   and syslog
@@ -265,6 +265,7 @@ With `[metrics]` set:
 | --- | --- |
 | `GET /metrics` | Prometheus text |
 | `GET /status` | upstreams, servers, health, active requests, cache stats |
+| `GET /config` | effective configuration as JSON |
 | `POST /reload` | same as SIGHUP |
 | `POST /drain` | graceful shutdown |
 | `POST /cache/purge` | drop cached responses |
@@ -289,7 +290,8 @@ The listener has no TLS. Put it on loopback or set `auth_file`.
 - `workers` and listener changes need a restart. SIGHUP reloads routes in every
   worker; SIGUSR2 rolls the workers one by one. Increasing `workers` on SIGHUP
   adds processes, decreasing needs a restart. In worker mode `/metrics` and
-  `/status` are aggregated by the supervisor; `POST /reload` and `/drain` are
+  `/status` are aggregated by the supervisor, and `/config` shows the snapshot
+  it last reloaded; `POST /reload` and `/drain` are
   handled there; `/cache/purge?prefix=` is broadcast to workers.
 - DNS resolution uses the system resolver. `dns_ttl_secs` bounds how long a
   pooled connection may outlive a DNS change.

@@ -8,10 +8,10 @@ use std::path::{Path, PathBuf};
 
 use http::header::{HeaderName, HeaderValue};
 use http::uri::Authority;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub listen: SocketAddr,
@@ -75,7 +75,7 @@ pub struct Config {
     pub routes: Vec<Route>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Limits {
     /// Maximum number of request headers. Guards against header-count floods.
@@ -237,7 +237,7 @@ impl Limits {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Health {
     #[serde(default)]
@@ -278,7 +278,7 @@ impl Health {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Compression {
     #[serde(default = "Compression::default_enabled")]
@@ -308,7 +308,7 @@ impl Compression {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Connect {
     /// Off by default: an open CONNECT proxy is an SSRF pivot, and a reverse
@@ -320,7 +320,7 @@ pub struct Connect {
     pub allow: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MetricsConfig {
     /// Bind loopback here unless you really mean to expose the counters.
@@ -331,7 +331,7 @@ pub struct MetricsConfig {
     pub auth_file: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Http3 {
     pub listen: SocketAddr,
@@ -370,7 +370,7 @@ impl Http3 {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Upstream {
     pub name: String,
@@ -424,7 +424,7 @@ pub struct Upstream {
     pub dns_ttl_secs: Option<u64>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Acme {
     pub domains: Vec<String>,
@@ -458,7 +458,7 @@ pub struct Acme {
     pub dns_propagation_secs: u64,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AcmeChallenge {
     #[default]
@@ -475,7 +475,7 @@ impl Acme {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpstreamTls {
     /// Skip certificate and hostname verification. Only for internal setups.
@@ -493,7 +493,7 @@ pub struct UpstreamTls {
     pub min_version: TlsVersion,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Balance {
     #[default]
@@ -501,7 +501,7 @@ pub enum Balance {
     LeastConn,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Route {
     /// Host to match, case-insensitive. `*` catches everything else, and
@@ -694,7 +694,7 @@ impl Route {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Redirect {
     pub to: String,
@@ -708,7 +708,7 @@ impl Redirect {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Cache {
     #[serde(default)]
@@ -763,7 +763,7 @@ impl Cache {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Tls {
     /// Empty when omitted; `validate` names the missing field instead of
@@ -822,7 +822,7 @@ pub struct Tls {
 }
 
 /// A certificate and the names it should answer for.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerCert {
     pub cert: PathBuf,
@@ -851,7 +851,7 @@ impl Tls {
 }
 
 /// Client certificate policy for the TLS listener.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClientAuthMode {
     #[default]
@@ -860,7 +860,7 @@ pub enum ClientAuthMode {
     Required,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TlsVersion {
     #[default]
@@ -868,7 +868,7 @@ pub enum TlsVersion {
     Tls13,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Log {
     #[serde(default)]
@@ -927,7 +927,8 @@ impl Log {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum LogFormat {
     #[default]
     Text,

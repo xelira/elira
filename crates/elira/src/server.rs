@@ -30,6 +30,7 @@ use crate::proxy::{BoxError, Proxy};
 pub struct Runtime {
     proxy: Proxy,
     tls: Option<Arc<rustls::ServerConfig>>,
+    config: Config,
     log: LogFormat,
     health: Health,
     http3: Option<Http3>,
@@ -84,6 +85,7 @@ impl Runtime {
         Ok(Self {
             proxy: Proxy::new(cfg)?,
             tls,
+            config: cfg.clone(),
             log: cfg.log.format,
             health: cfg.health.clone(),
             http3: cfg.http3.clone(),
@@ -119,6 +121,10 @@ impl Runtime {
 
     pub fn log(&self) -> LogFormat {
         self.log
+    }
+
+    pub fn config(&self) -> &Config {
+        &self.config
     }
 
     pub fn health(&self) -> &Health {
@@ -814,6 +820,7 @@ pub fn spawn_metrics_aggregate(
     listener: TcpListener,
     metrics: Arc<Metrics>,
     statuses: Arc<std::sync::Mutex<std::collections::HashMap<usize, String>>>,
+    config_json: Arc<std::sync::Mutex<String>>,
     auth: Option<Arc<elira_auth::BasicAuth>>,
     control: tokio::sync::mpsc::Sender<AdminCommand>,
 ) {
@@ -824,12 +831,14 @@ pub fn spawn_metrics_aggregate(
             };
             let metrics = metrics.clone();
             let statuses = statuses.clone();
+            let config_json = config_json.clone();
             let auth = auth.clone();
             let control = control.clone();
             tokio::spawn(async move {
                 let service = service_fn(move |req: hyper::Request<Incoming>| {
                     let metrics = metrics.clone();
                     let statuses = statuses.clone();
+                    let config_json = config_json.clone();
                     let auth = auth.clone();
                     let control = control.clone();
                     async move {
@@ -859,6 +868,13 @@ pub fn spawn_metrics_aggregate(
                                 "text/plain; version=0.0.4; charset=utf-8",
                                 metrics.render(),
                             ),
+                            (&hyper::Method::GET, "/config") => {
+                                let body = config_json
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .clone();
+                                json(hyper::StatusCode::OK, &body)
+                            }
                             (&hyper::Method::POST, "/reload") => {
                                 let _ = control.try_send(AdminCommand::Reload);
                                 json(hyper::StatusCode::ACCEPTED, "{\"reload\":\"queued\"}")
@@ -977,6 +993,9 @@ pub fn spawn_metrics(
                                         "application/json",
                                         runtime.load().proxy().status().to_string(),
                                     ),
+                                    (&hyper::Method::GET, "/config") => {
+                                        config_response(runtime.load().config())
+                                    }
                                     (&hyper::Method::POST, "/reload") => {
                                         let _ = reload.send(rand_counter());
                                         json(hyper::StatusCode::ACCEPTED, "{\"reload\":\"queued\"}")
@@ -1040,6 +1059,19 @@ fn json(
     body: &str,
 ) -> hyper::Response<http_body_util::Full<hyper::body::Bytes>> {
     text_response(status, "application/json", body.to_owned())
+}
+
+fn config_response(config: &Config) -> hyper::Response<http_body_util::Full<hyper::body::Bytes>> {
+    match serde_json::to_string_pretty(config) {
+        Ok(body) => json(hyper::StatusCode::OK, &body),
+        Err(err) => {
+            tracing::error!(%err, "cannot serialize the effective config");
+            json(
+                hyper::StatusCode::INTERNAL_SERVER_ERROR,
+                "{\"error\":\"config unavailable\"}",
+            )
+        }
+    }
 }
 
 /// The reload channel counts signal deliveries; the value itself is not used.

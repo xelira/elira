@@ -554,6 +554,16 @@ async fn metrics_listener_reports_requests() {
     .await;
     assert!(status.contains("application/json"), "{status}");
     assert!(status.contains("\"upstreams\""), "{status}");
+
+    let config = roundtrip(
+        metrics_addr,
+        "GET /config HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(config.contains("application/json"), "{config}");
+    assert!(config.contains("\"listen\""), "{config}");
+    assert!(config.contains("\"upstreams\""), "{config}");
+    assert!(config.contains("\"routes\""), "{config}");
 }
 
 #[tokio::test]
