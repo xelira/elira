@@ -648,6 +648,7 @@ dependencies = [
  "elira-tls",
  "elira-upstream",
  "elira-wasm",
+ "futures-util",
  "http",
  "http-body",
  "http-body-util",

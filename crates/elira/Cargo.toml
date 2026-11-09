@@ -41,6 +41,7 @@ tracing-subscriber = { workspace = true }
 [dev-dependencies]
 bcrypt = "0.17"
 base64 = "0.22"
+futures-util = { workspace = true }
 quinn = { workspace = true }
 elira-upstream = { path = "../elira-upstream" }
 elira-wasm = { path = "../elira-wasm" }
