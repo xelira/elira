@@ -3613,6 +3613,75 @@ root = "{}"
 }
 
 #[tokio::test]
+async fn routes_can_be_scoped_to_one_listener() {
+    let root = temp_root("scoped-listener");
+    std::fs::write(root.join("index.html"), "scoped").unwrap();
+
+    let first = TcpListener::bind("127.0.0.1:0").await.expect("bind first");
+    let first_addr = first.local_addr().expect("first addr");
+    let second = TcpListener::bind("127.0.0.1:0").await.expect("bind second");
+    let second_addr = second.local_addr().expect("second addr");
+
+    let cfg = Config::parse(&format!(
+        r#"
+listen = "{first_addr}"
+
+[[listeners]]
+listen = "{second_addr}"
+name = "second"
+
+[[routes]]
+host = "*"
+listeners = ["second"]
+root = "{}"
+"#,
+        root.display()
+    ))
+    .expect("config");
+    let runtime = Arc::new(ArcSwap::from_pointee(
+        Runtime::build(&cfg).expect("runtime"),
+    ));
+    let metrics = Arc::new(Metrics::new());
+    let (stop_tx, stop_rx) = watch::channel(false);
+
+    let first_task = tokio::spawn(server::serve(
+        first,
+        runtime.clone(),
+        Options::from_config(&cfg),
+        metrics.clone(),
+        stop_rx.clone(),
+    ));
+    let mut second_options = Options::from_config(&cfg);
+    second_options.name = "second".to_owned();
+    let second_task = tokio::spawn(server::serve(
+        second,
+        runtime,
+        second_options,
+        metrics,
+        stop_rx,
+    ));
+
+    let denied = roundtrip(
+        first_addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&denied), "HTTP/1.1 404 Not Found", "{denied}");
+
+    let served = roundtrip(
+        second_addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&served), "HTTP/1.1 200 OK", "{served}");
+    assert!(served.ends_with("scoped"), "{served}");
+
+    let _ = stop_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(2), first_task).await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), second_task).await;
+}
+
+#[tokio::test]
 async fn stale_cache_entry_is_served_while_it_refreshes() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 

@@ -184,6 +184,8 @@ pub struct Options {
     pub unix_tls: bool,
     /// This TCP listener terminates TLS.
     pub tls: bool,
+    /// Name used by routes scoped to this listener.
+    pub name: String,
     pub body_timeout: Option<Duration>,
     pub drain_timeout: Duration,
     pub shutdown_timeout: Duration,
@@ -202,6 +204,7 @@ impl Options {
             h2c: cfg.h2c,
             unix_tls: cfg.unix_tls,
             tls: cfg.tls.is_some() || cfg.acme.is_some(),
+            name: "default".to_owned(),
             body_timeout: match cfg.limits.request_body_timeout_secs {
                 0 => None,
                 secs => Some(Duration::from_secs(secs)),
@@ -390,6 +393,7 @@ pub async fn serve_unix(
                             &mut stop,
                             None,
                             None,
+                            "unix".to_owned(),
                         )
                         .await;
                         return;
@@ -425,6 +429,7 @@ pub async fn serve_unix(
                                 &mut stop,
                                 None,
                                 identity,
+                                "unix".to_owned(),
                             )
                             .await;
                         }
@@ -555,6 +560,7 @@ async fn serve_stream(
                 stop,
                 Some(acme.clone()),
                 None,
+                options.name.clone(),
             )
             .await;
             return;
@@ -576,6 +582,7 @@ async fn serve_stream(
                     stop,
                     Some(acme.clone()),
                     None,
+                    options.name.clone(),
                 )
                 .await;
             }
@@ -608,7 +615,18 @@ async fn serve_stream(
                     secure: false,
                     ..conn
                 };
-                serve_conn(stream, peer, runtime, conn, metrics, stop, None, None).await;
+                serve_conn(
+                    stream,
+                    peer,
+                    runtime,
+                    conn,
+                    metrics,
+                    stop,
+                    None,
+                    None,
+                    options.name.clone(),
+                )
+                .await;
                 return;
             }
         }
@@ -618,7 +636,7 @@ async fn serve_stream(
     // fast path would duplicate them.
     if options.sendfile
         && tls.is_none()
-        && crate::sendfile::try_serve(&mut stream, &runtime, &metrics, peer)
+        && crate::sendfile::try_serve(&mut stream, &runtime, &metrics, peer, &options.name)
             .await
             .is_some()
     {
@@ -652,6 +670,7 @@ async fn serve_stream(
                         stop,
                         options.acme.clone(),
                         identity,
+                        options.name.clone(),
                     )
                     .await;
                 }
@@ -665,7 +684,20 @@ async fn serve_stream(
                 }
             }
         }
-        None => serve_conn(stream, peer, runtime, conn, metrics, stop, None, None).await,
+        None => {
+            serve_conn(
+                stream,
+                peer,
+                runtime,
+                conn,
+                metrics,
+                stop,
+                None,
+                None,
+                options.name.clone(),
+            )
+            .await
+        }
     }
 }
 
@@ -679,6 +711,7 @@ async fn serve_conn<I>(
     stop: &mut watch::Receiver<bool>,
     acme: Option<Arc<elira_acme::Acme>>,
     client_cert: Option<elira_tls::ClientIdentity>,
+    listener: String,
 ) where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -691,6 +724,7 @@ async fn serve_conn<I>(
     let metrics_for_service = metrics.clone();
     let acme_for_service = acme.clone();
     let client_cert = client_cert.map(Arc::new);
+    let listener_for_service = listener;
 
     let service = service_fn(move |mut req: hyper::Request<Incoming>| {
         let runtime = runtime.clone();
@@ -698,6 +732,7 @@ async fn serve_conn<I>(
         let metrics = metrics_for_service.clone();
         let acme = acme_for_service.clone();
         let client_cert = client_cert.clone();
+        let listener = listener_for_service.clone();
         async move {
             // Reset the keep-alive watchdog: a request means the client is
             // still there, even if the response takes a while.
@@ -748,10 +783,10 @@ async fn serve_conn<I>(
                     .map(|token| token.split('?').next().unwrap_or(token));
                 match token.and_then(|token| acme.http01(token)) {
                     Some(body) => acme_response(hyper::StatusCode::OK, body),
-                    None => current.proxy.handle(req, peer, scheme).await,
+                    None => current.proxy.handle(req, peer, scheme, &listener).await,
                 }
             } else {
-                current.proxy.handle(req, peer, scheme).await
+                current.proxy.handle(req, peer, scheme, &listener).await
             };
             let elapsed = started.elapsed();
             let status = response.status().as_u16();

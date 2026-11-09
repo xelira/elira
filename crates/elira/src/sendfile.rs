@@ -34,6 +34,7 @@ pub(crate) async fn try_serve(
     runtime: &ArcSwap<Runtime>,
     metrics: &Metrics,
     peer: SocketAddr,
+    listener: &str,
 ) -> Option<()> {
     if !cfg!(target_os = "linux") {
         return None;
@@ -91,7 +92,7 @@ pub(crate) async fn try_serve(
     let current = runtime.load_full();
     let fast = current
         .proxy()
-        .fast_static(&host, path_only, peer.ip(), &request_headers)
+        .fast_static(&host, path_only, peer.ip(), &request_headers, listener)
         .await?;
     let file = fast.file;
     let meta = tokio::fs::metadata(&file).await.ok()?;

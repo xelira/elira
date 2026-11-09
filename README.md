@@ -259,7 +259,8 @@ Cache:
 
 Ops:
 
-- multiple TCP listeners with per-listener TLS, optional privilege drop,
+- multiple TCP listeners with per-listener TLS and routes scoped to a
+  listener, optional privilege drop, chroot, CPU affinity,
   `worker_rlimit_nofile` and a PID file
 - L4 TCP and UDP stream proxying with round robin, least connections or
   client-IP hashing, idle timeouts and optional TLS termination

@@ -233,7 +233,7 @@ impl SpoolLease {
 }
 
 struct Inner {
-    router: Router,
+    routers: HashMap<String, Router>,
     pools: Vec<Arc<Pool>>,
     tunnels: Arc<Semaphore>,
     connect: Option<Vec<Authority>>,
@@ -264,6 +264,7 @@ struct Inner {
     refreshing: Arc<Mutex<HashSet<String>>>,
 }
 
+#[derive(Clone)]
 enum Target {
     Proxy(Arc<Pool>),
     Files(Arc<Files>),
@@ -283,6 +284,7 @@ enum Target {
     Wasm(Arc<elira_wasm::WasmModule>),
 }
 
+#[derive(Clone)]
 enum ModuleTarget {
     InProcess(Arc<elira_module::Module>),
     Sandbox(Arc<elira_module::ProcessModule>),
@@ -365,6 +367,7 @@ fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     None
 }
 
+#[derive(Clone)]
 struct ClientCertRule {
     subject_cn: Option<String>,
     issuer_cn: Option<String>,
@@ -385,8 +388,10 @@ impl ClientCertRule {
     }
 }
 
+#[derive(Clone)]
 struct RouteEntry {
     label: String,
+    host: String,
     prefix: String,
     regex: Option<regex::Regex>,
     target: Target,
@@ -423,6 +428,42 @@ struct Router {
 }
 
 impl Router {
+    fn from_entries(entries: Vec<RouteEntry>) -> Self {
+        let mut exact: HashMap<String, Vec<RouteEntry>> = HashMap::new();
+        let mut wildcard: Vec<(String, Vec<RouteEntry>)> = Vec::new();
+        let mut default = Vec::new();
+
+        for entry in entries {
+            let host = entry.host.clone();
+            if host == "*" {
+                default.push(entry);
+            } else if let Some(suffix) = host.strip_prefix('*') {
+                if let Some((_, list)) = wildcard.iter_mut().find(|(known, _)| known == suffix) {
+                    list.push(entry);
+                } else {
+                    wildcard.push((suffix.to_owned(), vec![entry]));
+                }
+            } else {
+                exact.entry(host).or_default().push(entry);
+            }
+        }
+
+        for list in exact.values_mut() {
+            sort_routes(list);
+        }
+        for (_, list) in wildcard.iter_mut() {
+            sort_routes(list);
+        }
+        sort_routes(&mut default);
+        wildcard.sort_by_key(|(suffix, _)| std::cmp::Reverse(suffix.len()));
+
+        Self {
+            exact,
+            wildcard,
+            default,
+        }
+    }
+
     fn pick(&self, host: &str, path: &str) -> Option<&RouteEntry> {
         let mut lists: Vec<&Vec<RouteEntry>> = Vec::with_capacity(3);
 
@@ -946,9 +987,7 @@ impl Proxy {
         }
         let all_pools: Vec<Arc<Pool>> = pools.values().cloned().collect();
 
-        let mut exact: HashMap<String, Vec<RouteEntry>> = HashMap::new();
-        let mut wildcard: Vec<(String, Vec<RouteEntry>)> = Vec::new();
-        let mut default: Vec<RouteEntry> = Vec::new();
+        let mut entries: Vec<(RouteEntry, Vec<String>)> = Vec::new();
 
         for route in &cfg.routes {
             let target = if let Some(upstream) = &route.upstream {
@@ -1115,6 +1154,7 @@ impl Proxy {
                         .or(route.path_regex.as_deref())
                         .unwrap_or_default()
                 ),
+                host: route.host.trim().to_ascii_lowercase(),
                 prefix: route.path.clone().unwrap_or_default(),
                 regex: route
                     .path_regex
@@ -1179,28 +1219,45 @@ impl Proxy {
                 }),
             };
 
-            let host = route.host.trim().to_ascii_lowercase();
-            if host == "*" {
-                default.push(entry);
-            } else if let Some(suffix) = host.strip_prefix('*') {
-                if let Some((_, list)) = wildcard.iter_mut().find(|(known, _)| known == suffix) {
-                    list.push(entry);
-                } else {
-                    wildcard.push((suffix.to_owned(), vec![entry]));
-                }
-            } else {
-                exact.entry(host).or_default().push(entry);
-            }
+            entries.push((entry, route.listeners.clone()));
         }
 
-        for list in exact.values_mut() {
-            sort_routes(list);
+        let mut listener_names: Vec<String> = vec!["default".to_owned()];
+        if cfg.listen_unix.is_some() {
+            listener_names.push("unix".to_owned());
         }
-        for (_, list) in wildcard.iter_mut() {
-            sort_routes(list);
+        if cfg.http3.is_some() {
+            listener_names.push("http3".to_owned());
         }
-        sort_routes(&mut default);
-        wildcard.sort_by_key(|(suffix, _)| std::cmp::Reverse(suffix.len()));
+        for (index, listener) in cfg.listeners.iter().enumerate() {
+            listener_names.push(
+                listener
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("listener-{index}")),
+            );
+        }
+        let mut grouped: HashMap<String, Vec<RouteEntry>> = listener_names
+            .into_iter()
+            .map(|name| (name, Vec::new()))
+            .collect();
+        for (entry, scoped) in entries {
+            if scoped.is_empty() {
+                for list in grouped.values_mut() {
+                    list.push(entry.clone());
+                }
+            } else {
+                for name in scoped {
+                    if let Some(list) = grouped.get_mut(&name) {
+                        list.push(entry.clone());
+                    }
+                }
+            }
+        }
+        let routers: HashMap<String, Router> = grouped
+            .into_iter()
+            .map(|(name, entries)| (name, Router::from_entries(entries)))
+            .collect();
 
         let connect =
             if cfg.connect.enabled {
@@ -1253,11 +1310,7 @@ impl Proxy {
 
         Ok(Self {
             inner: Arc::new(Inner {
-                router: Router {
-                    exact,
-                    wildcard,
-                    default,
-                },
+                routers,
                 pools: all_pools,
                 tunnels: Arc::new(Semaphore::new(cfg.limits.max_connections)),
                 connect,
@@ -1319,9 +1372,19 @@ impl Proxy {
             path,
             std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             &HeaderMap::new(),
+            "default",
         )
         .await
         .map(|fast| fast.file)
+    }
+
+    fn router(&self, listener: &str) -> &Router {
+        self.inner
+            .routers
+            .get(listener)
+            .or_else(|| self.inner.routers.get("default"))
+            .or_else(|| self.inner.routers.values().next())
+            .expect("a configured server has at least one router")
     }
 
     /// Everything the sendfile fast path needs, after the same access checks
@@ -1332,9 +1395,10 @@ impl Proxy {
         path: &str,
         peer: std::net::IpAddr,
         headers: &HeaderMap,
+        listener: &str,
     ) -> Option<FastStatic> {
         let (key, _) = canonical_host(host)?;
-        let entry = self.inner.router.pick(&key, path)?;
+        let entry = self.router(listener).pick(&key, path)?;
 
         // Resolve the target first: a proxy route must not pay for a token or
         // an auth check here only to be handed to hyper afterwards.
@@ -1470,6 +1534,7 @@ impl Proxy {
         req: Request<Body>,
         peer: SocketAddr,
         scheme: &'static str,
+        listener: &str,
     ) -> Response<Body> {
         if self.headers_too_large(req.headers()) {
             let mut response = text(
@@ -1491,7 +1556,7 @@ impl Proxy {
             }
         }
 
-        match self.forward(req, peer, scheme).await {
+        match self.forward(req, peer, scheme, listener).await {
             Ok(response) => response,
             Err(mut response) => {
                 self.apply_global_error_page(&mut response, peer).await;
@@ -1596,6 +1661,7 @@ impl Proxy {
         mut req: Request<Body>,
         peer: SocketAddr,
         scheme: &'static str,
+        listener: &str,
     ) -> Result<Response<Body>, Response<Body>> {
         if req.method() == Method::CONNECT {
             return self.connect(req).await;
@@ -1678,8 +1744,7 @@ impl Proxy {
             .unwrap_or_else(elira_accesslog::request_id);
 
         let entry = self
-            .inner
-            .router
+            .router(listener)
             .pick(&key, req.uri().path())
             .ok_or_else(|| text(StatusCode::NOT_FOUND, "no route"))?;
 

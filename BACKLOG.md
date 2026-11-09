@@ -114,10 +114,9 @@ Living list for the self-improvement loop. One item per session.
 
 ### Section 1 leftovers (architecture)
 
-- [ ] `chroot` support with path rewriting for logs, cache and certificates.
-- [ ] `worker_cpu_affinity`.
-- [ ] Per-listener route sets, i.e. routes scoped to a named listener rather
-  than shared by every listener.
+- [x] `chroot` support after config load and before runtime files.
+- [x] `worker_cpu_affinity`.
+- [x] Per-listener route sets via `routes.listeners`.
 
 ### Section 2 — routing and configuration language
 
@@ -159,7 +158,6 @@ Living list for the self-improvement loop. One item per session.
 - [ ] Log reopen on SIGUSR1 for external rotation.
 - [ ] `open_file_cache`.
 - [ ] `worker_rlimit_nofile` propagation tuning and `worker_processes auto`.
-- [ ] `worker_cpu_affinity` (also listed above).
 
 ### Section 5 — HTTP details
 

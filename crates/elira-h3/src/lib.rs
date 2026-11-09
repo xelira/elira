@@ -340,7 +340,7 @@ where
         request.extensions_mut().insert(identity.as_ref().clone());
     }
 
-    let response = proxy().handle(request, peer, "https").await;
+    let response = proxy().handle(request, peer, "https", "http3").await;
     let status = response.status();
     let elapsed = started.elapsed();
     let status_code = status.as_u16();

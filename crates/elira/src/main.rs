@@ -149,6 +149,7 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
             run_ocsp_hook(hook).await;
         }
     }
+    apply_chroot(&cfg)?;
     let runtime = Arc::new(ArcSwap::from_pointee(Runtime::build(&cfg)?));
 
     let listener = server::bind_tcp(cfg.listen, cfg.reuse_port)
@@ -265,10 +266,12 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
             server::configure_unix(path, cfg.listen_unix_mode, cfg.listen_unix_owner.as_deref())
                 .with_context(|| format!("cannot configure unix socket {}", path.display()))?;
             tracing::info!(path = %path.display(), "listening on a unix socket");
+            let mut unix_options = options.clone();
+            unix_options.name = "unix".to_owned();
             Some(tokio::spawn(server::serve_unix(
                 listener,
                 runtime.clone(),
-                options.clone(),
+                unix_options,
                 metrics.clone(),
                 stop_rx.clone(),
             )))
@@ -286,6 +289,7 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
         tracing::info!(listen = %stream.listen, transport = ?stream.transport, "stream listener");
     }
 
+    apply_cpu_affinity(&cfg)?;
     apply_privileges(&cfg)?;
 
     let mut stream_serving = Vec::new();
@@ -307,12 +311,16 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
         metrics.clone(),
         stop_rx.clone(),
     )));
-    for entry in &cfg.listeners {
+    for (index, entry) in cfg.listeners.iter().enumerate() {
         let listener = server::bind_tcp(entry.listen, cfg.reuse_port)
             .with_context(|| format!("cannot bind {}", entry.listen))?;
         let mut listener_options = options.clone();
         listener_options.tls = entry.tls;
-        tracing::info!(listen = %entry.listen, tls = entry.tls, "additional listener");
+        listener_options.name = entry
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("listener-{index}"));
+        tracing::info!(listen = %entry.listen, tls = entry.tls, name = %listener_options.name, "additional listener");
         serving.push(tokio::spawn(server::serve(
             listener,
             runtime.clone(),
@@ -498,6 +506,54 @@ fn apply_rlimit(limit: Option<u64>) -> anyhow::Result<()> {
             std::io::Error::last_os_error()
         );
     }
+    Ok(())
+}
+
+fn apply_cpu_affinity(cfg: &Config) -> anyhow::Result<()> {
+    let Some(cpus) = &cfg.worker_cpu_affinity else {
+        return Ok(());
+    };
+    let index = std::env::var("ELIRA_WORKER_INDEX")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    let cpu = cpus[index % cpus.len()];
+
+    // SAFETY: cpu_set_t is initialized before use and sched_setaffinity only
+    // reads the set for the duration of the call.
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::CPU_ZERO(&mut set);
+        libc::CPU_SET(cpu, &mut set);
+    }
+    if unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) } != 0 {
+        bail!(
+            "cannot bind worker to CPU {cpu}: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    tracing::info!(cpu, "bound worker to CPU");
+    Ok(())
+}
+
+fn apply_chroot(cfg: &Config) -> anyhow::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let Some(root) = &cfg.chroot else {
+        return Ok(());
+    };
+    let path = std::ffi::CString::new(root.as_os_str().as_bytes())
+        .map_err(|_| anyhow::anyhow!("chroot path contains a NUL byte"))?;
+    // SAFETY: the path is NUL-terminated and chroot does not retain it.
+    if unsafe { libc::chroot(path.as_ptr()) } != 0 {
+        bail!(
+            "chroot {}: {}",
+            root.display(),
+            std::io::Error::last_os_error()
+        );
+    }
+    std::env::set_current_dir("/").context("chdir after chroot")?;
+    tracing::info!(root = %root.display(), "entered chroot");
     Ok(())
 }
 

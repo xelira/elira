@@ -57,9 +57,19 @@ pub struct Config {
     #[serde(default)]
     pub worker_rlimit_nofile: Option<u64>,
 
+    /// CPU indices assigned to workers in order. A single process uses the
+    /// first entry.
+    #[serde(default)]
+    pub worker_cpu_affinity: Option<Vec<usize>>,
+
     /// Write the supervisor (or single-process) PID here.
     #[serde(default)]
     pub pid_file: Option<PathBuf>,
+
+    /// Enter this directory as the filesystem root before loading runtime
+    /// files. Every configured path must be valid inside the new root.
+    #[serde(default)]
+    pub chroot: Option<PathBuf>,
     #[serde(default)]
     pub limits: Limits,
     /// Send our `Server: elira` header and keep the upstream one.
@@ -111,6 +121,9 @@ pub struct Config {
 #[serde(deny_unknown_fields)]
 pub struct Listener {
     pub listen: SocketAddr,
+    /// Name used by `routes.listeners`. Defaults to `listener-N`.
+    #[serde(default)]
+    pub name: Option<String>,
     /// Terminate TLS on this listener with the shared `[tls]` settings.
     #[serde(default)]
     pub tls: bool,
@@ -679,6 +692,10 @@ pub struct Route {
     /// Host to match, case-insensitive. `*` catches everything else, and
     /// `*.example.com` matches any subdomain.
     pub host: String,
+
+    /// Restrict the route to named listeners. Empty means every listener.
+    #[serde(default)]
+    pub listeners: Vec<String>,
 
     /// Path prefix. The longest matching prefix wins inside a host.
     #[serde(default)]
@@ -1458,6 +1475,27 @@ impl Config {
                 }
             }
         }
+
+        let mut listener_names = HashSet::new();
+        listener_names.insert("default".to_owned());
+        if self.listen_unix.is_some() {
+            listener_names.insert("unix".to_owned());
+        }
+        if self.http3.is_some() {
+            listener_names.insert("http3".to_owned());
+        }
+        for (index, listener) in self.listeners.iter().enumerate() {
+            let name = listener
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("listener-{index}"));
+            if name.is_empty() || name.chars().any(|c| c.is_control() || c.is_whitespace()) {
+                return Err(Error::BadListenerName);
+            }
+            if !listener_names.insert(name.clone()) {
+                return Err(Error::DuplicateListenerName { name });
+            }
+        }
         if self.unix_tls && self.listen_unix.is_none() {
             return Err(Error::UnixTlsWithoutListener);
         }
@@ -1509,12 +1547,24 @@ impl Config {
         if self.worker_rlimit_nofile == Some(0) {
             return Err(Error::BadRlimit);
         }
+        if let Some(cpus) = &self.worker_cpu_affinity {
+            if cpus.is_empty() || cpus.iter().any(|cpu| *cpu >= 4096) {
+                return Err(Error::BadCpuAffinity);
+            }
+        }
         if self
             .pid_file
             .as_ref()
             .is_some_and(|path| path.as_os_str().is_empty())
         {
             return Err(Error::EmptyPidFile);
+        }
+        if self
+            .chroot
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            return Err(Error::EmptyChroot);
         }
 
         if !self.log.sample.is_finite() || !(0.0..=1.0).contains(&self.log.sample) {
@@ -1929,6 +1979,14 @@ impl Config {
             if host.is_empty() {
                 return Err(Error::EmptyRouteHost { index });
             }
+            for name in &route.listeners {
+                if !listener_names.contains(name) {
+                    return Err(Error::UnknownListener {
+                        index,
+                        name: name.clone(),
+                    });
+                }
+            }
 
             // The same host may appear several times with different paths;
             // only an identical pair is ambiguous.
@@ -1937,7 +1995,10 @@ impl Config {
                 .clone()
                 .or_else(|| route.path_regex.clone())
                 .unwrap_or_default();
-            if !seen.insert((host.clone(), discriminator)) {
+            let mut route_listeners = route.listeners.clone();
+            route_listeners.sort();
+            route_listeners.dedup();
+            if !seen.insert((host.clone(), discriminator, route_listeners.join(","))) {
                 return Err(Error::DuplicateRoute {
                     host: route.host.clone(),
                 });
@@ -2313,6 +2374,15 @@ pub enum Error {
     #[error("a TCP listener with tls = true needs [tls] or [acme]")]
     ListenerTlsWithoutConfig,
 
+    #[error("listener name must not be empty or contain whitespace")]
+    BadListenerName,
+
+    #[error("listener name {name:?} is used twice")]
+    DuplicateListenerName { name: String },
+
+    #[error("route {index} refers to unknown listener {name:?}")]
+    UnknownListener { index: usize, name: String },
+
     #[error("stream listener {listen} is configured twice")]
     DuplicateStreamListen { listen: String },
 
@@ -2376,8 +2446,14 @@ pub enum Error {
     #[error("worker_rlimit_nofile must be greater than zero")]
     BadRlimit,
 
+    #[error("worker_cpu_affinity must be a non-empty list of CPU indices below 4096")]
+    BadCpuAffinity,
+
     #[error("pid_file must not be empty")]
     EmptyPidFile,
+
+    #[error("chroot must not be empty")]
+    EmptyChroot,
 
     #[error("health.path must start with '/' and contain no spaces or control characters")]
     BadHealthPath,
@@ -3995,6 +4071,24 @@ root = "/srv/www"
             Config::parse(&empty_pid),
             Err(Error::EmptyPidFile)
         ));
+
+        let empty_chroot = base.replace(
+            "pid_file = \"/run/elira.pid\"",
+            "pid_file = \"/run/elira.pid\"\nchroot = \"\"",
+        );
+        assert!(matches!(
+            Config::parse(&empty_chroot),
+            Err(Error::EmptyChroot)
+        ));
+
+        let empty_cpus = base.replace(
+            "pid_file = \"/run/elira.pid\"",
+            "pid_file = \"/run/elira.pid\"\nworker_cpu_affinity = []",
+        );
+        assert!(matches!(
+            Config::parse(&empty_cpus),
+            Err(Error::BadCpuAffinity)
+        ));
     }
 
     #[test]
@@ -4021,6 +4115,31 @@ root = "/srv/www"
             "listen = \"127.0.0.1:8081\"\ntls = true",
         );
         assert!(Config::parse(&tls_listener).is_ok());
+
+        let named = base.replace(
+            "listen = \"127.0.0.1:8081\"",
+            "listen = \"127.0.0.1:8081\"\nname = \"public\"",
+        );
+        let named = named.replace(
+            "[[routes]]\nhost = \"*\"",
+            "[[routes]]\nhost = \"*\"\nlisteners = [\"public\"]",
+        );
+        assert!(Config::parse(&named).is_ok());
+
+        let unknown = named.replace("listeners = [\"public\"]", "listeners = [\"missing\"]");
+        assert!(matches!(
+            Config::parse(&unknown),
+            Err(Error::UnknownListener { .. })
+        ));
+
+        let duplicate_name = base.replace(
+            "listen = \"127.0.0.1:8081\"",
+            "listen = \"127.0.0.1:8081\"\nname = \"default\"",
+        );
+        assert!(matches!(
+            Config::parse(&duplicate_name),
+            Err(Error::DuplicateListenerName { .. })
+        ));
 
         let duplicate = base.replace("listen = \"127.0.0.1:8081\"", "listen = \"127.0.0.1:8080\"");
         assert!(matches!(
