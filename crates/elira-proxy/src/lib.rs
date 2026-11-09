@@ -519,6 +519,8 @@ struct RouteEntry {
     access_log_sample: f64,
     client_auth: Option<ClientCertRule>,
     max_upstream_response: Option<usize>,
+    expires_secs: Option<u64>,
+    etag: bool,
     fastcgi_param: Vec<(String, String)>,
     cgi_param: Vec<(String, String)>,
 }
@@ -1094,12 +1096,28 @@ impl Proxy {
             } else if let Some(root) = &route.root {
                 Target::Files(Arc::new(Files::new(
                     root.clone(),
+                    None,
                     route.index.clone(),
                     route.spa,
                     route.try_files.clone(),
                     route.autoindex,
                     cfg.compression.enabled,
                     cfg.compression.min_bytes,
+                    route.expires_secs,
+                    route.etag.unwrap_or(true),
+                )))
+            } else if let Some(alias) = &route.alias {
+                Target::Files(Arc::new(Files::new(
+                    alias.clone(),
+                    Some(route.path.clone().unwrap_or_default()),
+                    route.index.clone(),
+                    route.spa,
+                    route.try_files.clone(),
+                    route.autoindex,
+                    cfg.compression.enabled,
+                    cfg.compression.min_bytes,
+                    route.expires_secs,
+                    route.etag.unwrap_or(true),
                 )))
             } else if let Some(pass) = &route.fastcgi_pass {
                 let target =
@@ -1305,6 +1323,8 @@ impl Proxy {
                     issuer_cn: route.client_issuer_cn.clone(),
                 }),
                 max_upstream_response: route.max_upstream_response_bytes,
+                expires_secs: route.expires_secs,
+                etag: route.etag.unwrap_or(true),
                 fastcgi_param: route
                     .fastcgi_param
                     .iter()
@@ -1510,6 +1530,10 @@ impl Proxy {
             .iter()
             .any(|(_, value)| value.contains('$'))
         {
+            return None;
+        }
+        // Cache headers and ETag policy belong to the Files response path.
+        if entry.expires_secs.is_some() || !entry.etag {
             return None;
         }
 
@@ -4021,7 +4045,18 @@ fn error_page_set(
     if pages.is_empty() {
         return Vec::new();
     }
-    let files = Arc::new(Files::new(root, index, false, Vec::new(), false, false, 0));
+    let files = Arc::new(Files::new(
+        root,
+        None,
+        index,
+        false,
+        Vec::new(),
+        false,
+        false,
+        0,
+        None,
+        true,
+    ));
     let mut out = Vec::new();
     for page in pages {
         let mut parts = page.splitn(2, char::is_whitespace);

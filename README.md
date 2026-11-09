@@ -243,6 +243,7 @@ HTTP:
 Static files:
 
 - index files, MIME types, `ETag`, `If-None-Match`, `If-Modified-Since`
+- `root` and `alias`, optional `expires_secs` and `etag = false`
 - single and multipart byte ranges, `If-Range` and strong `ETag`s; `HEAD`;
   precompressed `.br`/`.gz` siblings
 - on-the-fly compression; path traversal and symlink escapes rejected

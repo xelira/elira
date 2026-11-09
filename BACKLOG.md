@@ -126,14 +126,15 @@ Living list for the self-improvement loop. One item per session.
 - [ ] `rewrite` rules, `return` with variables, `if`, `map`, `geo`,
   `split_clients`.
 - [ ] `location =`, `^~`, nested and named locations, `internal`.
-- [ ] `alias` (distinct from `root`).
+- [x] `alias` (distinct from `root`).
+- [x] `expires` and `etag off` for static responses.
 - [ ] `auth_request` subrequests.
 - [ ] `satisfy any/all` for auth plus ACL combinations.
 - [ ] `secure_link`.
 - [ ] `X-Accel-Redirect` and `X-Sendfile` from upstream responses.
 - [ ] `error_page` status overrides (`=200`) and named locations.
-- [ ] `expires`, `add_header ... always`, `etag off`,
-  `if_modified_since off`.
+- [ ] `if_modified_since off` (response headers are already applied to every
+  status, matching `add_header ... always`).
 
 ### Section 3 — proxying and cache
 

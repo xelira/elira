@@ -713,6 +713,18 @@ pub struct Route {
     #[serde(default)]
     pub root: Option<PathBuf>,
 
+    /// Serve files from this directory by stripping `path`, nginx-style.
+    #[serde(default)]
+    pub alias: Option<PathBuf>,
+
+    /// Add `Cache-Control`/`Expires` for static responses.
+    #[serde(default)]
+    pub expires_secs: Option<u64>,
+
+    /// Emit an `ETag` for static responses. Defaults to true.
+    #[serde(default)]
+    pub etag: Option<bool>,
+
     /// Redirect instead of proxying or serving. Exactly one target.
     #[serde(default)]
     pub redirect: Option<Redirect>,
@@ -2006,6 +2018,7 @@ impl Config {
 
             let targets = usize::from(route.upstream.is_some())
                 + usize::from(route.root.is_some())
+                + usize::from(route.alias.is_some())
                 + usize::from(route.redirect.is_some())
                 + usize::from(route.fastcgi_pass.is_some())
                 + usize::from(route.cgi_pass.is_some())
@@ -2016,6 +2029,14 @@ impl Config {
             }
             if targets > 1 {
                 return Err(Error::RouteHasTwoTargets { index });
+            }
+            if let Some(alias) = &route.alias {
+                if alias.as_os_str().is_empty() || !alias.is_absolute() {
+                    return Err(Error::BadAlias { index });
+                }
+                if route.path.is_none() || route.path_regex.is_some() {
+                    return Err(Error::AliasNeedsPrefix { index });
+                }
             }
 
             if route.fastcgi_pool_idle.is_some() && route.fastcgi_pass.is_none() {
@@ -2603,6 +2624,12 @@ pub enum Error {
 
     #[error("route {index} has an empty `root`")]
     EmptyRoot { index: usize },
+
+    #[error("route {index}: alias must be a non-empty absolute path")]
+    BadAlias { index: usize },
+
+    #[error("route {index}: alias needs a literal path prefix")]
+    AliasNeedsPrefix { index: usize },
 
     #[error("route {index}: index file \"{entry}\" must be a plain file name")]
     BadIndexEntry { index: usize, entry: String },
@@ -4223,6 +4250,42 @@ root = "/srv/www"
         assert!(matches!(
             Config::parse(&no_tls),
             Err(Error::UnixTlsWithoutTls)
+        ));
+    }
+
+    #[test]
+    fn alias_and_static_headers_are_validated() {
+        let base = r#"
+listen = "127.0.0.1:8080"
+
+[[routes]]
+host = "*"
+path = "/static"
+alias = "/srv/static"
+expires_secs = 60
+etag = false
+"#;
+        let cfg = Config::parse(base).expect("valid");
+        assert_eq!(
+            cfg.routes[0].alias.as_deref(),
+            Some(Path::new("/srv/static"))
+        );
+        assert_eq!(cfg.routes[0].expires_secs, Some(60));
+        assert_eq!(cfg.routes[0].etag, Some(false));
+
+        let no_path = base.replace("path = \"/static\"\n", "");
+        assert!(matches!(
+            Config::parse(&no_path),
+            Err(Error::AliasNeedsPrefix { .. })
+        ));
+
+        let with_root = base.replace(
+            "alias = \"/srv/static\"",
+            "alias = \"/srv/static\"\nroot = \"/srv/www\"",
+        );
+        assert!(matches!(
+            Config::parse(&with_root),
+            Err(Error::RouteHasTwoTargets { .. })
         ));
     }
 

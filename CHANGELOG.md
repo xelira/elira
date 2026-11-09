@@ -158,6 +158,7 @@
 - Переменные `$host`, `$remote_addr`, `$request_uri` и другие в заголовках и
   редиректах.
 - Переменные в путях `error_pages`.
+- `alias`, `expires_secs` и `etag = false` для статики.
 - `Cache-Control: must-revalidate` запрещает stale-выдачу; `Expires`/`Date`
   задают TTL, если `max-age` нет. Запросы с `no-cache`/`no-store` обходят кэш.
 - Заголовки `Forwarded` и `X-Forwarded-Port` к upstream.

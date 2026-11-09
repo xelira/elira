@@ -1153,6 +1153,56 @@ redirect = {{ to = "https://$host/new", status = 302 }}
 }
 
 #[tokio::test]
+async fn alias_serves_files_with_expires_and_no_etag() {
+    let root = temp_root("alias");
+    std::fs::write(root.join("app.js"), "console.log(1)").unwrap();
+
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[routes]]
+host = "*"
+path = "/static"
+alias = "{}"
+expires_secs = 60
+etag = false
+"#,
+        root.display()
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let response = roundtrip(
+        addr,
+        "GET /static/app.js HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&response), "HTTP/1.1 200 OK", "{response}");
+    assert!(response.ends_with("console.log(1)"), "{response}");
+    assert!(
+        response
+            .to_ascii_lowercase()
+            .contains("cache-control: public, max-age=60"),
+        "{response}"
+    );
+    assert!(
+        response.to_ascii_lowercase().contains("expires:"),
+        "{response}"
+    );
+    assert!(
+        !response.to_ascii_lowercase().contains("etag:"),
+        "{response}"
+    );
+
+    let outside = roundtrip(
+        addr,
+        "GET /other/app.js HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&outside), "HTTP/1.1 404 Not Found", "{outside}");
+}
+
+#[tokio::test]
 async fn route_request_headers_are_set_and_removed() {
     let upstream = upstream().await;
     let config = format!(

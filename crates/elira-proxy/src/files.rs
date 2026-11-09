@@ -12,8 +12,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use futures_util::TryStreamExt;
 use http::header::{
-    ACCEPT_RANGES, ALLOW, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG,
-    IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE, LAST_MODIFIED, VARY,
+    ACCEPT_RANGES, ALLOW, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE,
+    CONTENT_TYPE, ETAG, EXPIRES, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE, LAST_MODIFIED, VARY,
 };
 use http::{Method, Request, Response, StatusCode};
 use http_body_util::combinators::BoxBody;
@@ -26,32 +26,42 @@ use super::{text, BoxError};
 
 pub(crate) struct Files {
     root: PathBuf,
+    prefix: Option<String>,
     index: Vec<String>,
     spa: bool,
     try_files: Vec<String>,
     autoindex: bool,
     compress: bool,
     min_bytes: u64,
+    expires: Option<u64>,
+    etag: bool,
 }
 
 impl Files {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         root: PathBuf,
+        prefix: Option<String>,
         index: Vec<String>,
         spa: bool,
         try_files: Vec<String>,
         autoindex: bool,
         compress: bool,
         min_bytes: usize,
+        expires: Option<u64>,
+        etag: bool,
     ) -> Self {
         Self {
             root,
+            prefix,
             index,
             spa,
             try_files,
             autoindex,
             compress,
             min_bytes: min_bytes as u64,
+            expires,
+            etag,
         }
     }
 
@@ -76,6 +86,10 @@ impl Files {
         let decoded = match percent_encoding::percent_decode_str(req.uri().path()).decode_utf8() {
             Ok(decoded) => decoded.into_owned(),
             Err(_) => return text(StatusCode::BAD_REQUEST, "path is not valid UTF-8"),
+        };
+        let decoded = match &self.prefix {
+            Some(prefix) => decoded.strip_prefix(prefix).unwrap_or(&decoded).to_owned(),
+            None => decoded,
         };
 
         let mut relative = PathBuf::new();
@@ -145,6 +159,10 @@ impl Files {
             .decode_utf8()
             .ok()?
             .into_owned();
+        let decoded = match &self.prefix {
+            Some(prefix) => decoded.strip_prefix(prefix).unwrap_or(&decoded).to_owned(),
+            None => decoded,
+        };
 
         let mut relative = PathBuf::new();
         for segment in decoded.split('/') {
@@ -311,15 +329,18 @@ impl Files {
         let path = path.as_path();
         let len = meta.len();
         let modified = meta.modified().ok();
-        let etag = etag(len, modified);
+        let etag_value = self.etag.then(|| etag(len, modified));
+        let etag = etag_value.as_deref().unwrap_or_default();
 
-        if not_modified(req, &etag, modified) {
+        if not_modified(req, etag_value.as_deref(), modified) {
             let mut response = Response::new(empty());
             *response.status_mut() = StatusCode::NOT_MODIFIED;
-            response.headers_mut().insert(
-                ETAG,
-                http::HeaderValue::from_str(&etag).expect("etag is ASCII"),
-            );
+            if let Some(etag) = etag_value {
+                response.headers_mut().insert(
+                    ETAG,
+                    http::HeaderValue::from_str(&etag).expect("etag is ASCII"),
+                );
+            }
             if let Some(modified) = modified {
                 response.headers_mut().insert(
                     LAST_MODIFIED,
@@ -341,7 +362,7 @@ impl Files {
             .get(IF_RANGE)
             .and_then(|value| value.to_str().ok())
         {
-            Some(condition) => if_range_matches(condition, &etag, modified),
+            Some(condition) => if_range_matches(condition, etag, modified),
             None => true,
         };
 
@@ -405,6 +426,14 @@ impl Files {
             .status(status)
             .header(ACCEPT_RANGES, "bytes")
             .header("x-content-type-options", "nosniff");
+        if let Some(seconds) = self.expires {
+            builder = builder
+                .header(CACHE_CONTROL, format!("public, max-age={seconds}"))
+                .header(
+                    EXPIRES,
+                    httpdate::fmt_http_date(SystemTime::now() + Duration::from_secs(seconds)),
+                );
+        }
         builder = match &boundary {
             Some(boundary) => builder.header(
                 CONTENT_TYPE,
@@ -419,7 +448,9 @@ impl Files {
             if let Some(length) = length {
                 builder = builder.header(CONTENT_LENGTH, length);
             }
-            builder = builder.header(ETAG, etag);
+            if let Some(etag) = &etag_value {
+                builder = builder.header(ETAG, etag);
+            }
         }
 
         if let Some(modified) = modified {
@@ -528,14 +559,15 @@ fn if_range_matches(condition: &str, etag: &str, modified: Option<SystemTime>) -
 
 fn not_modified(
     req: &Request<BoxBody<Bytes, BoxError>>,
-    etag: &str,
+    etag: Option<&str>,
     modified: Option<SystemTime>,
 ) -> bool {
-    if let Some(value) = req
-        .headers()
-        .get(IF_NONE_MATCH)
-        .and_then(|v| v.to_str().ok())
-    {
+    if let (Some(etag), Some(value)) = (
+        etag,
+        req.headers()
+            .get(IF_NONE_MATCH)
+            .and_then(|v| v.to_str().ok()),
+    ) {
         return value.trim() == "*" || value.split(',').any(|tag| tag.trim() == etag);
     }
 
