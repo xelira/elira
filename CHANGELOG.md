@@ -120,6 +120,8 @@
 - Per-route mTLS: `client_auth`, `client_cn`, `client_issuer_cn`; работает на
   HTTP/1.1, HTTP/2 и HTTP/3.
 - `rate_key` на маршруте: лимит по заголовку, cookie или `Authorization`.
+- OCSP stapling для SNI-сертификатов на TCP и QUIC; `ocsp_hook` обновляет все
+  файлы.
 - `Cache-Control: must-revalidate` запрещает stale-выдачу; `Expires`/`Date`
   задают TTL, если `max-age` нет. Запросы с `no-cache`/`no-store` обходят кэш.
 - Заголовки `Forwarded` и `X-Forwarded-Port` к upstream.

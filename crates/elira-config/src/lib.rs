@@ -816,6 +816,9 @@ pub struct ServerCert {
     /// the default instead of a named one.
     #[serde(default)]
     pub names: Vec<String>,
+    /// DER OCSP response to staple for this certificate.
+    #[serde(default)]
+    pub ocsp: Option<PathBuf>,
 }
 
 impl Tls {
@@ -1305,6 +1308,13 @@ impl Config {
                 if entry.cert.as_os_str().is_empty() || entry.key.as_os_str().is_empty() {
                     return Err(Error::TlsCertificatePair { index });
                 }
+                if entry
+                    .ocsp
+                    .as_ref()
+                    .is_some_and(|path| path.as_os_str().is_empty())
+                {
+                    return Err(Error::EmptyOcspPath);
+                }
                 for name in &entry.names {
                     let name = name.trim().to_ascii_lowercase();
                     if name.is_empty() || (!name.starts_with("*.") && !is_plain_name(&name)) {
@@ -1376,11 +1386,11 @@ impl Config {
             {
                 return Err(Error::EmptyOcspPath);
             }
-            if tls
-                .ocsp_hook
-                .as_ref()
-                .is_some_and(|path| path.as_os_str().is_empty() || tls.ocsp.is_none())
-            {
+            if tls.ocsp_hook.as_ref().is_some_and(|path| {
+                path.as_os_str().is_empty()
+                    || (tls.ocsp.is_none()
+                        && tls.certificates.iter().all(|entry| entry.ocsp.is_none()))
+            }) {
                 return Err(Error::OcspHookNeedsFile);
             }
             if tls.ocsp_refresh_secs == 0 && tls.ocsp_hook.is_some() {
@@ -1396,6 +1406,13 @@ impl Config {
             for (index, entry) in tls.certificates.iter().enumerate() {
                 if entry.cert.as_os_str().is_empty() || entry.key.as_os_str().is_empty() {
                     return Err(Error::TlsCertificatePair { index });
+                }
+                if entry
+                    .ocsp
+                    .as_ref()
+                    .is_some_and(|path| path.as_os_str().is_empty())
+                {
+                    return Err(Error::EmptyOcspPath);
                 }
                 for name in &entry.names {
                     let name = name.trim().to_ascii_lowercase();
@@ -3348,6 +3365,42 @@ root = "/srv/www"
         );
         let cfg = Config::parse(&with_file).expect("valid");
         assert_eq!(cfg.tls.expect("tls").ocsp_refresh_secs, 86400);
+    }
+
+    #[test]
+    fn sni_certificates_can_staple_their_own_ocsp() {
+        let text = r#"
+listen = "127.0.0.1:8443"
+
+[tls]
+cert = "/tmp/cert.pem"
+key = "/tmp/key.pem"
+ocsp_hook = "/usr/local/bin/fetch-ocsp"
+
+[[tls.certificates]]
+cert = "/tmp/a.pem"
+key = "/tmp/a.key"
+names = ["a.example.com"]
+ocsp = "/tmp/a.ocsp"
+
+[[routes]]
+host = "*"
+root = "/srv/www"
+"#;
+        let cfg = Config::parse(text).expect("valid");
+        assert_eq!(
+            cfg.tls.expect("tls").certificates[0].ocsp.as_deref(),
+            Some(Path::new("/tmp/a.ocsp"))
+        );
+
+        let no_ocsp = text.replace("ocsp = \"/tmp/a.ocsp\"\n", "");
+        assert!(matches!(
+            Config::parse(&no_ocsp),
+            Err(Error::OcspHookNeedsFile)
+        ));
+
+        let empty = text.replace("ocsp = \"/tmp/a.ocsp\"", "ocsp = \"\"");
+        assert!(matches!(Config::parse(&empty), Err(Error::EmptyOcspPath)));
     }
 
     #[test]

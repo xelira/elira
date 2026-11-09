@@ -55,6 +55,7 @@ impl Runtime {
                         names: entry.names.clone(),
                         cert: entry.cert.clone(),
                         key: entry.key.clone(),
+                        ocsp: entry.ocsp.clone(),
                     })
                     .collect();
                 let default = if tls.cert.as_os_str().is_empty() {

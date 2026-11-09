@@ -197,8 +197,12 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
     spawn_signal_task(stop_tx.clone(), reload_tx.clone(), restart_tx)?;
     if std::env::var_os("ELIRA_WORKER").is_none() {
         if let Some(tls) = &cfg.tls {
-            if let (Some(hook), Some(_)) = (&tls.ocsp_hook, &tls.ocsp) {
-                spawn_ocsp_refresh(hook.clone(), tls.ocsp_refresh_secs, reload_tx.clone());
+            if let Some(hook) = &tls.ocsp_hook {
+                let has_ocsp =
+                    tls.ocsp.is_some() || tls.certificates.iter().any(|entry| entry.ocsp.is_some());
+                if has_ocsp {
+                    spawn_ocsp_refresh(hook.clone(), tls.ocsp_refresh_secs, reload_tx.clone());
+                }
             }
         }
     }
@@ -443,6 +447,7 @@ fn spawn_h3(
                     names: entry.names.clone(),
                     cert: entry.cert.clone(),
                     key: entry.key.clone(),
+                    ocsp: entry.ocsp.clone(),
                 })
                 .collect(),
             idle_timeout_secs: http3.idle_timeout_secs,

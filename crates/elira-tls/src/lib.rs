@@ -22,6 +22,8 @@ pub struct NamedCert {
     pub names: Vec<String>,
     pub cert: PathBuf,
     pub key: PathBuf,
+    /// DER OCSP response to staple for this certificate.
+    pub ocsp: Option<PathBuf>,
 }
 
 /// Everything a TLS listener can be configured with.
@@ -44,6 +46,8 @@ pub struct ServerOptions<'a> {
 
 /// ALPN order matters: clients that accept both get the first shared protocol.
 const ALPN_PROTOCOLS: [&[u8]; 2] = [b"h2", b"http/1.1"];
+
+type NamedCertKey = (Vec<String>, Arc<CertifiedKey>);
 
 /// Where the certificate chain and private key live.
 #[derive(Debug, Clone)]
@@ -231,21 +235,9 @@ fn build(options: &ServerOptions<'_>, alpn: &[&[u8]]) -> Result<ServerConfig, Er
         None => builder.with_no_client_auth(),
     };
 
-    let ocsp = match options.ocsp {
-        Some(path) => Some(fs::read(path).map_err(|source| Error::Read {
-            path: path.to_path_buf(),
-            source,
-        })?),
-        None => None,
-    };
+    let ocsp = read_ocsp(options.ocsp)?;
 
-    let mut named = Vec::with_capacity(options.named.len());
-    for entry in options.named {
-        named.push((
-            entry.names.clone(),
-            Arc::new(certified(&entry.cert, &entry.key, None)?),
-        ));
-    }
+    let named = build_named(options.named)?;
 
     let default = match options.default {
         Some((cert, key)) => Some(Arc::new(certified(cert, key, ocsp)?)),
@@ -271,6 +263,31 @@ fn build(options: &ServerOptions<'_>, alpn: &[&[u8]]) -> Result<ServerConfig, Er
     Ok(config)
 }
 
+fn build_named(named: &[NamedCert]) -> Result<Vec<NamedCertKey>, Error> {
+    let mut out = Vec::with_capacity(named.len());
+    for entry in named {
+        out.push((
+            entry.names.clone(),
+            Arc::new(certified(
+                &entry.cert,
+                &entry.key,
+                read_ocsp(entry.ocsp.as_deref())?,
+            )?),
+        ));
+    }
+    Ok(out)
+}
+
+fn read_ocsp(path: Option<&Path>) -> Result<Option<Vec<u8>>, Error> {
+    match path {
+        Some(path) => Ok(Some(fs::read(path).map_err(|source| Error::Read {
+            path: path.to_path_buf(),
+            source,
+        })?)),
+        None => Ok(None),
+    }
+}
+
 fn certified(cert: &Path, key: &Path, ocsp: Option<Vec<u8>>) -> Result<CertifiedKey, Error> {
     let chain = load_chain(cert)?;
     let key_der = load_key(key)?;
@@ -288,7 +305,7 @@ fn certified(cert: &Path, key: &Path, ocsp: Option<Vec<u8>>) -> Result<Certified
 /// A client without SNI gets the default certificate.
 #[derive(Debug)]
 struct NamedResolver {
-    named: Vec<(Vec<String>, Arc<CertifiedKey>)>,
+    named: Vec<NamedCertKey>,
     default: Option<Arc<CertifiedKey>>,
 }
 
@@ -745,5 +762,38 @@ mod tests {
         assert!(no_default.pick(Some("b.example.com")).is_none());
         assert!(no_default.pick(Some("x.b.example.com")).is_some());
         assert!(no_default.pick(Some("deep.x.b.example.com")).is_none());
+    }
+
+    #[test]
+    fn sni_certificates_carry_their_own_ocsp() {
+        let fixtures = fixtures();
+        let dir = TempDir::new("sni-ocsp");
+        let ocsp_a = dir.write("a.ocsp", b"ocsp-for-a");
+        let ocsp_b = dir.write("b.ocsp", b"ocsp-for-b");
+
+        let named = vec![
+            NamedCert {
+                names: vec!["a.example.com".to_owned()],
+                cert: fixtures.join("cert.pem"),
+                key: fixtures.join("key.pem"),
+                ocsp: Some(ocsp_a),
+            },
+            NamedCert {
+                names: vec!["b.example.com".to_owned()],
+                cert: fixtures.join("cert.pem"),
+                key: fixtures.join("key.pem"),
+                ocsp: Some(ocsp_b),
+            },
+        ];
+
+        let resolver = NamedResolver {
+            named: build_named(&named).expect("named certificates"),
+            default: None,
+        };
+
+        let a = resolver.pick(Some("a.example.com")).expect("a");
+        assert_eq!(a.ocsp.as_deref(), Some(&b"ocsp-for-a"[..]));
+        let b = resolver.pick(Some("b.example.com")).expect("b");
+        assert_eq!(b.ocsp.as_deref(), Some(&b"ocsp-for-b"[..]));
     }
 }
