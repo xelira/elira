@@ -62,6 +62,7 @@ pub struct FastStatic {
     pub server_header: bool,
     pub alt_svc: Option<HeaderValue>,
     pub access_log: bool,
+    pub access_log_sample: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -69,6 +70,7 @@ pub struct Labels {
     pub route: String,
     pub upstream: Option<String>,
     pub access_log: bool,
+    pub access_log_sample: f64,
 }
 
 /// Marks a response whose body already came from an error page.
@@ -149,6 +151,7 @@ struct RouteEntry {
     cache: Option<bool>,
     cache_ttl: Option<Duration>,
     access_log: bool,
+    access_log_sample: f64,
     max_upstream_response: Option<usize>,
     fastcgi_param: Vec<(String, String)>,
     cgi_param: Vec<(String, String)>,
@@ -673,6 +676,7 @@ impl Proxy {
                 cache: route.cache_enabled,
                 cache_ttl: route.cache_ttl_secs.map(Duration::from_secs),
                 access_log: route.access_log,
+                access_log_sample: route.access_log_sample.unwrap_or(cfg.log.sample),
                 max_upstream_response: route.max_upstream_response_bytes,
                 fastcgi_param: route
                     .fastcgi_param
@@ -874,6 +878,7 @@ impl Proxy {
             server_header: self.inner.server_header,
             alt_svc: self.inner.alt_svc.clone(),
             access_log: entry.access_log,
+            access_log_sample: entry.access_log_sample,
         })
     }
 
@@ -1225,6 +1230,7 @@ impl Proxy {
                     route: entry.label.clone(),
                     upstream: None,
                     access_log: entry.access_log,
+                    access_log_sample: entry.access_log_sample,
                 });
                 self.apply_error_page(&mut response, entry, peer).await;
                 self.apply_route(&mut response, entry, &request_id);
@@ -1243,6 +1249,7 @@ impl Proxy {
                     route: entry.label.clone(),
                     upstream: None,
                     access_log: entry.access_log,
+                    access_log_sample: entry.access_log_sample,
                 });
                 self.apply_route(&mut response, entry, &request_id);
                 return Ok(response);
@@ -1253,6 +1260,7 @@ impl Proxy {
                     route: entry.label.clone(),
                     upstream: None,
                     access_log: entry.access_log,
+                    access_log_sample: entry.access_log_sample,
                 });
                 self.apply_error_page(&mut response, entry, peer).await;
                 self.apply_route(&mut response, entry, &request_id);
@@ -1264,6 +1272,7 @@ impl Proxy {
                     route: entry.label.clone(),
                     upstream: None,
                     access_log: entry.access_log,
+                    access_log_sample: entry.access_log_sample,
                 });
                 self.apply_error_page(&mut response, entry, peer).await;
                 self.apply_route(&mut response, entry, &request_id);
@@ -1275,6 +1284,7 @@ impl Proxy {
                     route: entry.label.clone(),
                     upstream: None,
                     access_log: entry.access_log,
+                    access_log_sample: entry.access_log_sample,
                 });
                 self.apply_error_page(&mut response, entry, peer).await;
                 self.apply_route(&mut response, entry, &request_id);
@@ -1416,6 +1426,7 @@ impl Proxy {
                         route: entry.label.clone(),
                         upstream: Some(pool.name.clone()),
                         access_log: entry.access_log,
+                        access_log_sample: entry.access_log_sample,
                     });
                     if stale {
                         self.refresh(
@@ -1672,6 +1683,7 @@ impl Proxy {
             route: entry.label.clone(),
             upstream: Some(pool.name.clone()),
             access_log: entry.access_log,
+            access_log_sample: entry.access_log_sample,
         });
         self.apply_error_page(&mut response, entry, peer).await;
         self.apply_route(&mut response, entry, &request_id);

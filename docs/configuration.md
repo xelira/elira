@@ -349,7 +349,13 @@ HTTP/3 живёт на отдельном UDP-порту и не делит со
 | --- | --- | --- | --- |
 | `format` | `"text"` или `"json"` | `"text"` | формат строки access-лога |
 | `template` | строка | нет | nginx-подобный шаблон; сильнее `format` |
+| `sample` | дробь 0..1 | `1.0` | доля запросов, попадающих в access-лог |
 | `syslog` | путь | нет | Unix datagram, обычно `/dev/log` |
+
+`sample` применяется к каждому запросу независимо; `0.0` выключает запись,
+`1.0` пишет всё. Решение принимается по уже случайному `request_id`, поэтому
+метрики и ответы клиентам не зависят от сэмплирования. Маршрут может
+переопределить долю через `access_log_sample`.
 
 Значение сравнивается точно: только эти две строки. Любое
 другое (включая `Text` или `JSON`) даёт ошибку `unknown log format "...", expected "text" or "json"`.
@@ -594,6 +600,7 @@ advisory-lock `.elira-cache.lock`, а `max_bytes` считается по все
 | `cache_enabled` | bool | глобальный | использовать ли общий кэш для маршрута |
 | `cache_ttl_secs` | целое > 0 | глобальный | свой TTL записей маршрута |
 | `access_log` | bool | `true` | писать ли запросы этого маршрута в access-лог |
+| `access_log_sample` | дробь 0..1 | `log.sample` | доля запросов маршрута в access-логе |
 | `max_concurrent` | целое > 0 | `16` | одновременные FastCGI/CGI/module запросы |
 | `error_pages` | массив строк | `[]` | `"404 /404.html"` |
 | `error_root` | путь | `root` | каталог для страниц ошибок проксирующего маршрута |
@@ -830,6 +837,7 @@ elira check --config elira.toml
 | `route N: "..." is not "STATUS /path"` | битая `error_pages` | формат `404 /404.html` |
 | `"..." is not "STATUS /path"` | битый глобальный `error_pages` | формат `404 /404.html` |
 | `global error_pages need error_root` | страницы без каталога | добавьте `error_root` |
+| `log.sample must be a fraction between 0 and 1` | сэмплирование вне диапазона | задайте `0.0`..`1.0` |
 | `route N: timeout_secs must be greater than zero` | нулевой таймаут | уберите поле или поставьте больше нуля |
 | `http3.cert must not be empty` | `[http3]` без сертификата | задайте `cert` и `key` |
 | `health.path must start with '/'...` | путь без `/` | `/health` |

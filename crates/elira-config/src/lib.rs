@@ -636,6 +636,10 @@ pub struct Route {
     #[serde(default = "Route::default_access_log")]
     pub access_log: bool,
 
+    /// Fraction of this route's requests to log. Overrides `log.sample`.
+    #[serde(default)]
+    pub access_log_sample: Option<f64>,
+
     /// Error pages as `STATUS /path.html`, served from `error_root` or `root`.
     #[serde(default)]
     pub error_pages: Vec<String>,
@@ -829,7 +833,7 @@ pub enum TlsVersion {
     Tls13,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Log {
     #[serde(default)]
@@ -847,6 +851,10 @@ pub struct Log {
     #[serde(default = "Log::default_keep")]
     pub keep: usize,
 
+    /// Fraction of requests to write to the access log. One logs everything.
+    #[serde(default = "Log::default_sample")]
+    pub sample: f64,
+
     /// nginx-like template. Overrides `format` when set.
     #[serde(default)]
     pub template: Option<String>,
@@ -856,7 +864,25 @@ pub struct Log {
     pub syslog: Option<PathBuf>,
 }
 
+impl Default for Log {
+    fn default() -> Self {
+        Self {
+            format: LogFormat::default(),
+            file: None,
+            max_bytes: Self::default_max_bytes(),
+            keep: Self::default_keep(),
+            sample: Self::default_sample(),
+            template: None,
+            syslog: None,
+        }
+    }
+}
+
 impl Log {
+    fn default_sample() -> f64 {
+        1.0
+    }
+
     fn default_max_bytes() -> usize {
         64 * 1024 * 1024
     }
@@ -1136,6 +1162,10 @@ impl Config {
         }
         if self.workers > 1 && !self.reuse_port {
             return Err(Error::WorkersNeedReusePort);
+        }
+
+        if !self.log.sample.is_finite() || !(0.0..=1.0).contains(&self.log.sample) {
+            return Err(Error::BadLogSample);
         }
 
         if self.error_pages.is_empty() {
@@ -1493,6 +1523,11 @@ impl Config {
             }
             if route.max_upstream_response_bytes == Some(0) {
                 return Err(Error::BadUpstreamResponseCap { index });
+            }
+            if let Some(sample) = route.access_log_sample {
+                if !sample.is_finite() || !(0.0..=1.0).contains(&sample) {
+                    return Err(Error::BadRouteLogSample { index });
+                }
             }
             if route.cache_ttl_secs == Some(0) {
                 return Err(Error::BadRouteCacheTtl { index });
@@ -1888,6 +1923,12 @@ pub enum Error {
 
     #[error("route {index}: max_upstream_response_bytes must be greater than zero")]
     BadUpstreamResponseCap { index: usize },
+
+    #[error("route {index}: access_log_sample must be between 0 and 1")]
+    BadRouteLogSample { index: usize },
+
+    #[error("log.sample must be a fraction between 0 and 1")]
+    BadLogSample,
 
     #[error("route {index}: cache_ttl_secs must be greater than zero")]
     BadRouteCacheTtl { index: usize },
@@ -2706,6 +2747,36 @@ error_pages = ["404 nope"]
         assert!(matches!(
             Config::parse(text),
             Err(Error::BadErrorPage { .. })
+        ));
+    }
+
+    #[test]
+    fn access_log_sampling_is_validated() {
+        let text = r#"
+listen = "127.0.0.1:8080"
+
+[log]
+sample = 0.25
+
+[[routes]]
+host = "*"
+root = "/srv/www"
+access_log_sample = 0.1
+"#;
+        let cfg = Config::parse(text).expect("valid");
+        assert_eq!(cfg.log.sample, 0.25);
+        assert_eq!(cfg.routes[0].access_log_sample, Some(0.1));
+
+        let bad_global = text.replace("sample = 0.25", "sample = 1.5");
+        assert!(matches!(
+            Config::parse(&bad_global),
+            Err(Error::BadLogSample)
+        ));
+
+        let bad_route = text.replace("access_log_sample = 0.1", "access_log_sample = -0.1");
+        assert!(matches!(
+            Config::parse(&bad_route),
+            Err(Error::BadRouteLogSample { .. })
         ));
     }
 

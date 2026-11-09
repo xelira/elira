@@ -1447,6 +1447,48 @@ root = "{root}"
 }
 
 #[tokio::test]
+async fn route_access_log_sampling_overrides_the_global_rate() {
+    let root = temp_root("logsample");
+    std::fs::write(root.join("index.html"), "ok").unwrap();
+    let log_path = root.join("access.log");
+
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[log]
+file = "{log}"
+sample = 0.0
+
+[[routes]]
+host = "quiet.local"
+root = "{root}"
+
+[[routes]]
+host = "loud.local"
+root = "{root}"
+access_log_sample = 1.0
+"#,
+        log = log_path.display(),
+        root = root.display()
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    for host in ["quiet.local", "loud.local"] {
+        let _ = roundtrip(
+            addr,
+            &format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"),
+        )
+        .await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let logged = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(!logged.contains("quiet.local"), "{logged}");
+    assert!(logged.contains("loud.local"), "{logged}");
+}
+
+#[tokio::test]
 async fn basic_auth_guards_a_route() {
     let upstream = upstream().await;
     let root = temp_root("auth");

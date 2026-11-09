@@ -34,6 +34,7 @@ pub struct Runtime {
     health: Health,
     http3: Option<Http3>,
     access_log: Option<Arc<crate::access_log::AccessLog>>,
+    access_log_sample: f64,
     template: Option<elira_accesslog::Format>,
     syslog: Option<Arc<elira_accesslog::Syslog>>,
 }
@@ -91,6 +92,7 @@ impl Runtime {
                 )?)),
                 None => None,
             },
+            access_log_sample: cfg.log.sample,
             template: match &cfg.log.template {
                 Some(template) => Some(
                     elira_accesslog::Format::parse(template)
@@ -126,6 +128,10 @@ impl Runtime {
 
     pub fn access_log(&self) -> Option<&Arc<crate::access_log::AccessLog>> {
         self.access_log.as_ref()
+    }
+
+    pub fn access_log_sample(&self) -> f64 {
+        self.access_log_sample
     }
 
     /// Render one access line and send it to every configured sink.
@@ -614,12 +620,16 @@ async fn serve_conn<I>(
             metrics.record_request(status, elapsed);
             metrics.request_bytes(request_bytes);
             let mut upstream = None;
+            let mut access_log = true;
+            let mut access_log_sample = current.access_log_sample();
             if let Some(labels) = response.extensions().get::<elira_proxy::Labels>().cloned() {
                 metrics.record_route(&labels.route, status, elapsed);
                 if let Some(name) = &labels.upstream {
                     metrics.record_upstream(name, status, elapsed);
                 }
                 upstream = labels.upstream;
+                access_log = labels.access_log;
+                access_log_sample = labels.access_log_sample;
             }
             match response
                 .headers()
@@ -633,6 +643,7 @@ async fn serve_conn<I>(
             }
             let bytes = response.body().size_hint().exact().unwrap_or(0);
             metrics.response_bytes(bytes);
+            let write_log = access_log && sample_request(&id, access_log_sample);
             let entry = Entry {
                 peer: peer.ip(),
                 method,
@@ -647,12 +658,7 @@ async fn serve_conn<I>(
                 upstream,
             };
 
-            if response
-                .extensions()
-                .get::<elira_proxy::Labels>()
-                .map(|labels| labels.access_log)
-                .unwrap_or(true)
-            {
+            if write_log {
                 current.write_log(&entry);
             }
 
@@ -1041,9 +1047,30 @@ async fn idle_watch(idle: Arc<tokio::sync::Notify>, timeout: Duration) {
     }
 }
 
+/// Decide whether a request makes it into the access log. Request ids are
+/// already random 64-bit values, so they double as the sampling draw.
+pub(crate) fn sample_request(request_id: &str, rate: f64) -> bool {
+    if rate >= 1.0 {
+        return true;
+    }
+    if rate <= 0.0 {
+        return false;
+    }
+    let value = u64::from_str_radix(request_id, 16).unwrap_or(0);
+    (value as f64) < rate * (u64::MAX as f64)
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sampling_respects_the_boundaries() {
+        assert!(sample_request("0000000000000000", 1.0));
+        assert!(!sample_request("0000000000000000", 0.0));
+        assert!(sample_request("0000000000000000", 0.5));
+        assert!(!sample_request("ffffffffffffffff", 0.5));
+    }
 
     #[tokio::test]
     async fn reuse_port_lets_two_listeners_share_a_port() {
