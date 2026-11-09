@@ -300,6 +300,46 @@ pub fn bind_unix(path: &std::path::Path) -> std::io::Result<UnixListener> {
     UnixListener::bind(path)
 }
 
+/// Apply the configured mode and numeric owner to a freshly bound socket.
+pub fn configure_unix(
+    path: &std::path::Path,
+    mode: Option<u32>,
+    owner: Option<&str>,
+) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    if let Some(mode) = mode {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    }
+
+    if let Some(owner) = owner {
+        let (uid, gid) = owner
+            .split_once(':')
+            .and_then(|(uid, gid)| Some((uid.parse::<u32>().ok()?, gid.parse::<u32>().ok()?)))
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "owner must look like uid:gid",
+                )
+            })?;
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "socket path has a NUL byte",
+            )
+        })?;
+        // SAFETY: the path is a valid NUL-terminated string and chown does not
+        // retain the pointer after returning.
+        let result = unsafe { libc::chown(path.as_ptr(), uid, gid) };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+
+    Ok(())
+}
+
 /// Accept HTTP/1.1 (or HTTP/2 over TLS) on a unix socket. PROXY protocol is
 /// not applied; the peer address is localhost for logs and ACLs.
 pub async fn serve_unix(
@@ -1178,6 +1218,34 @@ async fn idle_watch(idle: Arc<tokio::sync::Notify>, timeout: Duration) {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unix_socket_mode_and_owner_are_applied() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "elira-unix-mode-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let path = dir.join("elira.sock");
+        let listener = bind_unix(&path).expect("bind");
+
+        let owner = format!("{}:{}", unsafe { libc::geteuid() }, unsafe {
+            libc::getegid()
+        });
+        configure_unix(&path, Some(0o600), Some(&owner)).expect("configure");
+
+        let metadata = std::fs::metadata(&path).expect("metadata");
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[tokio::test]
     async fn reuse_port_lets_two_listeners_share_a_port() {

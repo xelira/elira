@@ -33,6 +33,8 @@ listen = "0.0.0.0:8080"
 # include = ["/etc/elira/conf.d/*.toml"]   # ${ENV} is substituted in values
 listen_unix = "/run/elira.sock"   # optional unix listener
 unix_tls = false                  # true terminates TLS with [tls]
+# listen_unix_mode = 0o660
+# listen_unix_owner = "1000:1000"
 # h2c = true                      # HTTP/2 with prior knowledge on plain TCP
 # workers = 4                     # needs reuse_port = true
 

@@ -24,6 +24,14 @@ pub struct Config {
     #[serde(default)]
     pub unix_tls: bool,
 
+    /// Permission bits for the unix socket, for example `0o660`.
+    #[serde(default)]
+    pub listen_unix_mode: Option<u32>,
+
+    /// Numeric owner as `uid:gid` for the unix socket.
+    #[serde(default)]
+    pub listen_unix_owner: Option<String>,
+
     /// Accept HTTP/2 with prior knowledge on plain TCP (h2c).
     #[serde(default)]
     pub h2c: bool,
@@ -1327,6 +1335,22 @@ impl Config {
         if self.unix_tls && self.listen_unix.is_none() {
             return Err(Error::UnixTlsWithoutListener);
         }
+        if (self.listen_unix_mode.is_some() || self.listen_unix_owner.is_some())
+            && self.listen_unix.is_none()
+        {
+            return Err(Error::UnixOptionsWithoutListener);
+        }
+        if self.listen_unix_mode.is_some_and(|mode| mode > 0o7777) {
+            return Err(Error::BadUnixMode);
+        }
+        if let Some(owner) = &self.listen_unix_owner {
+            let valid = owner
+                .split_once(':')
+                .is_some_and(|(uid, gid)| uid.parse::<u32>().is_ok() && gid.parse::<u32>().is_ok());
+            if !valid {
+                return Err(Error::BadUnixOwner);
+            }
+        }
         if self.unix_tls && self.tls.is_none() {
             return Err(Error::UnixTlsWithoutTls);
         }
@@ -2130,6 +2154,15 @@ pub enum Error {
 
     #[error("unix_tls needs listen_unix")]
     UnixTlsWithoutListener,
+
+    #[error("listen_unix_mode/listen_unix_owner need listen_unix")]
+    UnixOptionsWithoutListener,
+
+    #[error("listen_unix_mode must not exceed 0o7777")]
+    BadUnixMode,
+
+    #[error("listen_unix_owner must look like \"uid:gid\"")]
+    BadUnixOwner,
 
     #[error("unix_tls needs a [tls] section with a certificate")]
     UnixTlsWithoutTls,
@@ -3662,6 +3695,38 @@ root = "/srv/www"
 
         let empty = base.replace("client_crl = \"/tmp/ca.crl.pem\"", "client_crl = \"\"");
         assert!(matches!(Config::parse(&empty), Err(Error::EmptyClientCrl)));
+    }
+
+    #[test]
+    fn unix_socket_permissions_are_validated() {
+        let base = r#"
+listen = "127.0.0.1:8080"
+listen_unix = "/run/elira.sock"
+listen_unix_mode = 0o660
+listen_unix_owner = "1000:1000"
+
+[[routes]]
+host = "*"
+root = "/srv/www"
+"#;
+        let cfg = Config::parse(base).expect("valid");
+        assert_eq!(cfg.listen_unix_mode, Some(0o660));
+        assert_eq!(cfg.listen_unix_owner.as_deref(), Some("1000:1000"));
+
+        let no_listener = base.replace("listen_unix = \"/run/elira.sock\"\n", "");
+        assert!(matches!(
+            Config::parse(&no_listener),
+            Err(Error::UnixOptionsWithoutListener)
+        ));
+
+        let bad_mode = base.replace("0o660", "0o10000");
+        assert!(matches!(Config::parse(&bad_mode), Err(Error::BadUnixMode)));
+
+        let bad_owner = base.replace("\"1000:1000\"", "\"nobody\"");
+        assert!(matches!(
+            Config::parse(&bad_owner),
+            Err(Error::BadUnixOwner)
+        ));
     }
 
     #[test]

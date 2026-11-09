@@ -56,9 +56,11 @@ include = ["/etc/elira/conf.d/*.toml"]
 `sendfile` на нём не применяются; peer для логов и ACL — `127.0.0.1`. С
 `unix_tls = true` тот же сокет терминирует TLS настройками `[tls]`, включая
 SNI-сертификаты, mTLS, OCSP и ALPN `h2`/`http/1.1`; сертификат перечитывается
-по `SIGHUP` для новых соединений. Без `[tls]` комбинация отклоняется. Сокет не
-удаляется при старте: существующий файл означает ошибку, а не молчаливую
-замену чужого сокета.
+по `SIGHUP` для новых соединений. Без `[tls]` комбинация отклоняется.
+`listen_unix_mode` выставляет права после bind (например, `0o660`), а
+`listen_unix_owner` — числового владельца `"uid:gid"`; для чужого uid нужен
+root. Сокет не удаляется при старте: существующий файл означает ошибку, а не
+молчаливую замену чужого сокета.
 
 Адреса везде имеют вид `IP:порт` (тип `SocketAddr` в TOML-строке), поэтому
 `localhost:8080` не подходит — нужен `127.0.0.1:8080` или `[::1]:8080`.
@@ -72,6 +74,8 @@ SNI-сертификаты, mTLS, OCSP и ALPN `h2`/`http/1.1`; сертифик
 | `listen` | `IP:порт` | нет, обязательно | TCP-адрес основного HTTP-листенера |
 | `listen_unix` | путь | нет | дополнительный HTTP/1.1 на unix-сокете |
 | `unix_tls` | bool | `false` | завершать TLS на `listen_unix` настройками `[tls]` |
+| `listen_unix_mode` | целое | права из umask | биты доступа к сокету, например `0o660` |
+| `listen_unix_owner` | строка | нет | владелец сокета `"uid:gid"` |
 | `h2c` | bool | `false` | HTTP/2 prior knowledge без TLS |
 | `workers` | 1..64 | `1` | процессы-воркеры с SO_REUSEPORT; нужен `reuse_port = true` |
 | `proxy_protocol` | bool | `false` | ждать PROXY protocol (v1/v2) на каждом соединении |
@@ -984,6 +988,8 @@ elira check --config elira.toml
 | `"..." is not a hash key` | неизвестный ключ | `ip`, `authorization`, `header:NAME`, `cookie:NAME`, `uri` |
 | `unix_tls needs listen_unix` | TLS на сокете без сокета | задайте `listen_unix` |
 | `unix_tls needs a [tls] section...` | Unix TLS без сертификата | добавьте `[tls]` |
+| `listen_unix_mode/listen_unix_owner need listen_unix` | права без сокета | задайте `listen_unix` |
+| `listen_unix_owner must look like...` | имя вместо uid:gid | используйте числа |
 | `weights must contain one positive value per server` | длина не совпала | выровняйте `weights` и `servers` |
 | `weights and balance = "hash" cannot be combined` | веса с hash | уберите `weights` |
 | `"..." is not a retry condition` | мусор в `retry_on` | `error`, `timeout` или 5xx |

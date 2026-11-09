@@ -148,6 +148,7 @@
 - Буферизация и spooling тела запроса; ретраи `PUT`/`DELETE` с телом.
 - Single-flight заполнение кэша при одновременных промахах.
 - Политика `retry_on`: ошибки, таймауты и 5xx.
+- Права и владелец unix-сокета (`listen_unix_mode`, `listen_unix_owner`).
 - `Cache-Control: must-revalidate` запрещает stale-выдачу; `Expires`/`Date`
   задают TTL, если `max-age` нет. Запросы с `no-cache`/`no-store` обходят кэш.
 - Заголовки `Forwarded` и `X-Forwarded-Port` к upstream.

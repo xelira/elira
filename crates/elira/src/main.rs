@@ -254,6 +254,8 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
         Some(path) => {
             let listener = server::bind_unix(path)
                 .with_context(|| format!("cannot bind unix socket {}", path.display()))?;
+            server::configure_unix(path, cfg.listen_unix_mode, cfg.listen_unix_owner.as_deref())
+                .with_context(|| format!("cannot configure unix socket {}", path.display()))?;
             tracing::info!(path = %path.display(), "listening on a unix socket");
             Some(tokio::spawn(server::serve_unix(
                 listener,
