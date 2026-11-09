@@ -110,6 +110,80 @@ Living list for the self-improvement loop. One item per session.
 - [x] Scripted-peer tests for truncated and trailing FastCGI/CGI streaming
   framing.
 
+## N — nginx parity
+
+### Section 1 leftovers (architecture)
+
+- [ ] `chroot` support with path rewriting for logs, cache and certificates.
+- [ ] `worker_cpu_affinity`.
+- [ ] Per-listener route sets, i.e. routes scoped to a named listener rather
+  than shared by every listener.
+
+### Section 2 — routing and configuration language
+
+- [ ] Variables in `request_headers`, `add_headers`, redirects and error pages;
+  `$remote_addr`, `$host`, `$request_uri`, `$request_id` at minimum.
+- [ ] `rewrite` rules, `return` with variables, `if`, `map`, `geo`,
+  `split_clients`.
+- [ ] `location =`, `^~`, nested and named locations, `internal`.
+- [ ] `alias` (distinct from `root`).
+- [ ] `auth_request` subrequests.
+- [ ] `satisfy any/all` for auth plus ACL combinations.
+- [ ] `secure_link`.
+- [ ] `X-Accel-Redirect` and `X-Sendfile` from upstream responses.
+- [ ] `error_page` status overrides (`=200`) and named locations.
+- [ ] `expires`, `add_header ... always`, `etag off`,
+  `if_modified_since off`.
+
+### Section 3 — proxying and cache
+
+- [ ] Per-status cache TTL (`proxy_cache_valid`), cache key and bypass
+  directives, cache zones, manager/loader.
+- [ ] FastCGI/CGI response caching.
+- [ ] Upstream client certificates, upstream CRL and upstream cipher policy.
+- [ ] Separate connect/send/read timeouts.
+- [ ] `proxy_protocol on` toward upstreams and `proxy_bind`.
+- [ ] `proxy_redirect`, `proxy_cookie_domain/path`, `proxy_hide_header`.
+- [ ] Upstream keepalive tuning: `keepalive`, `keepalive_requests`, per-server
+  `max_conns`, `backup`, `down`, `slow_start`, `random`.
+- [ ] Configurable resolver with runtime DNS and TTL policy.
+
+### Section 4 — limits and operations
+
+- [ ] `limit_rate` and `limit_rate_after` bandwidth throttling.
+- [ ] `limit_conn` per-IP concurrent connection limits.
+- [ ] `limit_req` delay/nodelay semantics on top of the token bucket.
+- [ ] `keepalive_requests` per connection.
+- [ ] Configurable `client_header_timeout`, `lingering_close`,
+  `reset_timedout_connection`.
+- [ ] Log reopen on SIGUSR1 for external rotation.
+- [ ] `open_file_cache`.
+- [ ] `worker_rlimit_nofile` propagation tuning and `worker_processes auto`.
+- [ ] `worker_cpu_affinity` (also listed above).
+
+### Section 5 — HTTP details
+
+- [ ] `103 Early Hints`.
+- [ ] `h2c Upgrade`.
+- [ ] Dual RSA + ECDSA certificates per name.
+- [ ] Verify stapled OCSP responses (`ssl_stapling_verify`).
+- [ ] `ssl_reject_handshake` for unknown SNI.
+- [ ] HTTP/2 max concurrent streams and window tuning.
+- [ ] HTTP/3 QUIC transport tuning exposed in `[http3]`.
+
+### Section 6 — observability
+
+- [ ] `$upstream_addr`, `$upstream_status`, `$upstream_response_time` in
+  access logs and templates.
+- [ ] Map-derived log variables.
+- [ ] Request/response bytes and timings split per route and upstream.
+
+### Section 7 — performance
+
+- [ ] `io_uring`/AIO and `open_file_cache` for static files.
+- [ ] Zero-copy `sendfile` through TLS and HTTP/2.
+- [ ] Benchmark and tune the tokio/hyper hot path against nginx baselines.
+
 ## Done
 
 - [x] Streaming FastCGI and CGI.
