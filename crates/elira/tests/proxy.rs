@@ -101,6 +101,48 @@ async fn upstream() -> SocketAddr {
     addr
 }
 
+/// An HTTP upstream whose response body is a fixed label, so a test can tell
+/// which pool member served the request.
+async fn labeled_upstream(label: &'static str) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind labeled upstream");
+    let addr = listener.local_addr().expect("labeled addr");
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let Ok(read) = stream.read(&mut chunk).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        return;
+                    }
+                    head.extend_from_slice(&chunk[..read]);
+                    if head.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n{}",
+                    label.len(),
+                    label
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+
+    addr
+}
+
 /// A TCP server that echoes bytes back. Used by the CONNECT tests.
 async fn tcp_echo() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind echo");
@@ -825,6 +867,61 @@ upstream = "app"
         .await;
         assert_eq!(status(&response), "HTTP/1.1 200 OK", "{response}");
     }
+}
+
+#[tokio::test]
+async fn hash_balance_keeps_a_key_on_one_server() {
+    let first = labeled_upstream("one").await;
+    let second = labeled_upstream("two").await;
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[upstreams]]
+name = "app"
+servers = ["{first}", "{second}"]
+balance = "hash"
+hash_key = "header:x-user"
+
+[[routes]]
+host = "example.com"
+upstream = "app"
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    async fn body_for(addr: SocketAddr, user: &str) -> String {
+        let response = roundtrip(
+            addr,
+            &format!(
+                "GET / HTTP/1.1\r\nHost: example.com\r\nX-User: {user}\r\n\
+                 Connection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(status(&response), "HTTP/1.1 200 OK", "{response}");
+        response
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body.to_owned())
+            .unwrap_or_default()
+    }
+
+    let owner = body_for(addr, "user-1").await;
+    for _ in 0..5 {
+        assert_eq!(body_for(addr, "user-1").await, owner);
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    for index in 0..40 {
+        let body = body_for(addr, &format!("user-{index}")).await;
+        assert_eq!(body_for(addr, &format!("user-{index}")).await, body);
+        seen.insert(body);
+    }
+    assert_eq!(
+        seen.len(),
+        2,
+        "40 distinct keys should reach both servers, got {seen:?}"
+    );
 }
 
 #[tokio::test]

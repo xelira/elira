@@ -535,7 +535,8 @@ advisory-lock `.elira-cache.lock`, а `max_bytes` считается по все
 | --- | --- | --- | --- |
 | `name` | строка | нет, обязательна | имя, на которое ссылаются маршруты |
 | `servers` | массив строк | нет, обязателен и непуст | адреса бэкендов `host:port` или `unix:/path` |
-| `balance` | `round_robin` \| `least_conn` | `round_robin` | как выбирать сервер |
+| `balance` | `round_robin` \| `least_conn` \| `hash` | `round_robin` | как выбирать сервер |
+| `hash_key` | строка | `"ip"` | ключ для `balance = "hash"`: `ip`, `authorization`, `header:NAME`, `cookie:NAME`, `uri` |
 | `retries` | целое 0..5 | `0` | дополнительные попытки на ошибку соединения |
 | `tls` | bool | `false` | подключаться к серверам по HTTPS |
 | `sni` | строка | нет | имя для SNI и проверки сертификата |
@@ -559,6 +560,13 @@ advisory-lock `.elira-cache.lock`, а `max_bytes` считается по все
   как мёртвые. `least_conn` выбирает живого с наименьшим числом активных
   запросов; счётчик держится от приёма запроса до возврата заголовков ответа,
   поэтому потоковое тело в нём уже не учитывается.
+- `balance = "hash"` использует rendezvous hashing: один и тот же `hash_key`
+  остаётся на одном сервере, а добавление или удаление сервера перераспределяет
+  только ключи, которые были на нём. `hash_key = "uri"` хеширует путь с query;
+  остальные формы такие же, как у `rate_key`. При отсутствии заголовка или
+  cookie ключом становится IP. Если все серверы отключены, hash всё равно
+  выбирает детерминированного победителя, не теряя привязку.
+- `hash_key` допустим только вместе с `balance = "hash"`.
 - `retries` работает только для `GET`, `HEAD` и `OPTIONS` без
   `Content-Length` и `Transfer-Encoding`: тело нельзя переиграть. Повтор
   происходит при ошибке соединения или таймауте, не при ответе 5xx — бэкенд
@@ -625,7 +633,7 @@ advisory-lock `.elira-cache.lock`, а `max_bytes` считается по все
 | `timeout_secs` | целое > 0 | `limits.upstream_timeout_secs` | таймаут ответа upstream'а для этого маршрута |
 | `requests_per_second` | целое > 0 | глобальный лимит | свой token bucket для маршрута |
 | `burst` | целое ≥ 0 | равен rate | глубина bucket'а маршрута |
-| `rate_key` | строка | `"ip"` | ключ лимита: `ip`, `authorization`, `header:NAME`, `cookie:NAME` |
+| `rate_key` | строка | `"ip"` | ключ лимита: `ip`, `authorization`, `header:NAME`, `cookie:NAME`, `uri` |
 | `max_body_bytes` | целое ≥ 0 | глобальный лимит | свой предел `Content-Length` |
 | `max_response_bytes` | целое > 0 | `limits.max_response_bytes` | свой предел потокового ответа |
 | `max_upstream_response_bytes` | целое > 0 | `limits.max_upstream_response_bytes` | свой предел ответа upstream'а |
@@ -721,10 +729,11 @@ advisory-lock `.elira-cache.lock`, а `max_bytes` считается по все
   `429`. `max_body_bytes` проверяет `Content-Length` до обращения к upstream.
 - `rate_key` выбирает, что считает одним клиентом: адрес peer'а (`ip`,
   по умолчанию), полный `Authorization`, значение заголовка
-  (`header:X-Api-Key`) или cookie (`cookie:session`). Без выбранного заголовка
-  или cookie запрос попадает в bucket IP, поэтому лимит нельзя обойти их
-  отсутствием. Ключи хешируются случайным ключом процесса и не хранятся в
-  исходном виде. `rate_key` требует `requests_per_second` на том же маршруте.
+  (`header:X-Api-Key`), cookie (`cookie:session`) или путь с query (`uri`).
+  Без выбранного заголовка или cookie запрос попадает в bucket IP, поэтому
+  лимит нельзя обойти их отсутствием. Ключи хешируются случайным ключом
+  процесса и не хранятся в исходном виде. `rate_key` требует
+  `requests_per_second` на том же маршруте.
 - `error_pages` подменяет тело ответа с указанным статусом файлом. Статус
   сохраняется, даже если файл существует. `error_root` нужен, когда маршрут
   проксирует, а не отдаёт статику. Страницы применяются и к локальным отказам
@@ -900,6 +909,8 @@ elira check --config elira.toml
 | `QUIC requires TLS 1.3 cipher suites` | TLS 1.2 suite в `[http3]` | оставьте только `TLS13_*` |
 | `request headers cannot override hop-by-hop...` | `Connection`/`Transfer-Encoding` в request-заголовках | уберите framing-заголовки |
 | `eject_secs must be greater than zero...` | эвикция без cooldown | задайте `eject_secs` |
+| `hash_key needs balance = "hash"` | ключ без hash-балансировки | добавьте `balance = "hash"` |
+| `"..." is not a hash key` | неизвестный ключ | `ip`, `authorization`, `header:NAME`, `cookie:NAME`, `uri` |
 | `route N: timeout_secs must be greater than zero` | нулевой таймаут | уберите поле или поставьте больше нуля |
 | `http3.cert must not be empty` | `[http3]` без сертификата | задайте `cert` и `key` |
 | `health.path must start with '/'...` | путь без `/` | `/health` |

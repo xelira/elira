@@ -35,6 +35,7 @@ Living list for the self-improvement loop. One item per session.
 - [x] Admin `GET /config` with the effective configuration.
 - [x] Request header overrides and removals per route.
 - [x] Passive upstream ejection after consecutive transport failures.
+- [x] Rendezvous hash balancing by IP, header, cookie, Authorization or URI.
 - [x] Per-route FastCGI pool size.
 - [x] Purge tests through the admin listener in both single and worker mode.
 - [x] Per-route cache enable/TTL overrides.

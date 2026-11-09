@@ -134,26 +134,28 @@ enum ModuleTarget {
 }
 
 #[derive(Clone, Debug)]
-enum RateKey {
+enum RequestKey {
     Ip,
     Authorization,
     Header(HeaderName),
     Cookie(String),
+    Uri,
 }
 
-fn parse_rate_key(value: Option<&str>) -> RateKey {
+fn parse_request_key(value: Option<&str>) -> RequestKey {
     match value {
-        None | Some("ip") => RateKey::Ip,
-        Some("authorization") => RateKey::Authorization,
+        None | Some("ip") => RequestKey::Ip,
+        Some("authorization") => RequestKey::Authorization,
+        Some("uri") => RequestKey::Uri,
         Some(value) => {
             if let Some(name) = value.strip_prefix("header:") {
                 HeaderName::from_bytes(name.as_bytes())
-                    .map(RateKey::Header)
-                    .unwrap_or(RateKey::Ip)
+                    .map(RequestKey::Header)
+                    .unwrap_or(RequestKey::Ip)
             } else if let Some(name) = value.strip_prefix("cookie:") {
-                RateKey::Cookie(name.to_owned())
+                RequestKey::Cookie(name.to_owned())
             } else {
-                RateKey::Ip
+                RequestKey::Ip
             }
         }
     }
@@ -162,23 +164,25 @@ fn parse_rate_key(value: Option<&str>) -> RateKey {
 /// The value that identifies one bucket. A missing header or cookie falls
 /// back to the peer address, so a client cannot dodge the limiter by omitting
 /// it.
-fn rate_key_value<'a>(
-    key: &RateKey,
+fn request_key_value<'a>(
+    key: &RequestKey,
     headers: &'a HeaderMap,
     peer: std::net::IpAddr,
+    path: &'a str,
 ) -> Cow<'a, str> {
     let header = |name: &HeaderName| headers.get(name).and_then(|value| value.to_str().ok());
     match key {
-        RateKey::Ip => Cow::Owned(peer.to_string()),
-        RateKey::Authorization => header(&AUTHORIZATION)
+        RequestKey::Ip => Cow::Owned(peer.to_string()),
+        RequestKey::Authorization => header(&AUTHORIZATION)
             .map(Cow::Borrowed)
             .unwrap_or_else(|| Cow::Owned(peer.to_string())),
-        RateKey::Header(name) => header(name)
+        RequestKey::Header(name) => header(name)
             .map(Cow::Borrowed)
             .unwrap_or_else(|| Cow::Owned(peer.to_string())),
-        RateKey::Cookie(name) => cookie_value(headers, name)
+        RequestKey::Cookie(name) => cookie_value(headers, name)
             .map(Cow::Borrowed)
             .unwrap_or_else(|| Cow::Owned(peer.to_string())),
+        RequestKey::Uri => Cow::Borrowed(path),
     }
 }
 
@@ -240,7 +244,7 @@ struct RouteEntry {
     acl: Option<Arc<IpAcl>>,
     timeout: Option<Duration>,
     limiter: Option<Arc<RateLimiter>>,
-    rate_key: RateKey,
+    rate_key: RequestKey,
     body_limit: Option<usize>,
     error_pages: Vec<(StatusCode, String, Arc<Files>)>,
     app_permits: Option<Arc<Semaphore>>,
@@ -368,6 +372,8 @@ struct Pool {
     failures_before_eject: u32,
     eject_for: Duration,
     started: Instant,
+    hash_key: RequestKey,
+    server_labels: Vec<String>,
     next: AtomicUsize,
     balance: Balance,
     retries: u32,
@@ -397,22 +403,16 @@ impl Drop for ActiveGuard<'_> {
 
 impl Pool {
     fn pick(&self) -> usize {
+        self.pick_key(None)
+    }
+
+    fn pick_key(&self, key: Option<&str>) -> usize {
         let count = self.servers.len();
         let start = self.next.fetch_add(1, Ordering::Relaxed);
         let now = self.now_ms();
 
         match self.balance {
-            Balance::RoundRobin => {
-                for offset in 0..count {
-                    let index = (start + offset) % count;
-                    if self.available(index, now) {
-                        return index;
-                    }
-                }
-                // Everything looks down. Send traffic anyway: a broken probe
-                // or a stale ejection must not turn into an outage.
-                start % count
-            }
+            Balance::RoundRobin => self.pick_round_robin(start, now),
             Balance::LeastConn => {
                 let mut best = None;
                 let mut best_active = usize::MAX;
@@ -431,7 +431,58 @@ impl Pool {
 
                 best.unwrap_or(start % count)
             }
+            Balance::Hash => {
+                let Some(key) = key else {
+                    return self.pick_round_robin(start, now);
+                };
+                self.pick_rendezvous(key, now)
+            }
         }
+    }
+
+    fn pick_round_robin(&self, start: usize, now: u64) -> usize {
+        let count = self.servers.len();
+        for offset in 0..count {
+            let index = (start + offset) % count;
+            if self.available(index, now) {
+                return index;
+            }
+        }
+        // Everything looks down. Send traffic anyway: a broken probe or a
+        // stale ejection must not turn into an outage.
+        start % count
+    }
+
+    fn pick_rendezvous(&self, key: &str, now: u64) -> usize {
+        let mut best = None;
+        let mut best_score = 0;
+        for index in 0..self.servers.len() {
+            if !self.available(index, now) {
+                continue;
+            }
+            let score = rendezvous(key, &self.server_labels[index]);
+            if best.is_none() || score > best_score {
+                best = Some(index);
+                best_score = score;
+            }
+        }
+
+        if let Some(index) = best {
+            return index;
+        }
+
+        // All servers are unavailable. Pick the same rendezvous winner anyway
+        // instead of dropping the affinity completely.
+        let mut fallback = 0;
+        let mut fallback_score = 0;
+        for (index, label) in self.server_labels.iter().enumerate() {
+            let score = rendezvous(key, label);
+            if index == 0 || score > fallback_score {
+                fallback = index;
+                fallback_score = score;
+            }
+        }
+        fallback
     }
 
     fn available(&self, index: usize, now_ms: u64) -> bool {
@@ -540,6 +591,7 @@ impl Proxy {
                     "balance": match pool.balance {
                         Balance::RoundRobin => "round_robin",
                         Balance::LeastConn => "least_conn",
+                        Balance::Hash => "hash",
                     },
                     "retries": pool.retries,
                     "http2": pool.h2.as_ref().map(|h2| {
@@ -592,6 +644,7 @@ impl Proxy {
                     ejected_until_ms: AtomicU64::new(0),
                 })
                 .collect();
+            let server_labels = servers.iter().map(ToString::to_string).collect();
 
             // Each pool gets its own connector: trust and ALPN may differ
             // between upstreams.
@@ -622,6 +675,8 @@ impl Proxy {
                     failures_before_eject: up.failures_before_eject,
                     eject_for: Duration::from_secs(up.eject_secs),
                     started: Instant::now(),
+                    hash_key: parse_request_key(up.hash_key.as_deref()),
+                    server_labels,
                     next: AtomicUsize::new(0),
                     balance: up.balance,
                     retries: up.retries,
@@ -842,7 +897,7 @@ impl Proxy {
                 acl,
                 timeout: route.timeout_secs.map(Duration::from_secs),
                 limiter,
-                rate_key: parse_rate_key(route.rate_key.as_deref()),
+                rate_key: parse_request_key(route.rate_key.as_deref()),
                 body_limit: route.max_body_bytes,
                 error_pages,
                 app_permits,
@@ -1044,7 +1099,7 @@ impl Proxy {
             }
         }
         if let Some(limiter) = &entry.limiter {
-            let bucket = rate_key_value(&entry.rate_key, headers, peer);
+            let bucket = request_key_value(&entry.rate_key, headers, peer, path);
             if !limiter.check(bucket.as_ref(), Instant::now()) {
                 return None;
             }
@@ -1374,7 +1429,12 @@ impl Proxy {
         }
 
         if let Some(limiter) = &entry.limiter {
-            let bucket = rate_key_value(&entry.rate_key, req.headers(), peer.ip());
+            let key_path = req
+                .uri()
+                .path_and_query()
+                .map(|value| value.as_str())
+                .unwrap_or("/");
+            let bucket = request_key_value(&entry.rate_key, req.headers(), peer.ip(), key_path);
             if !limiter.check(bucket.as_ref(), Instant::now()) {
                 let mut response = text(StatusCode::TOO_MANY_REQUESTS, "too many requests");
                 response
@@ -1515,6 +1575,8 @@ impl Proxy {
         let (parts, body) = req.into_parts();
         // Kept for Vary matching: the response parts shadow this name later.
         let request_headers = parts.headers.clone();
+        let hash_key = (pool.balance == Balance::Hash)
+            .then(|| request_key_value(&pool.hash_key, &parts.headers, peer.ip(), &path));
         let mut template = HeaderMap::new();
         let drop = connection_tokens(&parts.headers);
         for (name, value) in parts.headers.iter() {
@@ -1644,7 +1706,7 @@ impl Proxy {
 
         if let Some(upgrade) = requested_upgrade.clone() {
             let client = client_upgrade.expect("created together with requested_upgrade");
-            let index = pool.pick();
+            let index = pool.pick_key(hash_key.as_deref());
             let server = pool.servers[index].clone();
             let _active = pool.enter(index);
             let uri = upstream_uri(&server, &upstream_path, pool.scheme)
@@ -1677,7 +1739,7 @@ impl Proxy {
         let mut response = None;
 
         for attempt in 0..attempts {
-            let index = pool.pick();
+            let index = pool.pick_key(hash_key.as_deref());
             let server = pool.servers[index].clone();
             let _active = pool.enter(index);
 
@@ -3235,6 +3297,15 @@ fn validators_from_entry(entry: &elira_cache::Entry) -> HeaderMap {
     validators
 }
 
+fn rendezvous(key: &str, server: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in key.bytes().chain(std::iter::once(0)).chain(server.bytes()) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 fn error_page_set(
     root: std::path::PathBuf,
     index: Vec<String>,
@@ -3658,6 +3729,8 @@ mod tests {
             failures_before_eject: 0,
             eject_for: Duration::from_secs(30),
             started: Instant::now(),
+            hash_key: RequestKey::Ip,
+            server_labels: vec!["127.0.0.1:1".to_owned(), "127.0.0.1:2".to_owned()],
             next: AtomicUsize::new(0),
             balance: Balance::LeastConn,
             retries: 0,
@@ -3700,6 +3773,8 @@ mod tests {
             failures_before_eject: 2,
             eject_for: Duration::from_secs(30),
             started: Instant::now(),
+            hash_key: RequestKey::Ip,
+            server_labels: vec!["127.0.0.1:1".to_owned(), "127.0.0.1:2".to_owned()],
             next: AtomicUsize::new(0),
             balance: Balance::RoundRobin,
             retries: 0,
@@ -3723,6 +3798,36 @@ mod tests {
         pool.record_success(0);
         pool.next.store(0, Ordering::Relaxed);
         assert_eq!(pool.pick(), 0);
+    }
+
+    #[test]
+    fn rendezvous_only_moves_keys_owned_by_a_removed_server() {
+        let labels = ["a", "b", "c"];
+        for index in 0..500 {
+            let key = format!("client-{index}");
+            let full = labels
+                .iter()
+                .copied()
+                .max_by_key(|label| rendezvous(&key, label))
+                .expect("winner");
+
+            for removed in labels {
+                if removed == full {
+                    continue;
+                }
+                let reduced: Vec<_> = labels
+                    .iter()
+                    .copied()
+                    .filter(|label| *label != removed)
+                    .collect();
+                let winner = reduced
+                    .iter()
+                    .copied()
+                    .max_by_key(|label| rendezvous(&key, label))
+                    .expect("winner");
+                assert_eq!(winner, full, "key {key} moved when {removed} was removed");
+            }
+        }
     }
 
     #[test]

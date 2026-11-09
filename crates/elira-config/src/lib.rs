@@ -380,6 +380,11 @@ pub struct Upstream {
     #[serde(default)]
     pub balance: Balance,
 
+    /// What identifies a client for `balance = "hash"`: `ip` (default),
+    /// `authorization`, `header:NAME`, `cookie:NAME` or `uri`.
+    #[serde(default)]
+    pub hash_key: Option<String>,
+
     /// Extra attempts on connection errors for bodyless idempotent requests.
     #[serde(default)]
     pub retries: u32,
@@ -514,6 +519,7 @@ pub enum Balance {
     #[default]
     RoundRobin,
     LeastConn,
+    Hash,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1162,7 +1168,7 @@ fn validate_tls_list(field: &'static str, list: &Option<Vec<String>>) -> Result<
 }
 
 fn valid_rate_key(value: &str) -> bool {
-    if value == "ip" || value == "authorization" {
+    if value == "ip" || value == "authorization" || value == "uri" {
         return true;
     }
     if let Some(name) = value.strip_prefix("header:") {
@@ -1526,6 +1532,19 @@ impl Config {
                 return Err(Error::BadEjectTimeout {
                     name: up.name.clone(),
                 });
+            }
+            if let Some(key) = &up.hash_key {
+                if up.balance != Balance::Hash {
+                    return Err(Error::HashKeyWithoutHashBalance {
+                        name: up.name.clone(),
+                    });
+                }
+                if !valid_rate_key(key) {
+                    return Err(Error::BadHashKey {
+                        name: up.name.clone(),
+                        key: key.clone(),
+                    });
+                }
             }
             if up.tls && up.servers.iter().any(|addr| addr.starts_with("unix:")) {
                 return Err(Error::TlsOverUnix {
@@ -2032,6 +2051,12 @@ pub enum Error {
 
     #[error("upstream \"{name}\": eject_secs must be greater than zero when failures_before_eject is set")]
     BadEjectTimeout { name: String },
+
+    #[error("upstream \"{name}\": hash_key needs balance = \"hash\"")]
+    HashKeyWithoutHashBalance { name: String },
+
+    #[error("upstream \"{name}\": \"{key}\" is not a hash key (ip, authorization, header:NAME, cookie:NAME, uri)")]
+    BadHashKey { name: String, key: String },
 
     #[error("upstream \"{name}\": TLS over a unix socket is not supported")]
     TlsOverUnix { name: String },
@@ -3245,6 +3270,43 @@ root = "/srv/www"
             cfg.cache.dir.as_deref().map(|p| p.to_str().unwrap()),
             Some("/var/cache/elira")
         );
+    }
+
+    #[test]
+    fn hash_balance_key_is_validated() {
+        let base = r#"
+listen = "127.0.0.1:8080"
+
+[[upstreams]]
+name = "app"
+servers = ["127.0.0.1:9000", "127.0.0.1:9001"]
+balance = "hash"
+hash_key = "header:X-User"
+
+[[routes]]
+host = "*"
+upstream = "app"
+"#;
+        let cfg = Config::parse(base).expect("valid");
+        assert_eq!(cfg.upstreams[0].balance, Balance::Hash);
+        assert_eq!(cfg.upstreams[0].hash_key.as_deref(), Some("header:X-User"));
+
+        for key in ["ip", "authorization", "cookie:session", "uri"] {
+            let text = base.replace("header:X-User", key);
+            assert!(Config::parse(&text).is_ok(), "{key}");
+        }
+
+        let without = base.replace("hash_key = \"header:X-User\"\n", "");
+        assert!(Config::parse(&without).is_ok(), "ip is the default key");
+
+        let bad = base.replace("header:X-User", "query:q");
+        assert!(matches!(Config::parse(&bad), Err(Error::BadHashKey { .. })));
+
+        let with_round_robin = base.replace("balance = \"hash\"", "balance = \"round_robin\"");
+        assert!(matches!(
+            Config::parse(&with_round_robin),
+            Err(Error::HashKeyWithoutHashBalance { .. })
+        ));
     }
 
     #[test]

@@ -197,7 +197,8 @@ Routing:
 
 Upstreams:
 
-- round robin and least connections, active health checks, passive ejection
+- round robin, least connections and rendezvous hashing by IP, header, cookie,
+  Authorization or URI; active health checks, passive ejection
   after repeated transport failures, retries for bodyless idempotent requests
 - streaming FastCGI over TCP (including DNS names) or unix sockets with an
   idle connection pool, streaming CGI scripts, and native `.so` modules
