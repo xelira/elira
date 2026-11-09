@@ -203,6 +203,8 @@ upstream. Нужен `error_root`; задавать их можно только
 | `client_ca` | путь | нет | PEM-корни для проверки клиентских сертификатов |
 | `client_auth` | `off` \| `optional` \| `required` | `off` | запрашивать ли клиентский сертификат |
 | `min_version` | `tls12` \| `tls13` | `tls12` | минимальная версия TLS |
+| `cipher_suites` | массив строк | по умолчанию rustls | cipher suites в порядке предпочтения |
+| `curves` | массив строк | по умолчанию rustls | key exchange groups в порядке предпочтения |
 | `ocsp` | путь | нет | DER OCSP-ответ для stapling; перечитывается по SIGHUP |
 | `ocsp_hook` | путь | нет | команда, обновляющая OCSP-файлы; после неё идёт reload |
 | `ocsp_refresh_secs` | целое > 0 | `86400` | период вызова `ocsp_hook` |
@@ -233,6 +235,11 @@ upstream. Нужен `error_root`; задавать их можно только
   `ocsp_hook` может обновлять и его; reload перечитывает все файлы. Без
   default-`ocsp` hook разрешён, если OCSP задан хотя бы одному SNI-сертификату.
 - Отсутствующие файлы и битый PEM — ошибка сборки runtime, то есть до accept.
+- `cipher_suites` и `curves` задаются именами из rustls, например
+  `TLS13_AES_128_GCM_SHA256`, `TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256`,
+  `X25519`, `secp256r1`. Списки задают и порядок предпочтения. Пустой список
+  отклоняется, неизвестное имя — ошибка сборки runtime. QUIC принимает только
+  TLS 1.3 suites; иначе загрузка падает.
 - ALPN предлагается в порядке `h2`, затем `http/1.1`. Клиент, поддерживающий
   оба, получит HTTP/2. HTTP/1.1 остаётся для клиентов без h2.
 - `client_auth = "optional"` принимает клиентский сертификат, если он прислан
@@ -321,6 +328,8 @@ dns_cleanup_hook = "/usr/local/lib/elira/cloudflare-dns.sh"
 | `key` | путь | нет, обязательно непустой | PEM-ключ для QUIC |
 | `client_ca` | путь | нет | PEM-корни клиентских сертификатов |
 | `client_auth` | `off` \| `optional` \| `required` | `off` | клиентские сертификаты на QUIC |
+| `cipher_suites` | массив строк | по умолчанию rustls | TLS 1.3 suites для QUIC |
+| `curves` | массив строк | по умолчанию rustls | key exchange groups для QUIC |
 | `certificates` | массив таблиц | `[]` | SNI-сертификаты на QUIC, формат как у `[tls]` |
 | `idle_timeout_secs` | целое > 0 | `30` | idle timeout QUIC-соединения |
 | `early_data` | bool | `false` | разрешить 0-RTT на QUIC (проверено session resumption-клиентом) |
@@ -863,6 +872,10 @@ elira check --config elira.toml
 | `route N: client_cn/client_issuer_cn need client_auth = true` | фильтр без требования сертификата | добавьте `client_auth = true` |
 | `route N: rate_key needs requests_per_second` | ключ без собственного лимита | задайте `requests_per_second` |
 | `route N: "..." is not a rate key` | неизвестный ключ | `ip`, `authorization`, `header:NAME`, `cookie:NAME` |
+| `tls.cipher_suites must not be empty` | пустой список политики | уберите поле или перечислите suites |
+| `unknown cipher suite "..."` | опечатка в имени suite | сверьтесь с именами rustls |
+| `unknown key exchange group "..."` | опечатка в имени curve | `X25519`, `secp256r1`, ... |
+| `QUIC requires TLS 1.3 cipher suites` | TLS 1.2 suite в `[http3]` | оставьте только `TLS13_*` |
 | `route N: timeout_secs must be greater than zero` | нулевой таймаут | уберите поле или поставьте больше нуля |
 | `http3.cert must not be empty` | `[http3]` без сертификата | задайте `cert` и `key` |
 | `health.path must start with '/'...` | путь без `/` | `/health` |

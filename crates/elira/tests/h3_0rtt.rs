@@ -47,6 +47,8 @@ root = "{}"
             reuse_port: false,
             client_ca: None,
             client_auth: elira_tls::ClientAuth::Off,
+            cipher_suites: None,
+            curves: None,
             certificates: Vec::new(),
             proxy_protocol: false,
             idle_timeout_secs: 5,

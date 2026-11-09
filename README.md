@@ -213,7 +213,8 @@ Upstreams:
 TLS:
 
 - rustls with ALPN `h2` then `http/1.1`; HTTP/3 uses `h3`
-- SNI-selected certificates on TCP and QUIC, minimum TLS version
+- SNI-selected certificates on TCP and QUIC, minimum TLS version, and
+  explicit cipher-suite/curve policy per listener
 - mutual TLS on TCP and QUIC, optional or required, with per-route
   subject/issuer CN checks
 

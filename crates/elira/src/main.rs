@@ -440,6 +440,8 @@ fn spawn_h3(
             reuse_port,
             client_ca: http3.client_ca,
             client_auth,
+            cipher_suites: http3.cipher_suites,
+            curves: http3.curves,
             certificates: http3
                 .certificates
                 .iter()

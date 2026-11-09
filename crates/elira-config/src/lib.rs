@@ -346,6 +346,12 @@ pub struct Http3 {
     pub client_ca: Option<PathBuf>,
     #[serde(default)]
     pub client_auth: ClientAuthMode,
+    /// Cipher suites to offer on QUIC, in preference order.
+    #[serde(default)]
+    pub cipher_suites: Option<Vec<String>>,
+    /// Key exchange groups to offer on QUIC, in preference order.
+    #[serde(default)]
+    pub curves: Option<Vec<String>>,
     /// Extra certificates selected by SNI on the QUIC listener.
     #[serde(default)]
     pub certificates: Vec<ServerCert>,
@@ -779,6 +785,15 @@ pub struct Tls {
     #[serde(default)]
     pub min_version: TlsVersion,
 
+    /// Cipher suites to offer, in preference order. Omit for the provider's
+    /// defaults.
+    #[serde(default)]
+    pub cipher_suites: Option<Vec<String>>,
+
+    /// Key exchange groups to offer, in preference order.
+    #[serde(default)]
+    pub curves: Option<Vec<String>>,
+
     /// DER OCSP response to staple for the default certificate. It is read
     /// on startup and on SIGHUP, so an external renewal hook can replace it.
     #[serde(default)]
@@ -1109,6 +1124,19 @@ fn substitute_env(text: &str) -> Result<String, Error> {
     Ok(out)
 }
 
+fn validate_tls_list(field: &'static str, list: &Option<Vec<String>>) -> Result<(), Error> {
+    let Some(list) = list else {
+        return Ok(());
+    };
+    if list.is_empty() {
+        return Err(Error::EmptyTlsList { field });
+    }
+    if list.iter().any(|value| value.trim().is_empty()) {
+        return Err(Error::BlankTlsListEntry { field });
+    }
+    Ok(())
+}
+
 fn valid_rate_key(value: &str) -> bool {
     if value == "ip" || value == "authorization" {
         return true;
@@ -1297,6 +1325,8 @@ impl Config {
             if http3.idle_timeout_secs == 0 {
                 return Err(Error::Http3IdleTimeoutZero);
             }
+            validate_tls_list("http3.cipher_suites", &http3.cipher_suites)?;
+            validate_tls_list("http3.curves", &http3.curves)?;
             if http3.client_auth != ClientAuthMode::Off {
                 match &http3.client_ca {
                     Some(path) if !path.as_os_str().is_empty() => {}
@@ -1386,6 +1416,8 @@ impl Config {
             {
                 return Err(Error::EmptyOcspPath);
             }
+            validate_tls_list("tls.cipher_suites", &tls.cipher_suites)?;
+            validate_tls_list("tls.curves", &tls.curves)?;
             if tls.ocsp_hook.as_ref().is_some_and(|path| {
                 path.as_os_str().is_empty()
                     || (tls.ocsp.is_none()
@@ -2073,6 +2105,12 @@ pub enum Error {
 
     #[error("route {index}: rate_key needs requests_per_second")]
     RateKeyWithoutRate { index: usize },
+
+    #[error("{field} must not be empty")]
+    EmptyTlsList { field: &'static str },
+
+    #[error("{field} entries must not be blank")]
+    BlankTlsListEntry { field: &'static str },
 
     #[error(
         "route {index}: {key:?} is not a rate key (ip, authorization, header:NAME, cookie:NAME)"
@@ -2866,6 +2904,41 @@ error_pages = ["404 nope"]
         assert!(matches!(
             Config::parse(text),
             Err(Error::BadErrorPage { .. })
+        ));
+    }
+
+    #[test]
+    fn tls_policy_lists_must_not_be_empty() {
+        let base = r#"
+listen = "127.0.0.1:8443"
+
+[tls]
+cert = "/tmp/cert.pem"
+key = "/tmp/key.pem"
+cipher_suites = ["TLS13_AES_128_GCM_SHA256"]
+curves = ["X25519"]
+
+[[routes]]
+host = "*"
+root = "/srv/www"
+"#;
+        let cfg = Config::parse(base).expect("valid");
+        let tls = cfg.tls.expect("tls");
+        assert_eq!(tls.cipher_suites.as_ref().map(Vec::len), Some(1));
+
+        let empty_suites = base.replace(
+            "cipher_suites = [\"TLS13_AES_128_GCM_SHA256\"]",
+            "cipher_suites = []",
+        );
+        assert!(matches!(
+            Config::parse(&empty_suites),
+            Err(Error::EmptyTlsList { .. })
+        ));
+
+        let blank_curve = base.replace("curves = [\"X25519\"]", "curves = [\" \"]");
+        assert!(matches!(
+            Config::parse(&blank_curve),
+            Err(Error::BlankTlsListEntry { .. })
         ));
     }
 

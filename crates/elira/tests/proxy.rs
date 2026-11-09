@@ -2230,6 +2230,83 @@ client_issuer_cn = "client-ca"
     assert_eq!(status(&accepted), "HTTP/1.1 200 OK", "{accepted}");
 }
 
+#[tokio::test]
+async fn tls_policy_refuses_a_cipher_suite_the_server_does_not_offer() {
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+
+    let ca_key = KeyPair::generate().expect("ca key");
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca = ca_params.self_signed(&ca_key).expect("ca");
+
+    let server_key = KeyPair::generate().expect("server key");
+    let server_params =
+        CertificateParams::new(vec!["localhost".to_owned()]).expect("server params");
+    let server = server_params
+        .signed_by(&server_key, &ca, &ca_key)
+        .expect("server cert");
+
+    let root = temp_root("tls-policy");
+    std::fs::write(root.join("server.pem"), server.pem()).unwrap();
+    std::fs::write(root.join("server.key"), server_key.serialize_pem()).unwrap();
+    std::fs::write(root.join("ca.pem"), ca.pem()).unwrap();
+
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[tls]
+cert = "{cert}"
+key = "{key}"
+min_version = "tls13"
+cipher_suites = ["TLS13_AES_128_GCM_SHA256"]
+curves = ["X25519"]
+
+[[routes]]
+host = "localhost"
+root = "{root}"
+"#,
+        cert = root.join("server.pem").display(),
+        key = root.join("server.key").display(),
+        root = root.display()
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    // Offer only a TLS 1.3 suite the server excluded.
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    provider
+        .cipher_suites
+        .retain(|suite| suite.suite() == rustls::CipherSuite::TLS13_AES_256_GCM_SHA384);
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(ca.der().clone()).expect("add ca");
+    let client = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
+    let name = rustls::pki_types::ServerName::try_from("localhost").expect("server name");
+    let tcp = TcpStream::connect(addr).await.expect("connect");
+    let rejected = match connector.connect(name, tcp).await {
+        Err(_) => true,
+        Ok(mut tls) => {
+            let _ = tls
+                .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .await;
+            let mut buf = [0u8; 128];
+            matches!(
+                tokio::time::timeout(Duration::from_secs(2), tls.read(&mut buf)).await,
+                Ok(Ok(0)) | Ok(Err(_)) | Err(_)
+            )
+        }
+    };
+    assert!(
+        rejected,
+        "a suite outside the policy must not be negotiated"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn proxies_to_a_unix_socket_upstream() {

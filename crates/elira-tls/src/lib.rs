@@ -9,6 +9,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::danger::ClientCertVerifier;
 use rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
@@ -36,6 +37,10 @@ pub struct ServerOptions<'a> {
     pub tls13_only: bool,
     /// DER OCSP response for the default certificate.
     pub ocsp: Option<&'a Path>,
+    /// Cipher suites to offer. `None` keeps the provider defaults.
+    pub cipher_suites: Option<&'a [String]>,
+    /// Key exchange groups to offer. `None` keeps the provider defaults.
+    pub curves: Option<&'a [String]>,
     /// TLS 1.3 tickets per handshake.
     pub session_tickets: usize,
     /// In-memory session cache entries; zero disables resumption.
@@ -123,6 +128,15 @@ pub enum Error {
         #[source]
         source: rustls::server::VerifierBuilderError,
     },
+
+    #[error("unknown cipher suite {name:?}")]
+    UnknownCipherSuite { name: String },
+
+    #[error("unknown key exchange group {name:?}")]
+    UnknownCurve { name: String },
+
+    #[error("QUIC requires TLS 1.3 cipher suites")]
+    QuicNeedsTls13Suite,
 }
 
 /// Build a server configuration from a PEM certificate chain and private key.
@@ -137,6 +151,8 @@ pub fn server_config(cert: &Path, key: &Path) -> Result<ServerConfig, Error> {
         client_auth: ClientAuth::Off,
         tls13_only: false,
         ocsp: None,
+        cipher_suites: None,
+        curves: None,
         session_tickets: 2,
         session_cache: 256,
         early_data: 0,
@@ -168,6 +184,8 @@ pub fn server_config_with_client_auth(
         client_auth: mode,
         tls13_only: false,
         ocsp: None,
+        cipher_suites: None,
+        curves: None,
         session_tickets: 2,
         session_cache: 256,
         early_data: 0,
@@ -187,10 +205,11 @@ pub fn quic_server_config_with_client_auth(
     client_ca: Option<&Path>,
     mode: ClientAuth,
 ) -> Result<ServerConfig, Error> {
-    quic_server_config_full(cert, key, &[], client_ca, mode, 0)
+    quic_server_config_full(cert, key, &[], client_ca, mode, 0, None, None)
 }
 
 /// QUIC listener with SNI-selected certificates as well as client auth.
+#[allow(clippy::too_many_arguments)]
 pub fn quic_server_config_full(
     cert: &Path,
     key: &Path,
@@ -198,6 +217,8 @@ pub fn quic_server_config_full(
     client_ca: Option<&Path>,
     mode: ClientAuth,
     early_data: u32,
+    cipher_suites: Option<&[String]>,
+    curves: Option<&[String]>,
 ) -> Result<ServerConfig, Error> {
     build(
         &ServerOptions {
@@ -207,6 +228,8 @@ pub fn quic_server_config_full(
             client_auth: mode,
             tls13_only: true,
             ocsp: None,
+            cipher_suites,
+            curves,
             session_tickets: 2,
             session_cache: 256,
             early_data,
@@ -215,12 +238,83 @@ pub fn quic_server_config_full(
     )
 }
 
-fn build(options: &ServerOptions<'_>, alpn: &[&[u8]]) -> Result<ServerConfig, Error> {
-    let client_verifier = client_verifier(options.client_ca, options.client_auth)?;
+fn crypto_provider(
+    cipher_suites: Option<&[String]>,
+    curves: Option<&[String]>,
+) -> Result<CryptoProvider, Error> {
+    let defaults = rustls::crypto::aws_lc_rs::default_provider();
 
+    let cipher_suites = match cipher_suites {
+        None => defaults.cipher_suites,
+        Some(names) => {
+            let mut selected = Vec::with_capacity(names.len());
+            for name in names {
+                let wanted = name.trim();
+                let suite = rustls::crypto::aws_lc_rs::ALL_CIPHER_SUITES
+                    .iter()
+                    .find(|suite| {
+                        suite
+                            .suite()
+                            .as_str()
+                            .is_some_and(|name| name.eq_ignore_ascii_case(wanted))
+                    })
+                    .copied()
+                    .ok_or_else(|| Error::UnknownCipherSuite {
+                        name: wanted.to_owned(),
+                    })?;
+                selected.push(suite);
+            }
+            selected
+        }
+    };
+
+    let kx_groups = match curves {
+        None => defaults.kx_groups,
+        Some(names) => {
+            let mut selected = Vec::with_capacity(names.len());
+            for name in names {
+                let wanted = name.trim();
+                let group = rustls::crypto::aws_lc_rs::ALL_KX_GROUPS
+                    .iter()
+                    .find(|group| {
+                        group
+                            .name()
+                            .as_str()
+                            .is_some_and(|name| name.eq_ignore_ascii_case(wanted))
+                    })
+                    .copied()
+                    .ok_or_else(|| Error::UnknownCurve {
+                        name: wanted.to_owned(),
+                    })?;
+                selected.push(group);
+            }
+            selected
+        }
+    };
+
+    Ok(CryptoProvider {
+        cipher_suites,
+        kx_groups,
+        ..defaults
+    })
+}
+
+fn build(options: &ServerOptions<'_>, alpn: &[&[u8]]) -> Result<ServerConfig, Error> {
     // Pick the provider explicitly. Relying on the process default breaks as
     // soon as another crate enables a second backend, which quinn does.
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let provider = Arc::new(crypto_provider(options.cipher_suites, options.curves)?);
+    if options.tls13_only
+        && options.cipher_suites.is_some()
+        && provider
+            .cipher_suites
+            .iter()
+            .any(|suite| !matches!(suite, rustls::SupportedCipherSuite::Tls13(_)))
+    {
+        return Err(Error::QuicNeedsTls13Suite);
+    }
+    let client_verifier =
+        client_verifier(options.client_ca, options.client_auth, provider.clone())?;
+
     let versions: &[&rustls::SupportedProtocolVersion] = if options.tls13_only {
         &[&rustls::version::TLS13]
     } else {
@@ -350,6 +444,7 @@ impl ResolvesServerCert for NamedResolver {
 fn client_verifier(
     client_ca: Option<&Path>,
     mode: ClientAuth,
+    provider: Arc<CryptoProvider>,
 ) -> Result<Option<Arc<dyn ClientCertVerifier>>, Error> {
     if mode == ClientAuth::Off {
         return Ok(None);
@@ -359,10 +454,7 @@ fn client_verifier(
     let roots = load_client_ca(path)?;
 
     // The two modes differ only in whether a client may omit its certificate.
-    // `build` is the strict path, which is also what Required needs. The
-    // provider is explicit for the same reason as in `build`: the workspace
-    // links two backends, so rustls cannot pick one on its own.
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    // `build` is the strict path, which is also what Required needs.
     let builder = WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider);
     let built = match mode {
         ClientAuth::Optional => builder.allow_unauthenticated().build(),
@@ -795,5 +887,92 @@ mod tests {
         assert_eq!(a.ocsp.as_deref(), Some(&b"ocsp-for-a"[..]));
         let b = resolver.pick(Some("b.example.com")).expect("b");
         assert_eq!(b.ocsp.as_deref(), Some(&b"ocsp-for-b"[..]));
+    }
+
+    #[test]
+    fn cipher_suites_and_curves_are_selected() {
+        let fixtures = fixtures();
+        let suites = vec!["TLS13_AES_128_GCM_SHA256".to_owned()];
+        let curves = vec!["X25519".to_owned()];
+
+        let config = server_config_with_options(&ServerOptions {
+            default: Some((&fixtures.join("cert.pem"), &fixtures.join("key.pem"))),
+            named: &[],
+            client_ca: None,
+            client_auth: ClientAuth::Off,
+            tls13_only: true,
+            ocsp: None,
+            cipher_suites: Some(&suites),
+            curves: Some(&curves),
+            session_tickets: 2,
+            session_cache: 256,
+            early_data: 0,
+        })
+        .expect("restricted policy");
+
+        let provider = config.crypto_provider();
+        assert_eq!(provider.cipher_suites.len(), 1);
+        assert_eq!(
+            provider.cipher_suites[0].suite().as_str(),
+            Some("TLS13_AES_128_GCM_SHA256")
+        );
+        assert_eq!(provider.kx_groups.len(), 1);
+        assert_eq!(provider.kx_groups[0].name().as_str(), Some("X25519"));
+    }
+
+    #[test]
+    fn unknown_tls_policy_names_fail() {
+        let fixtures = fixtures();
+        let suites = vec!["NOT_A_SUITE".to_owned()];
+        let err = server_config_with_options(&ServerOptions {
+            default: Some((&fixtures.join("cert.pem"), &fixtures.join("key.pem"))),
+            named: &[],
+            client_ca: None,
+            client_auth: ClientAuth::Off,
+            tls13_only: false,
+            ocsp: None,
+            cipher_suites: Some(&suites),
+            curves: None,
+            session_tickets: 2,
+            session_cache: 256,
+            early_data: 0,
+        })
+        .expect_err("unknown suite");
+        assert!(matches!(err, Error::UnknownCipherSuite { .. }), "{err:?}");
+
+        let curves = vec!["NOT_A_CURVE".to_owned()];
+        let err = server_config_with_options(&ServerOptions {
+            default: Some((&fixtures.join("cert.pem"), &fixtures.join("key.pem"))),
+            named: &[],
+            client_ca: None,
+            client_auth: ClientAuth::Off,
+            tls13_only: false,
+            ocsp: None,
+            cipher_suites: None,
+            curves: Some(&curves),
+            session_tickets: 2,
+            session_cache: 256,
+            early_data: 0,
+        })
+        .expect_err("unknown curve");
+        assert!(matches!(err, Error::UnknownCurve { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn quic_rejects_a_tls12_cipher_suite() {
+        let fixtures = fixtures();
+        let suites = vec!["TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256".to_owned()];
+        let err = quic_server_config_full(
+            &fixtures.join("cert.pem"),
+            &fixtures.join("key.pem"),
+            &[],
+            None,
+            ClientAuth::Off,
+            0,
+            Some(&suites),
+            None,
+        )
+        .expect_err("TLS 1.2 suite on QUIC");
+        assert!(matches!(err, Error::QuicNeedsTls13Suite), "{err:?}");
     }
 }
