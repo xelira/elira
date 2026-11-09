@@ -256,7 +256,27 @@ DNS-01 работает через внешний hook и поддерживае
 опубликовать TXT-запись `TXT_NAME = VALUE`. После успешного exit Elira ждёт
 `dns_propagation_secs`, затем просит CA проверить запись. Если задан
 `dns_cleanup_hook`, после успешной выдачи он получает то же окружение плюс
-`ACTION=cleanup` и должен удалить TXT-запись. Учётные данные
+`ACTION=cleanup` и должен удалить TXT-запись.
+
+Для Cloudflare есть готовый hook `scripts/cloudflare-dns.sh`. Токену нужны
+права `Zone:Read` и `DNS:Edit`; он читается из `CLOUDFLARE_API_TOKEN`, а не из
+конфига. Положите его в root-only env-файл, например
+`/etc/elira/cloudflare.env` с правами `0600`, и подключите через
+`EnvironmentFile=` в systemd:
+
+```toml
+[acme]
+domains = ["*.example.com"]
+contacts = ["mailto:admin@example.com"]
+cache_dir = "/var/lib/elira/acme"
+production = true
+challenge = "dns_01"
+dns_hook = "/usr/local/lib/elira/cloudflare-dns.sh"
+dns_cleanup_hook = "/usr/local/lib/elira/cloudflare-dns.sh"
+```
+
+Скрипт сам находит зону по самому длинному суффиксу `TXT_NAME`, публикует
+`_acme-challenge...` с TTL 60 и при `ACTION=cleanup` удаляет запись. Учётные данные
 аккаунта и сертификат кэшируются в `cache_dir`; обновление проверяется раз
 в 12 часов.
 
