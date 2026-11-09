@@ -43,6 +43,7 @@ Living list for the self-improvement loop. One item per session.
 - [x] Per-route cache hit/miss/stale metrics.
 - [x] Weighted round robin and least-connections balancing.
 - [x] Streaming request-body cap for chunked uploads.
+- [x] Configurable health probe method, status codes and Host.
 - [x] Per-route FastCGI pool size.
 - [x] Purge tests through the admin listener in both single and worker mode.
 - [x] Per-route cache enable/TTL overrides.

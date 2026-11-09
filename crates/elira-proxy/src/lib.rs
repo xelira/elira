@@ -387,6 +387,9 @@ struct Pool {
     client: Client<HttpsConnector<HttpConnector>, Body>,
     tls: TlsOptions,
     health_path: Option<String>,
+    health_method: Option<String>,
+    health_status: Option<Vec<u16>>,
+    health_host: Option<String>,
     h2: Option<elira_h2::Pool>,
     h3: Option<elira_h3upstream::Pool>,
 }
@@ -724,6 +727,9 @@ impl Proxy {
                     client,
                     tls: tls.clone(),
                     health_path: up.health_path.clone(),
+                    health_method: up.health_method.clone(),
+                    health_status: up.health_expect_status.clone(),
+                    health_host: up.health_host.clone(),
                     h3: up.h3_pool.then(|| {
                         elira_h3upstream::Pool::new(elira_h3upstream::PoolConfig {
                             max_connections: 4,
@@ -1227,9 +1233,17 @@ impl Proxy {
         let mut failed = 0;
         let timeout = Duration::from_secs(cfg.timeout_secs);
         for pool in &self.inner.pools {
-            let path = pool.health_path.as_deref().unwrap_or(&cfg.path);
+            let probe = Probe {
+                path: pool.health_path.as_deref().unwrap_or(&cfg.path),
+                method: pool.health_method.as_deref().unwrap_or(&cfg.method),
+                host: pool.health_host.as_deref().or(cfg.host.as_deref()),
+                expect: pool.health_status.as_deref().unwrap_or(&cfg.expect_status),
+                timeout,
+                tls: pool.scheme == "https",
+                options: &pool.tls,
+            };
             for (index, server) in pool.servers.iter().enumerate() {
-                let up = probe(server, path, timeout, pool.scheme == "https", &pool.tls).await;
+                let up = probe_server(server, &probe).await;
                 pool.set_health(index, up);
                 if up {
                     ok += 1;
@@ -2838,27 +2852,35 @@ where
 
 /// One health probe: a plain HTTP/1.1 GET with `Connection: close`.
 /// Anything 2xx or 3xx counts as up.
-async fn probe(
-    server: &ServerAddr,
-    path: &str,
+struct Probe<'a> {
+    path: &'a str,
+    method: &'a str,
+    host: Option<&'a str>,
+    expect: &'a [u16],
     timeout: Duration,
     tls: bool,
-    options: &TlsOptions,
-) -> bool {
+    options: &'a TlsOptions,
+}
+
+async fn probe_server(server: &ServerAddr, probe: &Probe<'_>) -> bool {
     if let Some(socket) = server.unix() {
-        let mut stream = match tokio::time::timeout(timeout, UnixStream::connect(socket)).await {
-            Ok(Ok(stream)) => stream,
-            _ => return false,
-        };
-        let request =
-            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
-        if tokio::time::timeout(timeout, stream.write_all(request.as_bytes()))
+        let mut stream =
+            match tokio::time::timeout(probe.timeout, UnixStream::connect(socket)).await {
+                Ok(Ok(stream)) => stream,
+                _ => return false,
+            };
+        let host = probe.host.unwrap_or("localhost");
+        let request = format!(
+            "{} {} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n",
+            probe.method, probe.path
+        );
+        if tokio::time::timeout(probe.timeout, stream.write_all(request.as_bytes()))
             .await
             .is_err()
         {
             return false;
         }
-        return probe_response(&mut stream, timeout).await;
+        return probe_response(&mut stream, probe.timeout, probe.expect).await;
     }
 
     let authority = match server.tcp() {
@@ -2869,20 +2891,26 @@ async fn probe(
         .host()
         .trim_start_matches('[')
         .trim_end_matches(']');
-    let port = authority.port_u16().unwrap_or(if tls { 443 } else { 80 });
+    let port = authority
+        .port_u16()
+        .unwrap_or(if probe.tls { 443 } else { 80 });
 
-    let stream = match tokio::time::timeout(timeout, TcpStream::connect((host, port))).await {
+    let stream = match tokio::time::timeout(probe.timeout, TcpStream::connect((host, port))).await {
         Ok(Ok(stream)) => stream,
         _ => return false,
     };
 
-    let request = format!("GET {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
-    if tls {
-        let config = match elira_upstream::client_config(options) {
+    let header_host = probe.host.unwrap_or(authority.as_str());
+    let request = format!(
+        "{} {} HTTP/1.1\r\nHost: {header_host}\r\nConnection: close\r\n\r\n",
+        probe.method, probe.path
+    );
+    if probe.tls {
+        let config = match elira_upstream::client_config(probe.options) {
             Ok(config) => config,
             Err(_) => return false,
         };
-        let name = match options.sni.as_deref().or(Some(host)) {
+        let name = match probe.options.sni.as_deref().or(Some(host)) {
             Some(name) => name.to_owned(),
             None => return false,
         };
@@ -2894,31 +2922,31 @@ async fn probe(
             },
         };
         let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-        let mut stream = match tokio::time::timeout(timeout, connector.connect(name, stream)).await
-        {
-            Ok(Ok(stream)) => stream,
-            _ => return false,
-        };
-        if tokio::time::timeout(timeout, stream.write_all(request.as_bytes()))
+        let mut stream =
+            match tokio::time::timeout(probe.timeout, connector.connect(name, stream)).await {
+                Ok(Ok(stream)) => stream,
+                _ => return false,
+            };
+        if tokio::time::timeout(probe.timeout, stream.write_all(request.as_bytes()))
             .await
             .is_err()
         {
             return false;
         }
-        probe_response(&mut stream, timeout).await
+        probe_response(&mut stream, probe.timeout, probe.expect).await
     } else {
         let mut stream = stream;
-        if tokio::time::timeout(timeout, stream.write_all(request.as_bytes()))
+        if tokio::time::timeout(probe.timeout, stream.write_all(request.as_bytes()))
             .await
             .is_err()
         {
             return false;
         }
-        probe_response(&mut stream, timeout).await
+        probe_response(&mut stream, probe.timeout, probe.expect).await
     }
 }
 
-async fn probe_response<S>(stream: &mut S, timeout: Duration) -> bool
+async fn probe_response<S>(stream: &mut S, timeout: Duration, expect: &[u16]) -> bool
 where
     S: tokio::io::AsyncRead + Unpin,
 {
@@ -2933,12 +2961,15 @@ where
 
         if let Some(end) = buf.windows(2).position(|window| window == b"\r\n") {
             let line = String::from_utf8_lossy(&buf[..end]);
-            return matches!(
-                line.split_whitespace().nth(1),
-                Some(code)
-                    if code.len() == 3
-                        && (code.starts_with('2') || code.starts_with('3'))
-            );
+            let code: u16 = match line.split_whitespace().nth(1).and_then(|c| c.parse().ok()) {
+                Some(code) => code,
+                None => return false,
+            };
+            return if expect.is_empty() {
+                (200..400).contains(&code)
+            } else {
+                expect.contains(&code)
+            };
         }
 
         if buf.len() > 1024 {
@@ -3925,6 +3956,9 @@ mod tests {
             client,
             tls,
             health_path: None,
+            health_method: None,
+            health_status: None,
+            health_host: None,
             h2: None,
             h3: None,
         };
@@ -3972,6 +4006,9 @@ mod tests {
             client,
             tls,
             health_path: None,
+            health_method: None,
+            health_status: None,
+            health_host: None,
             h2: None,
             h3: None,
         };
@@ -3981,6 +4018,55 @@ mod tests {
         pool.active[1].store(0, Ordering::Relaxed);
         pool.next.store(0, Ordering::Relaxed);
         assert_eq!(pool.pick(), 0);
+    }
+
+    #[tokio::test]
+    async fn health_probe_honours_method_host_and_expected_status() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind probe");
+        let addr = listener.local_addr().expect("probe addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let read = stream.read(&mut buf).await.unwrap_or(0);
+                    let head = String::from_utf8_lossy(&buf[..read]);
+                    let status = if head.starts_with("HEAD /ready ")
+                        && head.to_ascii_lowercase().contains("host: health.local")
+                    {
+                        "204 No Content"
+                    } else {
+                        "503 Service Unavailable"
+                    };
+                    let _ = stream
+                        .write_all(
+                            format!("HTTP/1.1 {status}\r\nConnection: close\r\n\r\n").as_bytes(),
+                        )
+                        .await;
+                });
+            }
+        });
+
+        let server = ServerAddr::Tcp(format!("{addr}").parse().expect("authority"));
+        let tls = TlsOptions::default();
+        let probe = |path: &'static str, expect: &'static [u16]| Probe {
+            path,
+            method: "HEAD",
+            host: Some("health.local"),
+            expect,
+            timeout: Duration::from_secs(2),
+            tls: false,
+            options: &tls,
+        };
+
+        assert!(probe_server(&server, &probe("/ready", &[204])).await);
+        assert!(probe_server(&server, &probe("/ready", &[])).await);
+        assert!(!probe_server(&server, &probe("/broken", &[204])).await);
+        assert!(probe_server(&server, &probe("/broken", &[503])).await);
     }
 
     #[test]
@@ -4021,6 +4107,9 @@ mod tests {
             client,
             tls,
             health_path: None,
+            health_method: None,
+            health_status: None,
+            health_host: None,
             h2: None,
             h3: None,
         };

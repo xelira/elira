@@ -404,16 +404,23 @@ HTTP/3 живёт на отдельном UDP-порту и не делит со
 | --- | --- | --- | --- |
 | `enabled` | bool | `false` | включает активные проверки |
 | `path` | строка | `"/health"` | путь, который опрашивается на каждом upstream |
+| `method` | `"GET"` \| `"HEAD"` | `"GET"` | метод health-пробы |
+| `expect_status` | массив кодов | `[]` | какие коды считать живыми; пусто — любые `2xx`/`3xx` |
+| `host` | строка | адрес upstream'а | заголовок `Host` в пробе |
 | `interval_secs` | целое > 0 | `5` | период между циклами проверок |
 | `timeout_secs` | целое > 0 | `2` | таймаут на каждую операцию проверки |
 
-Проверка — обычный HTTP/1.1 `GET path` с `Connection: close` на адрес
-`servers` из upstream'а. Живым считается любой ответ `2xx` или `3xx`; всё
-остальное, ошибка соединения и таймаут — «down».
+Проверка — обычный HTTP/1.1 запрос `method path` с `Connection: close` на
+адрес `servers` из upstream'а. Живым считается ответ `2xx`/`3xx` либо код из
+`expect_status`; всё остальное, ошибка соединения и таймаут — «down».
 
 - `path` должен начинаться с `/` и не содержать пробелов и управляющих
   символов; иначе ошибка `health.path must start with '/' ...`. Проверка пути
   выполняется только при `enabled = true`.
+- `method` — только `GET` или `HEAD`. `expect_status` принимает коды
+  `100..599`. `host` не может быть пустым или содержать пробелы.
+- `health_path`, `health_method`, `health_expect_status` и `health_host` у
+  upstream'а переопределяют глобальные значения независимо от `enabled`.
 - `interval_secs` и `timeout_secs` тоже проверяются только при включённых
   проверках; ноль — ошибка.
 - `timeout_secs` применяется отдельно к connect, записи запроса и чтению ответа,
@@ -555,6 +562,9 @@ advisory-lock `.elira-cache.lock`, а `max_bytes` считается по все
 | `tls` | bool | `false` | подключаться к серверам по HTTPS |
 | `sni` | строка | нет | имя для SNI и проверки сертификата |
 | `health_path` | путь | `health.path` | свой путь health-пробы |
+| `health_method` | `GET` \| `HEAD` | `health.method` | метод пробы |
+| `health_expect_status` | массив кодов | `health.expect_status` | ожидаемые коды |
+| `health_host` | строка | `health.host` | свой `Host` в пробе |
 | `tls_insecure` | bool | `[upstream_tls] insecure` | не проверять сертификат |
 | `tls_ca` | путь | `[upstream_tls] ca` | свой PEM-корень |
 | `http2` | bool | `[upstream_tls] http2` | предлагать `h2` |
@@ -944,4 +954,6 @@ elira check --config elira.toml
 | `http3.cert must not be empty` | `[http3]` без сертификата | задайте `cert` и `key` |
 | `health.path must start with '/'...` | путь без `/` | `/health` |
 | `health.interval_secs must be greater than zero` | ноль при `enabled = true` | поставьте `5` или больше |
+| `health method "..." must be GET or HEAD` | другой метод пробы | используйте GET/HEAD |
+| `health expect_status values must be between 100 and 599` | неверный код | исправьте список |
 | `cannot bind ...` на старте | порт занят или нет прав | смените `listen`/`metrics.listen` |

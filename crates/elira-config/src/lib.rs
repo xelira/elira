@@ -257,6 +257,18 @@ pub struct Health {
     #[serde(default = "Health::default_path")]
     pub path: String,
 
+    /// Request method for the probe. Only GET and HEAD are accepted.
+    #[serde(default = "Health::default_method")]
+    pub method: String,
+
+    /// Status codes that count as healthy. Empty means any 2xx or 3xx.
+    #[serde(default)]
+    pub expect_status: Vec<u16>,
+
+    /// Host header for the probe. Defaults to the upstream authority.
+    #[serde(default)]
+    pub host: Option<String>,
+
     #[serde(default = "Health::default_interval_secs")]
     pub interval_secs: u64,
 
@@ -269,6 +281,9 @@ impl Default for Health {
         Self {
             enabled: false,
             path: Self::default_path(),
+            method: Self::default_method(),
+            expect_status: Vec::new(),
+            host: None,
             interval_secs: Self::default_interval_secs(),
             timeout_secs: Self::default_timeout_secs(),
         }
@@ -278,6 +293,10 @@ impl Default for Health {
 impl Health {
     fn default_path() -> String {
         "/health".to_owned()
+    }
+
+    fn default_method() -> String {
+        "GET".to_owned()
     }
 
     fn default_interval_secs() -> u64 {
@@ -416,6 +435,18 @@ pub struct Upstream {
     /// Overrides `health.path` for this upstream.
     #[serde(default)]
     pub health_path: Option<String>,
+
+    /// Overrides `health.method` for this upstream.
+    #[serde(default)]
+    pub health_method: Option<String>,
+
+    /// Overrides `health.expect_status` for this upstream.
+    #[serde(default)]
+    pub health_expect_status: Option<Vec<u16>>,
+
+    /// Overrides `health.host` for this upstream.
+    #[serde(default)]
+    pub health_host: Option<String>,
 
     /// Overrides `[upstream_tls] insecure` for this upstream.
     #[serde(default)]
@@ -1182,6 +1213,18 @@ fn validate_tls_list(field: &'static str, list: &Option<Vec<String>>) -> Result<
     Ok(())
 }
 
+fn valid_health_method(method: &str) -> bool {
+    method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD")
+}
+
+fn valid_health_status(codes: &[u16]) -> bool {
+    codes.iter().all(|status| (100..=599).contains(status))
+}
+
+fn valid_health_host(host: &str) -> bool {
+    !host.trim().is_empty() && !host.chars().any(|c| c.is_control() || c.is_whitespace())
+}
+
 fn valid_rate_key(value: &str) -> bool {
     if value == "ip" || value == "authorization" || value == "uri" {
         return true;
@@ -1310,6 +1353,22 @@ impl Config {
                 || self.health.path.chars().any(|c| c.is_control() || c == ' ')
             {
                 return Err(Error::BadHealthPath);
+            }
+            if !valid_health_method(&self.health.method) {
+                return Err(Error::BadHealthMethod {
+                    method: self.health.method.clone(),
+                });
+            }
+            if !valid_health_status(&self.health.expect_status) {
+                return Err(Error::BadHealthStatus);
+            }
+            if self
+                .health
+                .host
+                .as_deref()
+                .is_some_and(|host| !valid_health_host(host))
+            {
+                return Err(Error::BadHealthHost);
             }
             if self.health.interval_secs == 0 {
                 return Err(Error::BadHealthInterval);
@@ -1600,6 +1659,23 @@ impl Config {
                     return Err(Error::BadUpstreamHealthPath {
                         name: up.name.clone(),
                     });
+                }
+            }
+            if let Some(method) = &up.health_method {
+                if !valid_health_method(method) {
+                    return Err(Error::BadHealthMethod {
+                        method: method.clone(),
+                    });
+                }
+            }
+            if let Some(status) = &up.health_expect_status {
+                if !valid_health_status(status) {
+                    return Err(Error::BadHealthStatus);
+                }
+            }
+            if let Some(host) = &up.health_host {
+                if !valid_health_host(host) {
+                    return Err(Error::BadHealthHost);
                 }
             }
             for addr in &up.servers {
@@ -2023,6 +2099,15 @@ pub enum Error {
 
     #[error("health.path must start with '/' and contain no spaces or control characters")]
     BadHealthPath,
+
+    #[error("health method {method:?} must be GET or HEAD")]
+    BadHealthMethod { method: String },
+
+    #[error("health expect_status values must be between 100 and 599")]
+    BadHealthStatus,
+
+    #[error("health host must not be empty or contain whitespace")]
+    BadHealthHost,
 
     #[error("health.interval_secs must be greater than zero")]
     BadHealthInterval,
@@ -2459,6 +2544,56 @@ upstream = "app"
         assert!(matches!(
             Config::parse(&text),
             Err(Error::MaxHeaderBytesTooSmall)
+        ));
+    }
+
+    #[test]
+    fn health_probe_settings_are_validated() {
+        let base = r#"
+listen = "127.0.0.1:8080"
+
+[health]
+enabled = true
+method = "HEAD"
+expect_status = [200, 204]
+host = "health.example.com"
+
+[[upstreams]]
+name = "app"
+servers = ["127.0.0.1:9000"]
+health_method = "GET"
+health_expect_status = [200]
+health_host = "app.internal"
+
+[[routes]]
+host = "*"
+upstream = "app"
+"#;
+        let cfg = Config::parse(base).expect("valid");
+        let health = &cfg.health;
+        assert_eq!(health.method, "HEAD");
+        assert_eq!(health.expect_status, vec![200, 204]);
+        assert_eq!(
+            cfg.upstreams[0].health_expect_status.as_deref(),
+            Some([200].as_slice())
+        );
+
+        let bad_method = base.replace("method = \"HEAD\"", "method = \"POST\"");
+        assert!(matches!(
+            Config::parse(&bad_method),
+            Err(Error::BadHealthMethod { .. })
+        ));
+
+        let bad_status = base.replace("expect_status = [200, 204]", "expect_status = [999]");
+        assert!(matches!(
+            Config::parse(&bad_status),
+            Err(Error::BadHealthStatus)
+        ));
+
+        let bad_host = base.replace("host = \"health.example.com\"", "host = \"bad host\"");
+        assert!(matches!(
+            Config::parse(&bad_host),
+            Err(Error::BadHealthHost)
         ));
     }
 
