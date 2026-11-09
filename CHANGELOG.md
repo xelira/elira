@@ -155,6 +155,8 @@
 - `user`, `worker_rlimit_nofile` и `pid_file`.
 - L4 TCP/UDP stream-прокси с TLS-терминацией.
 - Общий TLS 1.3 ticket key между воркерами.
+- Переменные `$host`, `$remote_addr`, `$request_uri` и другие в заголовках и
+  редиректах.
 - `Cache-Control: must-revalidate` запрещает stale-выдачу; `Expires`/`Date`
   задают TTL, если `max-age` нет. Запросы с `no-cache`/`no-store` обходят кэш.
 - Заголовки `Forwarded` и `X-Forwarded-Port` к upstream.

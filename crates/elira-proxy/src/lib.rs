@@ -270,7 +270,7 @@ enum Target {
     Files(Arc<Files>),
     Redirect {
         status: StatusCode,
-        location: HeaderValue,
+        location: String,
     },
     FastCgi {
         target: elira_fastcgi::Target,
@@ -297,6 +297,108 @@ enum RequestKey {
     Header(HeaderName),
     Cookie(String),
     Uri,
+}
+
+/// Values available for `$variable` expansion in route templates.
+struct RequestVars {
+    remote_addr: std::net::IpAddr,
+    host: String,
+    uri: String,
+    path: String,
+    query: String,
+    method: String,
+    scheme: &'static str,
+    port: u16,
+    request_id: String,
+    headers: HeaderMap,
+}
+
+impl RequestVars {
+    fn value<'a>(&'a self, name: &str) -> Option<Cow<'a, str>> {
+        match name {
+            "remote_addr" => Some(Cow::Owned(self.remote_addr.to_string())),
+            "host" => Some(Cow::Borrowed(&self.host)),
+            "request_uri" => Some(Cow::Borrowed(&self.uri)),
+            "uri" => Some(Cow::Borrowed(&self.path)),
+            "query_string" | "args" => Some(Cow::Borrowed(&self.query)),
+            "request_method" => Some(Cow::Borrowed(&self.method)),
+            "scheme" => Some(Cow::Borrowed(self.scheme)),
+            "server_port" => Some(Cow::Owned(self.port.to_string())),
+            "request_id" => Some(Cow::Borrowed(&self.request_id)),
+            _ => {
+                if let Some(header) = name.strip_prefix("http_") {
+                    let header = header.replace('_', "-");
+                    return self
+                        .headers
+                        .get(header)
+                        .and_then(|value| value.to_str().ok())
+                        .map(Cow::Borrowed);
+                }
+                if let Some(cookie) = name.strip_prefix("cookie_") {
+                    for header in self.headers.get_all(COOKIE) {
+                        let Ok(header) = header.to_str() else {
+                            continue;
+                        };
+                        for part in header.split(';') {
+                            let Some((key, value)) = part.trim().split_once('=') else {
+                                continue;
+                            };
+                            if key.trim() == cookie {
+                                return Some(Cow::Borrowed(value.trim()));
+                            }
+                        }
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    fn render(&self, template: &str) -> String {
+        let mut out = String::with_capacity(template.len());
+        let mut chars = template.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch != '$' {
+                out.push(ch);
+                continue;
+            }
+            if chars.peek() == Some(&'$') {
+                chars.next();
+                out.push('$');
+                continue;
+            }
+            let mut name = String::new();
+            if chars.peek() == Some(&'{') {
+                chars.next();
+                for ch in chars.by_ref() {
+                    if ch == '}' {
+                        break;
+                    }
+                    name.push(ch);
+                }
+            } else {
+                while let Some(ch) = chars.peek() {
+                    if ch.is_ascii_alphanumeric() || *ch == '_' {
+                        name.push(*ch);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            if name.is_empty() {
+                out.push('$');
+                continue;
+            }
+            if let Some(value) = self.value(&name) {
+                out.push_str(&value);
+            } else {
+                out.push('$');
+                out.push_str(&name);
+            }
+        }
+        out
+    }
 }
 
 fn parse_request_key(value: Option<&str>) -> RequestKey {
@@ -396,9 +498,9 @@ struct RouteEntry {
     regex: Option<regex::Regex>,
     target: Target,
     strip_prefix: bool,
-    add_headers: Vec<(HeaderName, HeaderValue)>,
+    add_headers: Vec<(HeaderName, String)>,
     remove_headers: Vec<HeaderName>,
-    request_headers: Vec<(HeaderName, HeaderValue)>,
+    request_headers: Vec<(HeaderName, String)>,
     request_remove_headers: Vec<HeaderName>,
     auth: Option<Arc<BasicAuth>>,
     acl: Option<Arc<IpAcl>>,
@@ -512,13 +614,6 @@ fn path_matches(prefix: &str, path: &str) -> bool {
 
 fn sort_routes(list: &mut [RouteEntry]) {
     list.sort_by_key(|entry| std::cmp::Reverse(entry.prefix.len()));
-}
-
-fn parse_header_line(line: &str) -> Option<(HeaderName, HeaderValue)> {
-    let (name, value) = line.split_once(':')?;
-    let name = HeaderName::from_bytes(name.trim().as_bytes()).ok()?;
-    let value = HeaderValue::from_str(value.trim()).ok()?;
-    Some((name, value))
 }
 
 /// A configured backend: TCP authority or a filesystem unix socket.
@@ -1083,10 +1178,7 @@ impl Proxy {
                     StatusCode::from_u16(redirect.status).map_err(|_| Error::BadRedirect {
                         host: route.host.clone(),
                     })?;
-                let location =
-                    HeaderValue::from_str(&redirect.to).map_err(|_| Error::BadRedirect {
-                        host: route.host.clone(),
-                    })?;
+                let location = redirect.to.clone();
                 Target::Redirect { status, location }
             } else {
                 return Err(Error::MissingTarget {
@@ -1165,7 +1257,13 @@ impl Proxy {
                 add_headers: route
                     .add_headers
                     .iter()
-                    .filter_map(|line| parse_header_line(line))
+                    .filter_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        Some((
+                            HeaderName::from_bytes(name.trim().as_bytes()).ok()?,
+                            value.trim().to_owned(),
+                        ))
+                    })
                     .collect(),
                 remove_headers: route
                     .remove_headers
@@ -1175,7 +1273,13 @@ impl Proxy {
                 request_headers: route
                     .request_headers
                     .iter()
-                    .filter_map(|line| parse_header_line(line))
+                    .filter_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        Some((
+                            HeaderName::from_bytes(name.trim().as_bytes()).ok()?,
+                            value.trim().to_owned(),
+                        ))
+                    })
                     .collect(),
                 request_remove_headers: route
                     .request_remove_headers
@@ -1399,6 +1503,15 @@ impl Proxy {
     ) -> Option<FastStatic> {
         let (key, _) = canonical_host(host)?;
         let entry = self.router(listener).pick(&key, path)?;
+        // The fast path writes headers itself. Template expansion happens in
+        // the hyper path, so hand those responses back to it.
+        if entry
+            .add_headers
+            .iter()
+            .any(|(_, value)| value.contains('$'))
+        {
+            return None;
+        }
 
         // Resolve the target first: a proxy route must not pay for a token or
         // an auth check here only to be handed to hyper afterwards.
@@ -1429,7 +1542,15 @@ impl Proxy {
 
         Some(FastStatic {
             file,
-            add_headers: entry.add_headers.clone(),
+            add_headers: entry
+                .add_headers
+                .iter()
+                .filter_map(|(name, value)| {
+                    HeaderValue::from_str(value)
+                        .ok()
+                        .map(|value| (name.clone(), value))
+                })
+                .collect(),
             remove_headers: entry.remove_headers.clone(),
             server_header: self.inner.server_header,
             alt_svc: self.inner.alt_svc.clone(),
@@ -1870,6 +1991,28 @@ impl Proxy {
             None => None,
         };
 
+        let request_uri = req
+            .uri()
+            .path_and_query()
+            .map(|value| value.as_str().to_owned())
+            .unwrap_or_else(|| "/".to_owned());
+        let request_port = forward_host
+            .rsplit_once(':')
+            .and_then(|(_, port)| port.parse::<u16>().ok())
+            .unwrap_or(if scheme == "https" { 443 } else { 80 });
+        let vars = RequestVars {
+            remote_addr: peer.ip(),
+            host: key.clone(),
+            path: req.uri().path().to_owned(),
+            query: req.uri().query().unwrap_or_default().to_owned(),
+            uri: request_uri,
+            method: req.method().to_string(),
+            scheme,
+            port: request_port,
+            request_id: request_id.clone(),
+            headers: req.headers().clone(),
+        };
+
         let pool = match &entry.target {
             Target::Proxy(pool) => pool,
             Target::Files(files) => {
@@ -1881,10 +2024,16 @@ impl Proxy {
                     access_log_sample: entry.access_log_sample,
                 });
                 self.apply_error_page(&mut response, entry, peer).await;
-                self.apply_route(&mut response, entry, &request_id);
+                self.apply_route(&mut response, entry, &vars, &request_id);
                 return Ok(response);
             }
             Target::Redirect { status, location } => {
+                let Ok(location) = HeaderValue::from_str(&vars.render(location)) else {
+                    return Err(text(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "redirect target is not a valid header value",
+                    ));
+                };
                 let mut response =
                     Response::builder()
                         .status(*status)
@@ -1892,14 +2041,14 @@ impl Proxy {
                         .map_err(|_| {
                             text(StatusCode::INTERNAL_SERVER_ERROR, "response build failed")
                         })?;
-                response.headers_mut().insert(LOCATION, location.clone());
+                response.headers_mut().insert(LOCATION, location);
                 response.extensions_mut().insert(Labels {
                     route: entry.label.clone(),
                     upstream: None,
                     access_log: entry.access_log,
                     access_log_sample: entry.access_log_sample,
                 });
-                self.apply_route(&mut response, entry, &request_id);
+                self.apply_route(&mut response, entry, &vars, &request_id);
                 return Ok(response);
             }
             Target::FastCgi { .. } => {
@@ -1914,7 +2063,7 @@ impl Proxy {
                     access_log_sample: entry.access_log_sample,
                 });
                 self.apply_error_page(&mut response, entry, peer).await;
-                self.apply_route(&mut response, entry, &request_id);
+                self.apply_route(&mut response, entry, &vars, &request_id);
                 return Ok(response);
             }
             Target::Cgi { .. } => {
@@ -1929,7 +2078,7 @@ impl Proxy {
                     access_log_sample: entry.access_log_sample,
                 });
                 self.apply_error_page(&mut response, entry, peer).await;
-                self.apply_route(&mut response, entry, &request_id);
+                self.apply_route(&mut response, entry, &vars, &request_id);
                 return Ok(response);
             }
             Target::Module(_) | Target::Wasm(_) => {
@@ -1944,7 +2093,7 @@ impl Proxy {
                     access_log_sample: entry.access_log_sample,
                 });
                 self.apply_error_page(&mut response, entry, peer).await;
-                self.apply_route(&mut response, entry, &request_id);
+                self.apply_route(&mut response, entry, &vars, &request_id);
                 return Ok(response);
             }
         };
@@ -2034,7 +2183,9 @@ impl Proxy {
             template.remove(name);
         }
         for (name, value) in &entry.request_headers {
-            template.insert(name, value.clone());
+            if let Ok(value) = HeaderValue::from_str(&vars.render(value)) {
+                template.insert(name.clone(), value);
+            }
         }
 
         let route_timeout = entry.timeout.unwrap_or(self.inner.timeout);
@@ -2112,7 +2263,7 @@ impl Proxy {
                                 entry.cache_ttl,
                             );
                         }
-                        self.apply_route(&mut response, entry, &request_id);
+                        self.apply_route(&mut response, entry, &vars, &request_id);
                         return Ok(response);
                     }
 
@@ -2441,7 +2592,7 @@ impl Proxy {
             access_log_sample: entry.access_log_sample,
         });
         self.apply_error_page(&mut response, entry, peer).await;
-        self.apply_route(&mut response, entry, &request_id);
+        self.apply_route(&mut response, entry, &vars, &request_id);
         Ok(response)
     }
 
@@ -3038,14 +3189,22 @@ impl Proxy {
         *response = page;
     }
 
-    fn apply_route(&self, response: &mut Response<Body>, entry: &RouteEntry, request_id: &str) {
+    fn apply_route(
+        &self,
+        response: &mut Response<Body>,
+        entry: &RouteEntry,
+        vars: &RequestVars,
+        request_id: &str,
+    ) {
         let headers = response.headers_mut();
 
         for name in &entry.remove_headers {
             headers.remove(name);
         }
         for (name, value) in &entry.add_headers {
-            headers.insert(name, value.clone());
+            if let Ok(value) = HeaderValue::from_str(&vars.render(value)) {
+                headers.insert(name.clone(), value);
+            }
         }
 
         if !headers.contains_key("x-request-id") {

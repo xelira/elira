@@ -1106,6 +1106,53 @@ async fn trusted_proxies_extend_the_forwarded_chain() {
 }
 
 #[tokio::test]
+async fn route_templates_expand_request_variables() {
+    let upstream = upstream().await;
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "example.com"
+upstream = "app"
+request_headers = ["X-Remote: $remote_addr", "X-Original: $request_uri"]
+add_headers = ["X-Reply-Host: $host", "X-Reply-Method: $request_method"]
+
+[[routes]]
+host = "redir.example"
+redirect = {{ to = "https://$host/new", status = 302 }}
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let response = roundtrip(
+        addr,
+        "GET /path?q=1 HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&response), "HTTP/1.1 200 OK", "{response}");
+    assert!(response.contains("x-remote: 127.0.0.1"), "{response}");
+    assert!(response.contains("x-original: /path?q=1"), "{response}");
+    assert!(response.contains("x-reply-host: example.com"), "{response}");
+    assert!(response.contains("x-reply-method: GET"), "{response}");
+
+    let redirect = roundtrip(
+        addr,
+        "GET /old HTTP/1.1\r\nHost: redir.example\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&redirect), "HTTP/1.1 302 Found", "{redirect}");
+    assert!(
+        redirect.contains("location: https://redir.example/new"),
+        "{redirect}"
+    );
+}
+
+#[tokio::test]
 async fn route_request_headers_are_set_and_removed() {
     let upstream = upstream().await;
     let config = format!(
