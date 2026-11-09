@@ -4,7 +4,6 @@
 //! headers from the client, never forward hop-by-hop headers, and pick an
 //! upstream before touching the body.
 
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io::SeekFrom;
@@ -22,7 +21,7 @@ use futures_util::stream::BoxStream;
 use futures_util::{Stream, StreamExt, TryStreamExt};
 use http::header::{
     HeaderName, HeaderValue, ACCEPT_ENCODING, ALT_SVC, AUTHORIZATION, CACHE_CONTROL, CONNECTION,
-    CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HOST, LOCATION, SERVER, SET_COOKIE,
+    CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HOST, LOCATION, SERVER, SET_COOKIE,
     TRANSFER_ENCODING, UPGRADE, VARY, WWW_AUTHENTICATE,
 };
 use http::uri::Authority;
@@ -49,6 +48,11 @@ use elira_tls::ClientIdentity;
 use elira_upstream::{https_connector, TlsOptions};
 
 pub mod files;
+
+mod health;
+mod variables;
+use health::*;
+use variables::*;
 
 use files::Files;
 
@@ -300,277 +304,6 @@ enum ModuleTarget {
 }
 
 #[derive(Clone, Debug)]
-enum RequestKey {
-    Ip,
-    Authorization,
-    Header(HeaderName),
-    Cookie(String),
-    Uri,
-}
-
-/// Values available for `$variable` expansion in route templates.
-struct RequestVars {
-    remote_addr: std::net::IpAddr,
-    host: String,
-    uri: String,
-    path: String,
-    query: String,
-    method: String,
-    scheme: &'static str,
-    port: u16,
-    request_id: String,
-    headers: HeaderMap,
-    mapped: HashMap<String, String>,
-}
-
-impl RequestVars {
-    fn value<'a>(&'a self, name: &str) -> Option<Cow<'a, str>> {
-        match name {
-            "remote_addr" => Some(Cow::Owned(self.remote_addr.to_string())),
-            "host" => Some(Cow::Borrowed(&self.host)),
-            "request_uri" => Some(Cow::Borrowed(&self.uri)),
-            "uri" => Some(Cow::Borrowed(&self.path)),
-            "query_string" | "args" => Some(Cow::Borrowed(&self.query)),
-            "request_method" => Some(Cow::Borrowed(&self.method)),
-            "scheme" => Some(Cow::Borrowed(self.scheme)),
-            "server_port" => Some(Cow::Owned(self.port.to_string())),
-            "request_id" => Some(Cow::Borrowed(&self.request_id)),
-            _ => {
-                if let Some(value) = self.mapped.get(name) {
-                    return Some(Cow::Borrowed(value));
-                }
-                if let Some(header) = name.strip_prefix("http_") {
-                    let header = header.replace('_', "-");
-                    return self
-                        .headers
-                        .get(header)
-                        .and_then(|value| value.to_str().ok())
-                        .map(Cow::Borrowed);
-                }
-                if let Some(cookie) = name.strip_prefix("cookie_") {
-                    for header in self.headers.get_all(COOKIE) {
-                        let Ok(header) = header.to_str() else {
-                            continue;
-                        };
-                        for part in header.split(';') {
-                            let Some((key, value)) = part.trim().split_once('=') else {
-                                continue;
-                            };
-                            if key.trim() == cookie {
-                                return Some(Cow::Borrowed(value.trim()));
-                            }
-                        }
-                    }
-                }
-                None
-            }
-        }
-    }
-
-    fn apply_derived(&mut self, maps: &[Map], geos: &[CompiledGeo], splits: &[CompiledSplit]) {
-        for map in maps {
-            let source = map.source.strip_prefix('$').unwrap_or(&map.source);
-            let key = self
-                .value(source)
-                .map(|value| value.into_owned())
-                .unwrap_or_default();
-            let value = map
-                .values
-                .get(&key)
-                .cloned()
-                .or_else(|| map.default.clone())
-                .unwrap_or_default();
-            self.mapped.insert(map.name.clone(), value);
-        }
-
-        for geo in geos {
-            let value = geo
-                .networks
-                .iter()
-                .find(|(network, _)| network.contains(&self.remote_addr))
-                .map(|(_, value)| value.clone())
-                .unwrap_or_else(|| geo.default.clone());
-            self.mapped.insert(geo.name.clone(), value);
-        }
-
-        for split in splits {
-            let source = split.source.strip_prefix('$').unwrap_or(&split.source);
-            let key = self
-                .value(source)
-                .map(|value| value.into_owned())
-                .unwrap_or_default();
-            let bucket = (stable_hash(&key) % 100) as u8;
-            let mut cumulative = 0u16;
-            let mut value = String::new();
-            for (percent, bucket_value) in &split.buckets {
-                cumulative = cumulative.saturating_add(u16::from(*percent));
-                if u16::from(bucket) < cumulative {
-                    value = bucket_value.clone();
-                    break;
-                }
-            }
-            self.mapped.insert(split.name.clone(), value);
-        }
-    }
-
-    fn render(&self, template: &str) -> String {
-        let mut out = String::with_capacity(template.len());
-        let mut chars = template.chars().peekable();
-        while let Some(ch) = chars.next() {
-            if ch != '$' {
-                out.push(ch);
-                continue;
-            }
-            if chars.peek() == Some(&'$') {
-                chars.next();
-                out.push('$');
-                continue;
-            }
-            let mut name = String::new();
-            if chars.peek() == Some(&'{') {
-                chars.next();
-                for ch in chars.by_ref() {
-                    if ch == '}' {
-                        break;
-                    }
-                    name.push(ch);
-                }
-            } else {
-                while let Some(ch) = chars.peek() {
-                    if ch.is_ascii_alphanumeric() || *ch == '_' {
-                        name.push(*ch);
-                        chars.next();
-                    } else {
-                        break;
-                    }
-                }
-            }
-            if name.is_empty() {
-                out.push('$');
-                continue;
-            }
-            if let Some(value) = self.value(&name) {
-                out.push_str(&value);
-            } else {
-                out.push('$');
-                out.push_str(&name);
-            }
-        }
-        out
-    }
-}
-
-fn expand_rewrite(template: &str, captures: &regex::Captures<'_>) -> String {
-    let mut out = String::with_capacity(template.len());
-    let mut chars = template.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch != '$' {
-            out.push(ch);
-            continue;
-        }
-        if chars.peek() == Some(&'$') {
-            chars.next();
-            out.push('$');
-            continue;
-        }
-        let mut name = String::new();
-        while let Some(ch) = chars.peek() {
-            if ch.is_ascii_alphanumeric() || *ch == '_' {
-                name.push(*ch);
-                chars.next();
-            } else {
-                break;
-            }
-        }
-        if name.is_empty() {
-            out.push('$');
-            continue;
-        }
-        let value = if let Ok(index) = name.parse::<usize>() {
-            captures.get(index).map(|capture| capture.as_str())
-        } else {
-            captures.name(&name).map(|capture| capture.as_str())
-        };
-        match value {
-            Some(value) => out.push_str(value),
-            None => {
-                out.push('$');
-                out.push_str(&name);
-            }
-        }
-    }
-    out
-}
-
-fn parse_request_key(value: Option<&str>) -> RequestKey {
-    match value {
-        None | Some("ip") => RequestKey::Ip,
-        Some("authorization") => RequestKey::Authorization,
-        Some("uri") => RequestKey::Uri,
-        Some(value) => {
-            if let Some(name) = value.strip_prefix("header:") {
-                HeaderName::from_bytes(name.as_bytes())
-                    .map(RequestKey::Header)
-                    .unwrap_or(RequestKey::Ip)
-            } else if let Some(name) = value.strip_prefix("cookie:") {
-                RequestKey::Cookie(name.to_owned())
-            } else {
-                RequestKey::Ip
-            }
-        }
-    }
-}
-
-/// The value that identifies one bucket. A missing header or cookie falls
-/// back to the peer address, so a client cannot dodge the limiter by omitting
-/// it.
-fn request_key_value<'a>(
-    key: &RequestKey,
-    headers: &'a HeaderMap,
-    peer: std::net::IpAddr,
-    path: &'a str,
-) -> Cow<'a, str> {
-    let header = |name: &HeaderName| headers.get(name).and_then(|value| value.to_str().ok());
-    match key {
-        RequestKey::Ip => Cow::Owned(peer.to_string()),
-        RequestKey::Authorization => header(&AUTHORIZATION)
-            .map(Cow::Borrowed)
-            .unwrap_or_else(|| Cow::Owned(peer.to_string())),
-        RequestKey::Header(name) => header(name)
-            .map(Cow::Borrowed)
-            .unwrap_or_else(|| Cow::Owned(peer.to_string())),
-        RequestKey::Cookie(name) => cookie_value(headers, name)
-            .map(Cow::Borrowed)
-            .unwrap_or_else(|| Cow::Owned(peer.to_string())),
-        RequestKey::Uri => Cow::Borrowed(path),
-    }
-}
-
-fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
-    for header in headers.get_all(COOKIE) {
-        let Ok(header) = header.to_str() else {
-            continue;
-        };
-        for part in header.split(';') {
-            let Some((key, value)) = part.trim().split_once('=') else {
-                continue;
-            };
-            if key.trim() != name {
-                continue;
-            }
-            let value = value.trim();
-            return Some(
-                value
-                    .strip_prefix('"')
-                    .and_then(|value| value.strip_suffix('"'))
-                    .unwrap_or(value),
-            );
-        }
-    }
-    None
-}
-
-#[derive(Clone)]
 struct ClientCertRule {
     subject_cn: Option<String>,
     issuer_cn: Option<String>,
@@ -630,33 +363,6 @@ struct RouteEntry {
 }
 
 #[derive(Clone)]
-struct CompiledIf {
-    variable: String,
-    equals: Option<String>,
-    regex: Option<regex::Regex>,
-    status: StatusCode,
-    body: String,
-    content_type: Option<String>,
-}
-
-struct CompiledRewrite {
-    regex: regex::Regex,
-    replacement: String,
-    flag: RewriteFlag,
-}
-
-struct CompiledGeo {
-    name: String,
-    default: String,
-    networks: Vec<(ipnet::IpNet, String)>,
-}
-
-struct CompiledSplit {
-    name: String,
-    source: String,
-    buckets: Vec<(u8, String)>,
-}
-
 struct Router {
     exact: HashMap<String, Vec<RouteEntry>>,
     wildcard: Vec<(String, Vec<RouteEntry>)>,
@@ -763,7 +469,7 @@ fn sort_routes(list: &mut [RouteEntry]) {
 
 /// A configured backend: TCP authority or a filesystem unix socket.
 #[derive(Clone, Debug)]
-enum ServerAddr {
+pub(crate) enum ServerAddr {
     Tcp(Authority),
     Unix(PathBuf),
 }
@@ -785,14 +491,14 @@ impl ServerAddr {
         value.parse::<Authority>().ok().map(Self::Tcp)
     }
 
-    fn tcp(&self) -> Option<&Authority> {
+    pub(crate) fn tcp(&self) -> Option<&Authority> {
         match self {
             Self::Tcp(authority) => Some(authority),
             Self::Unix(_) => None,
         }
     }
 
-    fn unix(&self) -> Option<&Path> {
+    pub(crate) fn unix(&self) -> Option<&Path> {
         match self {
             Self::Unix(path) => Some(path),
             Self::Tcp(_) => None,
@@ -3853,132 +3559,6 @@ where
 
 /// One health probe: a plain HTTP/1.1 GET with `Connection: close`.
 /// Anything 2xx or 3xx counts as up.
-struct Probe<'a> {
-    path: &'a str,
-    method: &'a str,
-    host: Option<&'a str>,
-    expect: &'a [u16],
-    timeout: Duration,
-    tls: bool,
-    options: &'a TlsOptions,
-}
-
-async fn probe_server(server: &ServerAddr, probe: &Probe<'_>) -> bool {
-    if let Some(socket) = server.unix() {
-        let mut stream =
-            match tokio::time::timeout(probe.timeout, UnixStream::connect(socket)).await {
-                Ok(Ok(stream)) => stream,
-                _ => return false,
-            };
-        let host = probe.host.unwrap_or("localhost");
-        let request = format!(
-            "{} {} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n",
-            probe.method, probe.path
-        );
-        if tokio::time::timeout(probe.timeout, stream.write_all(request.as_bytes()))
-            .await
-            .is_err()
-        {
-            return false;
-        }
-        return probe_response(&mut stream, probe.timeout, probe.expect).await;
-    }
-
-    let authority = match server.tcp() {
-        Some(authority) => authority,
-        None => return false,
-    };
-    let host = authority
-        .host()
-        .trim_start_matches('[')
-        .trim_end_matches(']');
-    let port = authority
-        .port_u16()
-        .unwrap_or(if probe.tls { 443 } else { 80 });
-
-    let stream = match tokio::time::timeout(probe.timeout, TcpStream::connect((host, port))).await {
-        Ok(Ok(stream)) => stream,
-        _ => return false,
-    };
-
-    let header_host = probe.host.unwrap_or(authority.as_str());
-    let request = format!(
-        "{} {} HTTP/1.1\r\nHost: {header_host}\r\nConnection: close\r\n\r\n",
-        probe.method, probe.path
-    );
-    if probe.tls {
-        let config = match elira_upstream::client_config(probe.options) {
-            Ok(config) => config,
-            Err(_) => return false,
-        };
-        let name = match probe.options.sni.as_deref().or(Some(host)) {
-            Some(name) => name.to_owned(),
-            None => return false,
-        };
-        let name = match name.parse::<std::net::IpAddr>() {
-            Ok(ip) => tokio_rustls::rustls::pki_types::ServerName::IpAddress(ip.into()),
-            Err(_) => match tokio_rustls::rustls::pki_types::ServerName::try_from(name) {
-                Ok(name) => name,
-                Err(_) => return false,
-            },
-        };
-        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-        let mut stream =
-            match tokio::time::timeout(probe.timeout, connector.connect(name, stream)).await {
-                Ok(Ok(stream)) => stream,
-                _ => return false,
-            };
-        if tokio::time::timeout(probe.timeout, stream.write_all(request.as_bytes()))
-            .await
-            .is_err()
-        {
-            return false;
-        }
-        probe_response(&mut stream, probe.timeout, probe.expect).await
-    } else {
-        let mut stream = stream;
-        if tokio::time::timeout(probe.timeout, stream.write_all(request.as_bytes()))
-            .await
-            .is_err()
-        {
-            return false;
-        }
-        probe_response(&mut stream, probe.timeout, probe.expect).await
-    }
-}
-
-async fn probe_response<S>(stream: &mut S, timeout: Duration, expect: &[u16]) -> bool
-where
-    S: tokio::io::AsyncRead + Unpin,
-{
-    let mut buf = Vec::new();
-    loop {
-        let mut chunk = [0u8; 64];
-        let read = match tokio::time::timeout(timeout, stream.read(&mut chunk)).await {
-            Ok(Ok(read)) if read > 0 => read,
-            _ => return false,
-        };
-        buf.extend_from_slice(&chunk[..read]);
-
-        if let Some(end) = buf.windows(2).position(|window| window == b"\r\n") {
-            let line = String::from_utf8_lossy(&buf[..end]);
-            let code: u16 = match line.split_whitespace().nth(1).and_then(|c| c.parse().ok()) {
-                Some(code) => code,
-                None => return false,
-            };
-            return if expect.is_empty() {
-                (200..400).contains(&code)
-            } else {
-                expect.contains(&code)
-            };
-        }
-
-        if buf.len() > 1024 {
-            return false;
-        }
-    }
-}
-
 fn wants_upgrade(headers: &HeaderMap) -> Option<HeaderValue> {
     let upgrade = headers.get(UPGRADE)?.clone();
     let connection = headers.get(CONNECTION)?.to_str().ok()?;
@@ -4427,15 +4007,6 @@ fn headers_within_limits(headers: &HeaderMap, max_headers: usize, max_bytes: usi
         .map(|(name, value)| name.as_str().len() + value.as_bytes().len() + 4)
         .sum();
     bytes <= max_bytes
-}
-
-fn stable_hash(value: &str) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in value.bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
 }
 
 fn rendezvous(key: &str, server: &str) -> u64 {
