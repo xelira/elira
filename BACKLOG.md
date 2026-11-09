@@ -80,7 +80,8 @@ Living list for the self-improvement loop. One item per session.
 - [x] Custom FastCGI/CGI params.
 - [ ] DNS-01 against a real production CA: blocked on an externally managed
   zone for TXT records.
-- [ ] Fuzz the FastCGI/CGI streaming state machines with a scripted peer.
+- [x] Scripted-peer tests for truncated and trailing FastCGI/CGI streaming
+  framing.
 
 ## Done
 

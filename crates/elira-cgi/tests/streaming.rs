@@ -274,6 +274,46 @@ echo $$ > "$ELIRA_PID_FILE"
     wait_for_exit(pid).await;
 }
 
+#[tokio::test]
+async fn missing_header_terminator_is_rejected() {
+    let _guard = SPAWN_LOCK.lock().await;
+    let dir = TempDir::new();
+    let script = dir.script(
+        "no-terminator.sh",
+        r#"#!/bin/sh
+printf 'Status: 200 OK\r\nContent-Type: text/plain\r\n'
+"#,
+    );
+
+    let error = execute_stream(request(script, body_from(Vec::new())), 64 * 1024)
+        .await
+        .expect_err("a header block without a blank line must fail");
+    assert!(
+        matches!(error, Error::Malformed(message) if message.contains("header")),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn malformed_status_is_rejected() {
+    let _guard = SPAWN_LOCK.lock().await;
+    let dir = TempDir::new();
+    let script = dir.script(
+        "bad-status.sh",
+        r#"#!/bin/sh
+printf 'Status: nope\r\nContent-Type: text/plain\r\n\r\nbody'
+"#,
+    );
+
+    let error = execute_stream(request(script, body_from(Vec::new())), 64 * 1024)
+        .await
+        .expect_err("a malformed Status header must fail");
+    assert!(
+        matches!(error, Error::Malformed(_)),
+        "unexpected error: {error:?}"
+    );
+}
+
 #[cfg(target_os = "linux")]
 async fn wait_for_exit(pid: u32) {
     let path = format!("/proc/{pid}");

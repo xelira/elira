@@ -571,6 +571,177 @@ async fn end_request_before_headers_is_rejected() {
     server.await.unwrap();
 }
 
+#[tokio::test]
+async fn truncated_record_header_is_reported() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_request(&mut stream).await.unwrap();
+        // Six bytes of an eight-byte header, then a close.
+        stream
+            .write_all(&[VERSION, STDOUT, 0, 1, 0, 0])
+            .await
+            .unwrap();
+    });
+
+    let error = execute_stream(
+        &Target::Tcp(address),
+        Vec::new(),
+        Box::pin(stream::empty::<Result<Bytes, BoxError>>()),
+        Duration::from_secs(5),
+        64 * 1024,
+    )
+    .await
+    .expect_err("a truncated record header must fail");
+    assert!(
+        matches!(
+            error,
+            Error::Io { .. } | Error::Response(_) | Error::Protocol(_)
+        ),
+        "unexpected error: {error:?}"
+    );
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn truncated_record_content_is_reported() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_request(&mut stream).await.unwrap();
+        // A STDOUT record claims ten bytes; only four arrive.
+        stream
+            .write_all(&[VERSION, STDOUT, 0, 1, 0, 10, 0, 0])
+            .await
+            .unwrap();
+        stream.write_all(b"abcd").await.unwrap();
+    });
+
+    let error = execute_stream(
+        &Target::Tcp(address),
+        Vec::new(),
+        Box::pin(stream::empty::<Result<Bytes, BoxError>>()),
+        Duration::from_secs(5),
+        64 * 1024,
+    )
+    .await
+    .expect_err("a truncated record body must fail");
+    assert!(
+        matches!(
+            error,
+            Error::Io { .. } | Error::Response(_) | Error::Protocol(_)
+        ),
+        "unexpected error: {error:?}"
+    );
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn truncated_padding_is_reported() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_request(&mut stream).await.unwrap();
+        // Content length 2, padding length 8, but no padding follows.
+        stream
+            .write_all(&[VERSION, STDOUT, 0, 1, 0, 2, 8, 0, b'o', b'k'])
+            .await
+            .unwrap();
+    });
+
+    let error = execute_stream(
+        &Target::Tcp(address),
+        Vec::new(),
+        Box::pin(stream::empty::<Result<Bytes, BoxError>>()),
+        Duration::from_secs(5),
+        64 * 1024,
+    )
+    .await
+    .expect_err("missing padding must fail");
+    assert!(
+        matches!(
+            error,
+            Error::Io { .. } | Error::Response(_) | Error::Protocol(_)
+        ),
+        "unexpected error: {error:?}"
+    );
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn incomplete_header_block_is_rejected() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_request(&mut stream).await.unwrap();
+        write_record(
+            &mut stream,
+            STDOUT,
+            b"Status: 200 OK\r\nContent-Type: text/plain\r\n",
+        )
+        .await
+        .unwrap();
+        send_end(&mut stream, 0).await.unwrap();
+    });
+
+    let error = execute_stream(
+        &Target::Tcp(address),
+        Vec::new(),
+        Box::pin(stream::empty::<Result<Bytes, BoxError>>()),
+        Duration::from_secs(5),
+        64 * 1024,
+    )
+    .await
+    .expect_err("a header block without its blank line must fail");
+    assert!(
+        matches!(error, Error::Response(ref message) if message.contains("header block")),
+        "unexpected error: {error:?}"
+    );
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn records_after_end_request_are_not_returned() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_request(&mut stream).await.unwrap();
+        write_record(&mut stream, STDOUT, b"Status: 200 OK\r\n\r\nbody")
+            .await
+            .unwrap();
+        send_end(&mut stream, 0).await.unwrap();
+        // Trailing bytes belong to no request; the one-shot client must stop
+        // at END_REQUEST rather than appending them to the body.
+        write_record(&mut stream, STDOUT, b"-after-end")
+            .await
+            .unwrap();
+    });
+
+    let response = execute_stream(
+        &Target::Tcp(address),
+        Vec::new(),
+        Box::pin(stream::empty::<Result<Bytes, BoxError>>()),
+        Duration::from_secs(5),
+        64 * 1024,
+    )
+    .await
+    .expect("response");
+    let (body, failure) = drain(response).await;
+    assert!(failure.is_none(), "unexpected stream error: {failure:?}");
+    assert_eq!(body, b"body");
+    server.await.unwrap();
+}
+
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }

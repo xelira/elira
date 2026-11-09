@@ -124,6 +124,8 @@
   файлы.
 - `cipher_suites`/`curves` для TCP и отдельно для HTTP/3.
 - `GET /config` на админском листенере: эффективный конфиг в JSON.
+- Тесты FastCGI/CGI на обрезанные заголовки, длину записи, padding и хвост
+  после `END_REQUEST`.
 - `Cache-Control: must-revalidate` запрещает stale-выдачу; `Expires`/`Date`
   задают TTL, если `max-age` нет. Запросы с `no-cache`/`no-store` обходят кэш.
 - Заголовки `Forwarded` и `X-Forwarded-Port` к upstream.
