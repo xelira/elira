@@ -131,6 +131,7 @@
 - `request_headers`/`request_remove_headers` на маршруте.
 - Пассивная эвикция upstream: `failures_before_eject` и `eject_secs`.
 - Балансировка `hash` (rendezvous) по IP/заголовку/cookie/URI.
+- Multi-range для статики: `multipart/byteranges`, склейка и лимит 64.
 - `Cache-Control: must-revalidate` запрещает stale-выдачу; `Expires`/`Date`
   задают TTL, если `max-age` нет. Запросы с `no-cache`/`no-store` обходят кэш.
 - Заголовки `Forwarded` и `X-Forwarded-Port` к upstream.

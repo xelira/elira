@@ -230,7 +230,7 @@ HTTP:
 Static files:
 
 - index files, MIME types, `ETag`, `If-None-Match`, `If-Modified-Since`
-- single byte ranges; `HEAD`; precompressed `.br`/`.gz` siblings
+- single and multipart byte ranges; `HEAD`; precompressed `.br`/`.gz` siblings
 - on-the-fly compression; path traversal and symlink escapes rejected
 - `sendfile(2)` for plain HTTP/1.1 GET/HEAD, including single ranges,
   conditionals and protected routes
@@ -277,7 +277,7 @@ The listener has no TLS. Put it on loopback or set `auth_file`.
 ## Not yet
 
 - `sendfile` still declines TLS, HTTP/2, compression and multi-range
-  responses; those need hyper or a multipart body. Single ranges,
+  responses; those go through hyper or a multipart body. Single ranges,
   conditionals, auth, ACLs and per-route headers stay on the fast path.
 - The HTTP/3 listener survives a reload when its address, certificate and
   client-auth settings did not change. Replacing the certificate file restarts

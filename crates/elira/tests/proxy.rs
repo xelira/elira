@@ -484,6 +484,40 @@ root = "{}"
     assert!(range.contains("content-range: bytes 0-4/11"), "{range}");
     assert!(range.ends_with("hello"));
 
+    let multi = roundtrip(
+        addr,
+        "GET /file.txt HTTP/1.1\r\nHost: example.com\r\nRange: bytes=0-4,6-10\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&multi), "HTTP/1.1 206 Partial Content", "{multi}");
+    let boundary = multi
+        .lines()
+        .find(|line| line.to_ascii_lowercase().starts_with("content-type:"))
+        .and_then(|line| line.split("boundary=").nth(1))
+        .map(str::trim)
+        .expect("multipart boundary");
+    let lower = multi.to_ascii_lowercase();
+    assert!(
+        lower.contains("content-type: multipart/byteranges"),
+        "{multi}"
+    );
+    assert!(lower.contains("content-range: bytes 0-4/11"), "{multi}");
+    assert!(lower.contains("content-range: bytes 6-10/11"), "{multi}");
+    assert!(lower.contains(&format!("--{boundary}--")), "{multi}");
+    assert!(
+        multi.contains("hello") && multi.contains("world"),
+        "{multi}"
+    );
+
+    let merged = roundtrip(
+        addr,
+        "GET /file.txt HTTP/1.1\r\nHost: example.com\r\nRange: bytes=0-4,3-6\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&merged), "HTTP/1.1 206 Partial Content");
+    assert!(merged.contains("content-range: bytes 0-6/11"), "{merged}");
+    assert!(merged.ends_with("hello w"));
+
     let cached = roundtrip(
         addr,
         &format!(

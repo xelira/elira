@@ -7,7 +7,7 @@
 use std::io::SeekFrom;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use futures_util::TryStreamExt;
@@ -330,33 +330,54 @@ impl Files {
             return response;
         }
 
-        let range = req
+        enum Selection {
+            Full,
+            Single(ByteRange),
+            Multi(Vec<ByteRange>),
+        }
+
+        let selection = match req
             .headers()
             .get(http::header::RANGE)
             .and_then(|value| value.to_str().ok())
-            .and_then(|value| parse_range(value, len));
-
-        let (status, start, end) = match range {
-            Some(Ok(range)) => (StatusCode::PARTIAL_CONTENT, range.start, range.end),
-            Some(Err(())) => {
-                let mut response = text(StatusCode::RANGE_NOT_SATISFIABLE, "range not satisfiable");
-                response.headers_mut().insert(
-                    CONTENT_RANGE,
-                    http::HeaderValue::from_str(&format!("bytes */{len}")).expect("ASCII"),
-                );
-                return response;
-            }
-            None => (StatusCode::OK, 0, len.saturating_sub(1)),
+        {
+            Some(value) => match parse_ranges(value, len) {
+                Some(Ok(mut ranges)) if ranges.len() == 1 => Selection::Single(ranges.remove(0)),
+                Some(Ok(ranges)) => Selection::Multi(ranges),
+                Some(Err(())) => {
+                    let mut response =
+                        text(StatusCode::RANGE_NOT_SATISFIABLE, "range not satisfiable");
+                    response.headers_mut().insert(
+                        CONTENT_RANGE,
+                        http::HeaderValue::from_str(&format!("bytes */{len}")).expect("ASCII"),
+                    );
+                    return response;
+                }
+                None => Selection::Full,
+            },
+            None => Selection::Full,
         };
 
-        let length = if len == 0 { 0 } else { end - start + 1 };
+        let status = match &selection {
+            Selection::Full => StatusCode::OK,
+            Selection::Single(_) | Selection::Multi(_) => StatusCode::PARTIAL_CONTENT,
+        };
+        let length = match &selection {
+            Selection::Full => Some(len),
+            Selection::Single(range) => Some(range.end - range.start + 1),
+            Selection::Multi(_) => None,
+        };
+        let boundary = match &selection {
+            Selection::Multi(_) => Some(multipart_boundary()),
+            _ => None,
+        };
 
         // Compress only the whole representation: a range is a byte range of
         // the identity body, and a precompressed sibling is already encoded.
         let compress_with = if self.compress
             && status == StatusCode::OK
             && req.method() != Method::HEAD
-            && length >= self.min_bytes
+            && length.is_some_and(|length| length >= self.min_bytes)
             && content_encoding.is_none()
             && crate::compressible(content_type)
         {
@@ -367,21 +388,33 @@ impl Files {
 
         let mut builder = Response::builder()
             .status(status)
-            .header(CONTENT_TYPE, content_type)
             .header(ACCEPT_RANGES, "bytes")
             .header("x-content-type-options", "nosniff");
+        builder = match &boundary {
+            Some(boundary) => builder.header(
+                CONTENT_TYPE,
+                format!("multipart/byteranges; boundary={boundary}"),
+            ),
+            None => builder.header(CONTENT_TYPE, content_type),
+        };
 
         // A compressed body has no fixed length, and its ETag would belong to
         // a different representation, so both are dropped.
         if compress_with.is_none() {
-            builder = builder.header(CONTENT_LENGTH, length).header(ETAG, etag);
+            if let Some(length) = length {
+                builder = builder.header(CONTENT_LENGTH, length);
+            }
+            builder = builder.header(ETAG, etag);
         }
 
         if let Some(modified) = modified {
             builder = builder.header(LAST_MODIFIED, httpdate::fmt_http_date(modified));
         }
-        if status == StatusCode::PARTIAL_CONTENT {
-            builder = builder.header(CONTENT_RANGE, format!("bytes {start}-{end}/{len}"));
+        if let Selection::Single(range) = &selection {
+            builder = builder.header(
+                CONTENT_RANGE,
+                format!("bytes {}-{}/{len}", range.start, range.end),
+            );
         }
         if let Some(encoding) = content_encoding.or(compress_with) {
             builder = builder
@@ -391,7 +424,7 @@ impl Files {
 
         // A HEAD response carries the headers but no body, and hyper will not
         // send a body for it anyway.
-        if req.method() == Method::HEAD || length == 0 {
+        if req.method() == Method::HEAD || length.is_some_and(|length| length == 0) {
             return builder.body(empty()).unwrap_or_else(|_| {
                 text(StatusCode::INTERNAL_SERVER_ERROR, "response build failed")
             });
@@ -401,13 +434,30 @@ impl Files {
             Ok(file) => file,
             Err(_) => return text(StatusCode::NOT_FOUND, "not found"),
         };
-        if start > 0 && file.seek(SeekFrom::Start(start)).await.is_err() {
-            return text(StatusCode::INTERNAL_SERVER_ERROR, "cannot seek the file");
-        }
 
-        let stream = ReaderStream::new(file.take(length)).map_ok(Frame::data);
-        let body =
-            BodyExt::map_err(StreamBody::new(stream), |err| -> BoxError { Box::new(err) }).boxed();
+        let body = match selection {
+            Selection::Full => {
+                let stream = ReaderStream::new(file.take(len)).map_ok(Frame::data);
+                BodyExt::map_err(StreamBody::new(stream), |err| -> BoxError { Box::new(err) })
+                    .boxed()
+            }
+            Selection::Single(range) => {
+                if range.start > 0 && file.seek(SeekFrom::Start(range.start)).await.is_err() {
+                    return text(StatusCode::INTERNAL_SERVER_ERROR, "cannot seek the file");
+                }
+                let stream =
+                    ReaderStream::new(file.take(range.end - range.start + 1)).map_ok(Frame::data);
+                BodyExt::map_err(StreamBody::new(stream), |err| -> BoxError { Box::new(err) })
+                    .boxed()
+            }
+            Selection::Multi(ranges) => multipart_body(
+                file,
+                ranges,
+                len,
+                content_type,
+                boundary.expect("multi-range selection has a boundary"),
+            ),
+        };
         let body = if let Some(encoding) = compress_with {
             crate::compress(body, encoding)
         } else {
@@ -472,43 +522,77 @@ fn not_modified(
     false
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ByteRange {
     start: u64,
     end: u64,
 }
 
-/// One range only. A multi-range request falls back to the whole file, which
-/// is allowed and avoids generating a multipart body.
-fn parse_range(value: &str, len: u64) -> Option<Result<ByteRange, ()>> {
+/// Maximum ranges honoured in one request. Beyond this the request is
+/// rejected rather than turning one request into thousands of file seeks.
+const MAX_RANGES: usize = 64;
+
+/// Parse a `Range` header. `None` means "ignore the header and send the whole
+/// file"; `Some(Err(()))` means no requested range is satisfiable.
+fn parse_ranges(value: &str, len: u64) -> Option<Result<Vec<ByteRange>, ()>> {
     let list = value.strip_prefix("bytes=")?;
-    if list.contains(',') {
-        return None;
-    }
-
-    let (start, end) = list.split_once('-')?;
-    let start = start.trim();
-    let end = end.trim();
-
     if len == 0 {
         return Some(Err(()));
     }
 
+    let mut ranges = Vec::new();
+    for item in list.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        if let Some(range) = parse_one_range(item, len) {
+            ranges.push(range);
+            if ranges.len() > MAX_RANGES {
+                return Some(Err(()));
+            }
+        }
+    }
+
+    if ranges.is_empty() {
+        return Some(Err(()));
+    }
+
+    // Coalesce touching or overlapping ranges so the multipart body does not
+    // repeat bytes and `0-4,3-9` becomes a single range.
+    ranges.sort_by_key(|range| range.start);
+    let mut merged: Vec<ByteRange> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        if let Some(last) = merged.last_mut() {
+            if range.start <= last.end.saturating_add(1) {
+                last.end = last.end.max(range.end);
+                continue;
+            }
+        }
+        merged.push(range);
+    }
+    Some(Ok(merged))
+}
+
+fn parse_one_range(value: &str, len: u64) -> Option<ByteRange> {
+    let (start, end) = value.split_once('-')?;
+    let start = start.trim();
+    let end = end.trim();
+
     if start.is_empty() {
         let suffix: u64 = end.parse().ok()?;
         if suffix == 0 {
-            return Some(Err(()));
+            return None;
         }
-        let start = len.saturating_sub(suffix);
-        return Some(Ok(ByteRange {
-            start,
+        return Some(ByteRange {
+            start: len.saturating_sub(suffix),
             end: len - 1,
-        }));
+        });
     }
 
     let start: u64 = start.parse().ok()?;
     if start >= len {
-        return Some(Err(()));
+        return None;
     }
 
     let end = if end.is_empty() {
@@ -518,10 +602,94 @@ fn parse_range(value: &str, len: u64) -> Option<Result<ByteRange, ()>> {
     };
 
     if end < start {
-        return Some(Err(()));
+        return None;
     }
 
-    Some(Ok(ByteRange { start, end }))
+    Some(ByteRange { start, end })
+}
+
+fn multipart_boundary() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!("elira-{nanos:x}-{:x}", NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
+fn multipart_body(
+    file: tokio::fs::File,
+    ranges: Vec<ByteRange>,
+    total: u64,
+    content_type: &'static str,
+    boundary: String,
+) -> super::Body {
+    struct State {
+        file: tokio::fs::File,
+        ranges: Vec<ByteRange>,
+        total: u64,
+        content_type: &'static str,
+        boundary: String,
+        index: usize,
+        remaining: u64,
+        header_pending: bool,
+        tail_sent: bool,
+    }
+
+    async fn step(mut state: State) -> std::io::Result<Option<(Frame<Bytes>, State)>> {
+        loop {
+            if state.header_pending {
+                state.header_pending = false;
+                let range = state.ranges[state.index];
+                state.remaining = range.end - range.start + 1;
+                state.file.seek(SeekFrom::Start(range.start)).await?;
+                let header = format!(
+                    "--{}\r\nContent-Type: {}\r\nContent-Range: bytes {}-{}/{}\r\n\r\n",
+                    state.boundary, state.content_type, range.start, range.end, state.total
+                );
+                return Ok(Some((Frame::data(Bytes::from(header)), state)));
+            }
+
+            if state.remaining > 0 {
+                let take = state.remaining.min(64 * 1024);
+                let mut buffer = vec![0u8; take as usize];
+                state.file.read_exact(&mut buffer).await?;
+                state.remaining -= take;
+                return Ok(Some((Frame::data(Bytes::from(buffer)), state)));
+            }
+
+            if state.index + 1 < state.ranges.len() {
+                state.index += 1;
+                state.header_pending = true;
+                continue;
+            }
+
+            if !state.tail_sent {
+                state.tail_sent = true;
+                let tail = format!("--{}--\r\n", state.boundary);
+                return Ok(Some((Frame::data(Bytes::from(tail)), state)));
+            }
+
+            return Ok(None);
+        }
+    }
+
+    let state = State {
+        file,
+        ranges,
+        total,
+        content_type,
+        boundary,
+        index: 0,
+        remaining: 0,
+        header_pending: true,
+        tail_sent: false,
+    };
+
+    let stream = futures_util::stream::try_unfold(state, step);
+    BodyExt::map_err(StreamBody::new(stream), |err| -> BoxError { Box::new(err) }).boxed()
 }
 
 fn escape_html(value: &str) -> String {
@@ -578,21 +746,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ranges_are_clamped_and_suffixes_work() {
+    fn ranges_are_clamped_merged_and_capped() {
         assert_eq!(
-            parse_range("bytes=0-9", 100).map(|r| r.ok()),
-            Some(Some(ByteRange { start: 0, end: 9 }))
+            parse_ranges("bytes=0-9", 100).map(|r| r.ok()),
+            Some(Some(vec![ByteRange { start: 0, end: 9 }]))
         );
         assert_eq!(
-            parse_range("bytes=90-", 100).map(|r| r.ok()),
-            Some(Some(ByteRange { start: 90, end: 99 }))
+            parse_ranges("bytes=90-", 100).map(|r| r.ok()),
+            Some(Some(vec![ByteRange { start: 90, end: 99 }]))
         );
         assert_eq!(
-            parse_range("bytes=-10", 100).map(|r| r.ok()),
-            Some(Some(ByteRange { start: 90, end: 99 }))
+            parse_ranges("bytes=-10", 100).map(|r| r.ok()),
+            Some(Some(vec![ByteRange { start: 90, end: 99 }]))
         );
-        assert!(matches!(parse_range("bytes=100-", 100), Some(Err(()))));
-        assert!(parse_range("bytes=0-1,3-4", 100).is_none());
+        assert_eq!(
+            parse_ranges("bytes=0-1,3-4", 100).map(|r| r.ok()),
+            Some(Some(vec![
+                ByteRange { start: 0, end: 1 },
+                ByteRange { start: 3, end: 4 }
+            ]))
+        );
+        assert_eq!(
+            parse_ranges("bytes=0-4,3-9", 100).map(|r| r.ok()),
+            Some(Some(vec![ByteRange { start: 0, end: 9 }]))
+        );
+        assert_eq!(
+            parse_ranges("bytes=abc,0-2", 100).map(|r| r.ok()),
+            Some(Some(vec![ByteRange { start: 0, end: 2 }]))
+        );
+        assert!(matches!(parse_ranges("bytes=100-", 100), Some(Err(()))));
+        assert!(matches!(parse_ranges("bytes=abc", 100), Some(Err(()))));
+        assert!(parse_ranges("items=0-9", 100).is_none());
+
+        let many = (0..65)
+            .map(|index| format!("{index}-{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(matches!(
+            parse_ranges(&format!("bytes={many}"), 1000),
+            Some(Err(()))
+        ));
     }
 
     #[test]
