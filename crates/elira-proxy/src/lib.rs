@@ -1869,10 +1869,33 @@ impl Proxy {
             .pick(&key, req.uri().path())
             .ok_or_else(|| text(StatusCode::NOT_FOUND, "no route"))?;
 
+        let request_uri = req
+            .uri()
+            .path_and_query()
+            .map(|value| value.as_str().to_owned())
+            .unwrap_or_else(|| "/".to_owned());
+        let request_port = forward_host
+            .rsplit_once(':')
+            .and_then(|(_, port)| port.parse::<u16>().ok())
+            .unwrap_or(if scheme == "https" { 443 } else { 80 });
+        let vars = RequestVars {
+            remote_addr: peer.ip(),
+            host: key.clone(),
+            path: req.uri().path().to_owned(),
+            query: req.uri().query().unwrap_or_default().to_owned(),
+            uri: request_uri,
+            method: req.method().to_string(),
+            scheme,
+            port: request_port,
+            request_id: request_id.clone(),
+            headers: req.headers().clone(),
+        };
+
         if let Some(rule) = &entry.client_auth {
             if !rule.allows(req.extensions().get::<ClientIdentity>()) {
                 let mut response = text(StatusCode::FORBIDDEN, "client certificate required");
-                self.apply_error_page(&mut response, entry, peer).await;
+                self.apply_error_page(&mut response, entry, &vars, peer)
+                    .await;
                 return Err(response);
             }
         }
@@ -1889,7 +1912,8 @@ impl Proxy {
                     if length > limit as u64 {
                         let mut response =
                             text(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
-                        self.apply_error_page(&mut response, entry, peer).await;
+                        self.apply_error_page(&mut response, entry, &vars, peer)
+                            .await;
                         return Err(response);
                     }
                 }
@@ -1908,7 +1932,8 @@ impl Proxy {
                 response
                     .headers_mut()
                     .insert(http::header::RETRY_AFTER, HeaderValue::from_static("1"));
-                self.apply_error_page(&mut response, entry, peer).await;
+                self.apply_error_page(&mut response, entry, &vars, peer)
+                    .await;
                 return Err(response);
             }
         }
@@ -1916,7 +1941,8 @@ impl Proxy {
         if let Some(acl) = &entry.acl {
             if !acl.allows(peer.ip()) {
                 let mut response = text(StatusCode::FORBIDDEN, "forbidden");
-                self.apply_error_page(&mut response, entry, peer).await;
+                self.apply_error_page(&mut response, entry, &vars, peer)
+                    .await;
                 return Err(response);
             }
         }
@@ -1933,7 +1959,8 @@ impl Proxy {
                     WWW_AUTHENTICATE,
                     HeaderValue::from_static("Basic realm=\"elira\""),
                 );
-                self.apply_error_page(&mut response, entry, peer).await;
+                self.apply_error_page(&mut response, entry, &vars, peer)
+                    .await;
                 return Err(response);
             }
         }
@@ -1966,7 +1993,7 @@ impl Proxy {
                 }
                 Err(()) => {
                     if body_limit_hit.load(Ordering::Relaxed) {
-                        return Err(self.body_too_large(entry, peer).await);
+                        return Err(self.body_too_large(entry, &vars, peer).await);
                     }
                     return Err(text(StatusCode::BAD_REQUEST, "request body error"));
                 }
@@ -1984,33 +2011,12 @@ impl Proxy {
                     response
                         .headers_mut()
                         .insert(http::header::RETRY_AFTER, HeaderValue::from_static("1"));
-                    self.apply_error_page(&mut response, entry, peer).await;
+                    self.apply_error_page(&mut response, entry, &vars, peer)
+                        .await;
                     return Err(response);
                 }
             },
             None => None,
-        };
-
-        let request_uri = req
-            .uri()
-            .path_and_query()
-            .map(|value| value.as_str().to_owned())
-            .unwrap_or_else(|| "/".to_owned());
-        let request_port = forward_host
-            .rsplit_once(':')
-            .and_then(|(_, port)| port.parse::<u16>().ok())
-            .unwrap_or(if scheme == "https" { 443 } else { 80 });
-        let vars = RequestVars {
-            remote_addr: peer.ip(),
-            host: key.clone(),
-            path: req.uri().path().to_owned(),
-            query: req.uri().query().unwrap_or_default().to_owned(),
-            uri: request_uri,
-            method: req.method().to_string(),
-            scheme,
-            port: request_port,
-            request_id: request_id.clone(),
-            headers: req.headers().clone(),
         };
 
         let pool = match &entry.target {
@@ -2023,7 +2029,8 @@ impl Proxy {
                     access_log: entry.access_log,
                     access_log_sample: entry.access_log_sample,
                 });
-                self.apply_error_page(&mut response, entry, peer).await;
+                self.apply_error_page(&mut response, entry, &vars, peer)
+                    .await;
                 self.apply_route(&mut response, entry, &vars, &request_id);
                 return Ok(response);
             }
@@ -2054,7 +2061,7 @@ impl Proxy {
             Target::FastCgi { .. } => {
                 let mut response = self.serve_fastcgi(req, entry, peer, scheme).await;
                 if body_limit_hit.load(Ordering::Relaxed) {
-                    return Err(self.body_too_large(entry, peer).await);
+                    return Err(self.body_too_large(entry, &vars, peer).await);
                 }
                 response.extensions_mut().insert(Labels {
                     route: entry.label.clone(),
@@ -2062,14 +2069,15 @@ impl Proxy {
                     access_log: entry.access_log,
                     access_log_sample: entry.access_log_sample,
                 });
-                self.apply_error_page(&mut response, entry, peer).await;
+                self.apply_error_page(&mut response, entry, &vars, peer)
+                    .await;
                 self.apply_route(&mut response, entry, &vars, &request_id);
                 return Ok(response);
             }
             Target::Cgi { .. } => {
                 let mut response = self.serve_cgi(req, entry, peer, scheme).await;
                 if body_limit_hit.load(Ordering::Relaxed) {
-                    return Err(self.body_too_large(entry, peer).await);
+                    return Err(self.body_too_large(entry, &vars, peer).await);
                 }
                 response.extensions_mut().insert(Labels {
                     route: entry.label.clone(),
@@ -2077,14 +2085,15 @@ impl Proxy {
                     access_log: entry.access_log,
                     access_log_sample: entry.access_log_sample,
                 });
-                self.apply_error_page(&mut response, entry, peer).await;
+                self.apply_error_page(&mut response, entry, &vars, peer)
+                    .await;
                 self.apply_route(&mut response, entry, &vars, &request_id);
                 return Ok(response);
             }
             Target::Module(_) | Target::Wasm(_) => {
                 let mut response = self.serve_app(req, entry, peer, scheme).await;
                 if body_limit_hit.load(Ordering::Relaxed) {
-                    return Err(self.body_too_large(entry, peer).await);
+                    return Err(self.body_too_large(entry, &vars, peer).await);
                 }
                 response.extensions_mut().insert(Labels {
                     route: entry.label.clone(),
@@ -2092,7 +2101,8 @@ impl Proxy {
                     access_log: entry.access_log,
                     access_log_sample: entry.access_log_sample,
                 });
-                self.apply_error_page(&mut response, entry, peer).await;
+                self.apply_error_page(&mut response, entry, &vars, peer)
+                    .await;
                 self.apply_route(&mut response, entry, &vars, &request_id);
                 return Ok(response);
             }
@@ -2363,7 +2373,7 @@ impl Proxy {
                 }
                 Err(SendError::Failed(err)) => {
                     if body_limit_hit.load(Ordering::Relaxed) {
-                        return Err(self.body_too_large(entry, peer).await);
+                        return Err(self.body_too_large(entry, &vars, peer).await);
                     }
                     pool.record_failure(index);
                     tracing::warn!(upstream = %server, error = %err, "upstream request failed");
@@ -2373,7 +2383,7 @@ impl Proxy {
                 }
                 Err(SendError::Timeout) => {
                     if body_limit_hit.load(Ordering::Relaxed) {
-                        return Err(self.body_too_large(entry, peer).await);
+                        return Err(self.body_too_large(entry, &vars, peer).await);
                     }
                     pool.record_failure(index);
                     tracing::warn!(upstream = %server, "upstream timed out");
@@ -2591,7 +2601,8 @@ impl Proxy {
             access_log: entry.access_log,
             access_log_sample: entry.access_log_sample,
         });
-        self.apply_error_page(&mut response, entry, peer).await;
+        self.apply_error_page(&mut response, entry, &vars, peer)
+            .await;
         self.apply_route(&mut response, entry, &vars, &request_id);
         Ok(response)
     }
@@ -3121,18 +3132,26 @@ impl Proxy {
         &self,
         response: &mut Response<Body>,
         entry: &RouteEntry,
+        vars: &RequestVars,
         peer: SocketAddr,
     ) {
-        self.apply_page(response, Some(entry), peer).await;
+        self.apply_page(response, Some(entry), Some(vars), peer)
+            .await;
     }
 
     async fn apply_global_error_page(&self, response: &mut Response<Body>, peer: SocketAddr) {
-        self.apply_page(response, None, peer).await;
+        self.apply_page(response, None, None, peer).await;
     }
 
-    async fn body_too_large(&self, entry: &RouteEntry, peer: SocketAddr) -> Response<Body> {
+    async fn body_too_large(
+        &self,
+        entry: &RouteEntry,
+        vars: &RequestVars,
+        peer: SocketAddr,
+    ) -> Response<Body> {
         let mut response = text(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
-        self.apply_error_page(&mut response, entry, peer).await;
+        self.apply_error_page(&mut response, entry, vars, peer)
+            .await;
         response
     }
 
@@ -3140,6 +3159,7 @@ impl Proxy {
         &self,
         response: &mut Response<Body>,
         entry: Option<&RouteEntry>,
+        vars: Option<&RequestVars>,
         peer: SocketAddr,
     ) {
         if response.extensions().get::<ErrorPageApplied>().is_some() {
@@ -3162,10 +3182,14 @@ impl Proxy {
         let Some((_, path, files)) = page else {
             return;
         };
+        let path = match vars {
+            Some(vars) => vars.render(path),
+            None => path.clone(),
+        };
 
         let request = Request::builder()
             .method(Method::GET)
-            .uri(path.clone())
+            .uri(path)
             .body(empty());
         let Ok(request) = request else {
             return;

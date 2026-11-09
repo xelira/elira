@@ -2889,6 +2889,33 @@ rate_key = "header:x-api-key"
 }
 
 #[tokio::test]
+async fn error_page_path_expands_request_variables() {
+    let root = temp_root("error-vars");
+    std::fs::write(root.join("error-GET.html"), "method page").unwrap();
+
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[routes]]
+host = "*"
+root = "{root}"
+error_pages = ["404 /error-$request_method.html"]
+"#,
+        root = root.display()
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let response = roundtrip(
+        addr,
+        "GET /missing HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&response), "HTTP/1.1 404 Not Found", "{response}");
+    assert!(response.ends_with("method page"), "{response}");
+}
+
+#[tokio::test]
 async fn route_rate_limit_and_body_cap_apply() {
     let upstream = upstream().await;
     let config = format!(

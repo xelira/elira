@@ -122,7 +122,7 @@ Living list for the self-improvement loop. One item per session.
 
 - [x] Variables in `request_headers`, `add_headers` and redirects;
   `$remote_addr`, `$host`, `$request_uri`, `$request_id` at minimum.
-- [ ] Variables in `error_pages` paths.
+- [x] Variables in `error_pages` paths.
 - [ ] `rewrite` rules, `return` with variables, `if`, `map`, `geo`,
   `split_clients`.
 - [ ] `location =`, `^~`, nested and named locations, `internal`.
