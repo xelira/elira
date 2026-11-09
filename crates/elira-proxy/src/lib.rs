@@ -272,6 +272,11 @@ enum Target {
         status: StatusCode,
         location: String,
     },
+    Return {
+        status: StatusCode,
+        body: String,
+        content_type: Option<String>,
+    },
     FastCgi {
         target: elira_fastcgi::Target,
         root: PathBuf,
@@ -1198,6 +1203,15 @@ impl Proxy {
                     })?;
                 let location = redirect.to.clone();
                 Target::Redirect { status, location }
+            } else if let Some(ret) = &route.return_response {
+                let status = StatusCode::from_u16(ret.status).map_err(|_| Error::BadRedirect {
+                    host: route.host.clone(),
+                })?;
+                Target::Return {
+                    status,
+                    body: ret.body.clone().unwrap_or_default(),
+                    content_type: ret.content_type.clone(),
+                }
             } else {
                 return Err(Error::MissingTarget {
                     host: route.host.clone(),
@@ -2073,6 +2087,47 @@ impl Proxy {
                             text(StatusCode::INTERNAL_SERVER_ERROR, "response build failed")
                         })?;
                 response.headers_mut().insert(LOCATION, location);
+                response.extensions_mut().insert(Labels {
+                    route: entry.label.clone(),
+                    upstream: None,
+                    access_log: entry.access_log,
+                    access_log_sample: entry.access_log_sample,
+                });
+                self.apply_route(&mut response, entry, &vars, &request_id);
+                return Ok(response);
+            }
+            Target::Return {
+                status,
+                body,
+                content_type,
+            } => {
+                let rendered = vars.render(body);
+                let has_body = !rendered.is_empty()
+                    && *status != StatusCode::NO_CONTENT
+                    && *status != StatusCode::NOT_MODIFIED;
+                let body = if has_body {
+                    Full::new(Bytes::from(rendered))
+                        .map_err(|never| match never {})
+                        .boxed()
+                } else {
+                    empty()
+                };
+                let mut response =
+                    Response::builder()
+                        .status(*status)
+                        .body(body)
+                        .map_err(|_| {
+                            text(StatusCode::INTERNAL_SERVER_ERROR, "response build failed")
+                        })?;
+                if has_body {
+                    let value = content_type
+                        .as_deref()
+                        .map(|value| vars.render(value))
+                        .unwrap_or_else(|| "text/plain; charset=utf-8".to_owned());
+                    if let Ok(value) = HeaderValue::from_str(&value) {
+                        response.headers_mut().insert(CONTENT_TYPE, value);
+                    }
+                }
                 response.extensions_mut().insert(Labels {
                     route: entry.label.clone(),
                     upstream: None,

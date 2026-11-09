@@ -756,6 +756,7 @@ mTLS из `[tls]`/`[acme]`; ALPN для L4 не важен. UDP-сессии п�
 | `expires_secs` | целое ≥ 0 | нет | `Cache-Control: public, max-age` и `Expires` |
 | `etag` | bool | `true` | выдавать ли `ETag` для статики |
 | `redirect` | таблица | нет | `{ to, status }`; вместо upstream и root |
+| `return` | таблица | нет | `{ status, body, content_type }` с переменными |
 | `index` | массив строк | `["index.html"]` | файлы, которые ищутся для каталога |
 | `spa` | bool | `false` | отдавать index для несуществующих путей |
 | `strip_prefix` | bool | `false` | срезать `path` перед отправкой в upstream |
@@ -837,19 +838,24 @@ mTLS из `[tls]`/`[acme]`; ALPN для L4 не важен. UDP-сессии п�
   или статики. Формат `add_headers` — `"Name: value"`; строка без двоеточия
   или с невалидным именем отклоняется.
 - `request_headers` заменяет одноимённые заголовки клиента перед отправкой в
-  upstream, `request_remove_headers` удаляет их. Значения задаются литералами.
+  upstream, `request_remove_headers` удаляет их. Значения могут содержать
+  переменные (см. ниже).
   `Host`, `X-Forwarded-*` и `X-Request-Id` формируются автоматически, но
   `request_headers` может переопределить их явно. Hop-by-hop и framing
   заголовки (`Connection`, `Transfer-Encoding`, `Content-Length`, `Upgrade`,
   `TE`, `Trailer`, `Keep-Alive`, `Proxy-Connection`) менять нельзя — конфиг
   отклоняется.
-- В значениях `request_headers`, `add_headers`, `redirect.to` и путях
-  `error_pages` подставляются переменные: `$remote_addr`, `$host`, `$uri`,
+- В значениях `request_headers`, `add_headers`, `redirect.to`, `return.body`,
+  `return.content_type` и путях `error_pages` подставляются переменные: `$remote_addr`, `$host`, `$uri`,
   `$request_uri`, `$query_string`/`$args`, `$request_method`, `$scheme`,
   `$server_port`, `$request_id`, `$http_NAME` и `$cookie_NAME`. Форма `${NAME}`
   поддерживается, `$$` даёт литеральный `$`. Неизвестная переменная остаётся
   как есть. Если после подстановки значение не является допустимым
   HTTP-заголовком, заголовок пропускается, а редирект отвечает `500`.
+- `return = { status, body, content_type }` отвечает фиксированным статусом.
+  `body` и `content_type` раскрывают переменные. Для `204` и `304` тело не
+  отправляется. Это отдельная цель маршрута и не сочетается с `upstream`,
+  `root`, `alias` или `redirect`.
 - `alias` работает как `root`, но сначала отрезает литеральный `path` маршрута:
   `path = "/static"` и `alias = "/srv/assets"` отдают
   `/static/app.js` из `/srv/assets/app.js`. `alias` требует `path` и не

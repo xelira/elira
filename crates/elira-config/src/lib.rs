@@ -729,6 +729,11 @@ pub struct Route {
     #[serde(default)]
     pub redirect: Option<Redirect>,
 
+    /// Return a fixed status and body, with variable expansion. Exactly one
+    /// target.
+    #[serde(default, rename = "return")]
+    pub return_response: Option<RouteReturn>,
+
     /// FastCGI target: `host:port` or `unix:/path`.
     #[serde(default)]
     pub fastcgi_pass: Option<String>,
@@ -915,6 +920,16 @@ impl Redirect {
     fn default_status() -> u16 {
         302
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteReturn {
+    pub status: u16,
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub content_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -2020,6 +2035,7 @@ impl Config {
                 + usize::from(route.root.is_some())
                 + usize::from(route.alias.is_some())
                 + usize::from(route.redirect.is_some())
+                + usize::from(route.return_response.is_some())
                 + usize::from(route.fastcgi_pass.is_some())
                 + usize::from(route.cgi_pass.is_some())
                 + usize::from(route.module.is_some())
@@ -2036,6 +2052,16 @@ impl Config {
                 }
                 if route.path.is_none() || route.path_regex.is_some() {
                     return Err(Error::AliasNeedsPrefix { index });
+                }
+            }
+            if let Some(ret) = &route.return_response {
+                if !(200..=599).contains(&ret.status) {
+                    return Err(Error::BadReturnStatus { index });
+                }
+                if let Some(content_type) = &ret.content_type {
+                    if HeaderValue::from_str(content_type).is_err() {
+                        return Err(Error::BadReturnContentType { index });
+                    }
                 }
             }
 
@@ -2630,6 +2656,12 @@ pub enum Error {
 
     #[error("route {index}: alias needs a literal path prefix")]
     AliasNeedsPrefix { index: usize },
+
+    #[error("route {index}: return.status must be between 200 and 599")]
+    BadReturnStatus { index: usize },
+
+    #[error("route {index}: return.content_type is not a valid header value")]
+    BadReturnContentType { index: usize },
 
     #[error("route {index}: index file \"{entry}\" must be a plain file name")]
     BadIndexEntry { index: usize, entry: String },
@@ -4250,6 +4282,31 @@ root = "/srv/www"
         assert!(matches!(
             Config::parse(&no_tls),
             Err(Error::UnixTlsWithoutTls)
+        ));
+    }
+
+    #[test]
+    fn return_route_is_validated() {
+        let base = r#"
+listen = "127.0.0.1:8080"
+
+[[routes]]
+host = "*"
+return = { status = 503, body = "down", content_type = "text/plain" }
+"#;
+        let cfg = Config::parse(base).expect("valid");
+        assert_eq!(cfg.routes[0].return_response.as_ref().unwrap().status, 503);
+
+        let bad_status = base.replace("status = 503", "status = 700");
+        assert!(matches!(
+            Config::parse(&bad_status),
+            Err(Error::BadReturnStatus { .. })
+        ));
+
+        let bad_type = base.replace("text/plain", "bad\\u007fvalue");
+        assert!(matches!(
+            Config::parse(&bad_type),
+            Err(Error::BadReturnContentType { .. })
         ));
     }
 

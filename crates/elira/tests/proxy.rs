@@ -1203,6 +1203,50 @@ etag = false
 }
 
 #[tokio::test]
+async fn return_route_expands_variables() {
+    let config = r#"
+listen = "127.0.0.1:0"
+
+[[routes]]
+host = "down.example"
+return = { status = 503, body = "down for $host and $request_method", content_type = "text/plain" }
+
+[[routes]]
+host = "empty.example"
+return = { status = 204 }
+"#;
+    let (addr, _stop, _metrics) = start(config).await;
+
+    let response = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: down.example\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(
+        status(&response),
+        "HTTP/1.1 503 Service Unavailable",
+        "{response}"
+    );
+    assert!(
+        response.ends_with("down for down.example and GET"),
+        "{response}"
+    );
+    assert!(
+        response
+            .to_ascii_lowercase()
+            .contains("content-type: text/plain"),
+        "{response}"
+    );
+
+    let empty = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: empty.example\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&empty), "HTTP/1.1 204 No Content", "{empty}");
+}
+
+#[tokio::test]
 async fn route_request_headers_are_set_and_removed() {
     let upstream = upstream().await;
     let config = format!(
