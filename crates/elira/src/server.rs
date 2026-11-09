@@ -372,6 +372,14 @@ pub fn spawn_health_loop(
                             stats.queued_streams as u64,
                         );
                     }
+                    for (upstream, stats) in current.proxy.pool_h3_stats() {
+                        metrics.set_h3_pool(
+                            &upstream,
+                            stats.connections as u64,
+                            stats.active_requests as u64,
+                            stats.total_connections,
+                        );
+                    }
                 }
             }
         }

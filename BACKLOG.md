@@ -68,6 +68,7 @@ Living list for the self-improvement loop. One item per session.
 
 - [x] WASM module runtime beside the native `.so` ABI, including a fuel budget.
 - [x] Upstream HTTP/3 pool (`h3_pool`).
+- [x] Prometheus gauges for the HTTP/3 upstream pool.
 - [ ] DNS-01 against a real production CA: blocked on an externally managed
   zone for TXT records.
 - [ ] Fuzz the FastCGI/CGI streaming state machines with a scripted peer.

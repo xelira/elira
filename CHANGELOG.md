@@ -108,7 +108,8 @@
   против бесконечных циклов.
 - Собственный HTTP/2-пул upstream (`h2_pool`), h2c prior knowledge,
   connections/active/total/queued в `/status` и Prometheus-gauges.
-- Собственный HTTP/3-пул upstream (`h3_pool`) на quinn/h3.
+- Собственный HTTP/3-пул upstream (`h3_pool`) на quinn/h3 с
+  Prometheus-gauges.
 - `Cache-Control: must-revalidate` запрещает stale-выдачу; `Expires`/`Date`
   задают TTL, если `max-age` нет. Запросы с `no-cache`/`no-store` обходят кэш.
 - Заголовки `Forwarded` и `X-Forwarded-Port` к upstream.
