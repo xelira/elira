@@ -40,6 +40,7 @@ Living list for the self-improvement loop. One item per session.
 - [x] Disk spooling for large upstream responses.
 - [x] TLS on the unix listener, reusing the `[tls]` configuration.
 - [x] End-to-end gRPC trailer test through the custom HTTP/2 pool.
+- [x] Per-route cache hit/miss/stale metrics.
 - [x] Per-route FastCGI pool size.
 - [x] Purge tests through the admin listener in both single and worker mode.
 - [x] Per-route cache enable/TTL overrides.

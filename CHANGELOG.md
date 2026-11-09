@@ -135,6 +135,7 @@
 - Дисковая буферизация ответов upstream (`response_spool_bytes`).
 - TLS на `listen_unix` через общую секцию `[tls]`.
 - Сквозной тест gRPC-трейлеров через собственный HTTP/2-пул.
+- Per-route метрики кэша: `elira_route_cache_requests_total`.
 - `Cache-Control: must-revalidate` запрещает stale-выдачу; `Expires`/`Date`
   задают TTL, если `max-age` нет. Запросы с `no-cache`/`no-store` обходят кэш.
 - Заголовки `Forwarded` и `X-Forwarded-Port` к upstream.

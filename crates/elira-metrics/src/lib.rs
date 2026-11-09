@@ -93,6 +93,17 @@ struct Labeled {
     requests: [u64; STATUS_CLASSES.len()],
     duration_sum_nanos: u64,
     duration_count: u64,
+    cache_hits: u64,
+    cache_misses: u64,
+    cache_stale: u64,
+}
+
+/// The outcome of one cache lookup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheResult {
+    Hit,
+    Miss,
+    Stale,
 }
 
 impl Labeled {
@@ -103,6 +114,15 @@ impl Labeled {
         self.duration_count = self.duration_count.saturating_add(1);
     }
 
+    fn record_cache(&mut self, result: CacheResult) {
+        let counter = match result {
+            CacheResult::Hit => &mut self.cache_hits,
+            CacheResult::Miss => &mut self.cache_misses,
+            CacheResult::Stale => &mut self.cache_stale,
+        };
+        *counter = counter.saturating_add(1);
+    }
+
     fn merge(&mut self, other: &Labeled) {
         for (target, value) in self.requests.iter_mut().zip(&other.requests) {
             *target = target.saturating_add(*value);
@@ -111,6 +131,9 @@ impl Labeled {
             .duration_sum_nanos
             .saturating_add(other.duration_sum_nanos);
         self.duration_count = self.duration_count.saturating_add(other.duration_count);
+        self.cache_hits = self.cache_hits.saturating_add(other.cache_hits);
+        self.cache_misses = self.cache_misses.saturating_add(other.cache_misses);
+        self.cache_stale = self.cache_stale.saturating_add(other.cache_stale);
     }
 
     fn is_empty(&self) -> bool {
@@ -147,6 +170,9 @@ pub struct Delta {
     ///
     /// Each entry is `(route, sum_nanos, count)`.
     pub route_duration: Vec<(String, u64, u64)>,
+    /// Per-route cache lookups: `(route, [hits, misses, stale])`.
+    #[serde(default)]
+    pub route_cache: Vec<(String, [u64; 3])>,
     /// Per-upstream requests by status class, sorted by upstream name.
     pub upstream_requests: Vec<(String, [u64; STATUS_CLASSES.len()])>,
     /// Per-upstream duration sums and counts, sorted by upstream name.
@@ -207,6 +233,10 @@ impl Delta {
                 .route_duration
                 .iter()
                 .all(|(_, sum, count)| *sum == 0 && *count == 0)
+            && self
+                .route_cache
+                .iter()
+                .all(|(_, counts)| counts.iter().all(|&value| value == 0))
             && self
                 .upstream_requests
                 .iter()
@@ -328,6 +358,17 @@ impl Metrics {
         let nanos = nanos_of(duration);
         let mut routes = lock(&self.routes);
         record_labeled(&mut routes, route, status, nanos);
+    }
+
+    /// Record one cache lookup for a configured route.
+    ///
+    /// Only existing route labels are updated, so a route already dropped by
+    /// [`MAX_LABELS`] does not reappear just because it used the cache.
+    pub fn record_route_cache(&self, route: &str, result: CacheResult) {
+        let mut routes = lock(&self.routes);
+        if let Some(stats) = routes.get_mut(route) {
+            stats.record_cache(result);
+        }
     }
 
     /// Record one finished request for an upstream.
@@ -491,8 +532,8 @@ impl Metrics {
             .collect();
         let duration_sum_nanos = self.duration_sum_nanos.swap(0, Ordering::Relaxed);
         let duration_count = self.duration_count.swap(0, Ordering::Relaxed);
-        let (route_requests, route_duration) = take_labeled(&self.routes);
-        let (upstream_requests, upstream_duration) = take_labeled(&self.upstreams);
+        let (route_requests, route_duration, route_cache) = take_labeled(&self.routes);
+        let (upstream_requests, upstream_duration, _) = take_labeled(&self.upstreams);
 
         Delta {
             requests,
@@ -501,6 +542,7 @@ impl Metrics {
             duration_count,
             route_requests,
             route_duration,
+            route_cache,
             upstream_requests,
             upstream_duration,
             cache_hits: self.cache_hits.swap(0, Ordering::Relaxed),
@@ -573,6 +615,7 @@ impl Metrics {
         {
             let mut routes = lock(&self.routes);
             apply_labeled(&mut routes, &delta.route_requests, &delta.route_duration);
+            apply_route_cache(&mut routes, &delta.route_cache);
         }
         {
             let mut upstreams = lock(&self.upstreams);
@@ -712,6 +755,29 @@ impl Metrics {
             "elira_route_duration_seconds",
             "route",
         );
+
+        out.push_str(
+            "# HELP elira_route_cache_requests_total Cache lookups by configured route and result.\n",
+        );
+        out.push_str("# TYPE elira_route_cache_requests_total counter\n");
+        {
+            let routes = lock(&self.routes);
+            for (label, stats) in routes.iter() {
+                let label = escape_label(label);
+                for (result, count) in [
+                    ("hit", stats.cache_hits),
+                    ("miss", stats.cache_misses),
+                    ("stale", stats.cache_stale),
+                ] {
+                    if count > 0 {
+                        let _ = writeln!(
+                            out,
+                            "elira_route_cache_requests_total{{route=\"{label}\",result=\"{result}\"}} {count}"
+                        );
+                    }
+                }
+            }
+        }
 
         out.push_str(
             "# HELP elira_upstream_requests_total Proxied requests by upstream and status class.\n",
@@ -927,19 +993,26 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// Remove all labelled series, returning requests and durations in name order.
-fn take_labeled(mutex: &Mutex<BTreeMap<String, Labeled>>) -> (LabeledRequests, LabeledDuration) {
+fn take_labeled(
+    mutex: &Mutex<BTreeMap<String, Labeled>>,
+) -> (LabeledRequests, LabeledDuration, Vec<(String, [u64; 3])>) {
     let map = std::mem::take(&mut *lock(mutex));
     let mut requests = Vec::with_capacity(map.len());
     let mut duration = Vec::with_capacity(map.len());
+    let mut cache = Vec::new();
     for (label, stats) in map {
         duration.push((
             label.clone(),
             stats.duration_sum_nanos,
             stats.duration_count,
         ));
-        requests.push((label, stats.requests));
+        requests.push((label.clone(), stats.requests));
+        let counts = [stats.cache_hits, stats.cache_misses, stats.cache_stale];
+        if counts.iter().any(|&value| value != 0) {
+            cache.push((label, counts));
+        }
     }
-    (requests, duration)
+    (requests, duration, cache)
 }
 
 /// Merge the request and duration halves of a delta into one label map.
@@ -982,6 +1055,19 @@ fn apply_labeled(
 
 fn usize_of(value: u64) -> usize {
     usize::try_from(value).unwrap_or(usize::MAX)
+}
+
+/// Merge per-route cache counters into the existing label map.
+fn apply_route_cache(map: &mut BTreeMap<String, Labeled>, cache: &[(String, [u64; 3])]) {
+    for (label, counts) in cache {
+        if !map.contains_key(label) && map.len() >= MAX_LABELS {
+            continue;
+        }
+        let stats = map.entry(label.clone()).or_default();
+        stats.cache_hits = stats.cache_hits.saturating_add(counts[0]);
+        stats.cache_misses = stats.cache_misses.saturating_add(counts[1]);
+        stats.cache_stale = stats.cache_stale.saturating_add(counts[2]);
+    }
 }
 
 fn record_labeled(map: &mut BTreeMap<String, Labeled>, label: &str, status: u16, nanos: u64) {
@@ -1347,6 +1433,48 @@ mod tests {
             "2"
         );
         assert_valid_exposition(&text);
+    }
+
+    #[test]
+    fn route_cache_results_are_rendered_and_travel_in_deltas() {
+        let metrics = Metrics::new();
+        metrics.record_route("api", 200, Duration::ZERO);
+        metrics.record_route_cache("api", CacheResult::Hit);
+        metrics.record_route_cache("api", CacheResult::Miss);
+        metrics.record_route_cache("api", CacheResult::Stale);
+        metrics.record_route_cache("unknown", CacheResult::Hit);
+
+        let text = metrics.render();
+        assert!(line(
+            &text,
+            "elira_route_cache_requests_total{route=\"api\",result=\"hit\"} 1"
+        ));
+        assert!(line(
+            &text,
+            "elira_route_cache_requests_total{route=\"api\",result=\"miss\"} 1"
+        ));
+        assert!(line(
+            &text,
+            "elira_route_cache_requests_total{route=\"api\",result=\"stale\"} 1"
+        ));
+        assert!(!text.contains("route=\"unknown\",result=\"hit\""));
+        assert_valid_exposition(&text);
+
+        let delta = metrics.take_delta();
+        assert_eq!(delta.route_cache, vec![("api".to_owned(), [1, 1, 1])]);
+
+        let aggregate = Metrics::new();
+        aggregate.apply_counters(&delta);
+        let text = aggregate.render();
+        assert!(line(
+            &text,
+            "elira_route_cache_requests_total{route=\"api\",result=\"hit\"} 1"
+        ));
+        assert_eq!(
+            aggregate.take_delta().route_cache,
+            vec![("api".to_owned(), [1, 1, 1])]
+        );
+        assert!(aggregate.take_delta().route_cache.is_empty());
     }
 
     #[test]

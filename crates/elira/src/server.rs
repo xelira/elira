@@ -20,7 +20,7 @@ use tokio::sync::{watch, Semaphore};
 use tokio_rustls::TlsAcceptor;
 
 use elira_accesslog::{request_id, Entry};
-use elira_metrics::Metrics;
+use elira_metrics::{CacheResult, Metrics};
 
 use crate::config::{ClientAuthMode, Config, Health, Http3, LogFormat, TlsVersion};
 use crate::proxy::{BoxError, Proxy};
@@ -709,6 +709,7 @@ async fn serve_conn<I>(
             metrics.record_request(status, elapsed);
             metrics.request_bytes(request_bytes);
             let mut upstream = None;
+            let mut route_label = None;
             let mut access_log = true;
             let mut access_log_sample = current.access_log_sample();
             if let Some(labels) = response.extensions().get::<elira_proxy::Labels>().cloned() {
@@ -717,18 +718,29 @@ async fn serve_conn<I>(
                     metrics.record_upstream(name, status, elapsed);
                 }
                 upstream = labels.upstream;
+                route_label = Some(labels.route);
                 access_log = labels.access_log;
                 access_log_sample = labels.access_log_sample;
             }
-            match response
+            let cache_result = match response
                 .headers()
                 .get("x-cache")
                 .and_then(|v| v.to_str().ok())
             {
-                Some("HIT") => metrics.cache_hit(),
-                Some("STALE") => metrics.cache_stale(),
-                Some("MISS") => metrics.cache_miss(),
-                _ => {}
+                Some("HIT") => Some(CacheResult::Hit),
+                Some("STALE") => Some(CacheResult::Stale),
+                Some("MISS") => Some(CacheResult::Miss),
+                _ => None,
+            };
+            if let Some(result) = cache_result {
+                match result {
+                    CacheResult::Hit => metrics.cache_hit(),
+                    CacheResult::Miss => metrics.cache_miss(),
+                    CacheResult::Stale => metrics.cache_stale(),
+                }
+                if let Some(route) = &route_label {
+                    metrics.record_route_cache(route, result);
+                }
             }
             let bytes = response.body().size_hint().exact().unwrap_or(0);
             metrics.response_bytes(bytes);

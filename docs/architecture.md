@@ -206,7 +206,7 @@ HTTP/3-путь получает `Arc<Metrics>` и обновляет:
 
 - `elira_requests_total` и глобальную гистограмму;
 - `elira_route_*` и `elira_upstream_*`, если ответ нёс `Labels`;
-- `elira_cache_requests_total` по `X-Cache`;
+- `elira_cache_requests_total` и `elira_route_cache_requests_total` по `X-Cache`;
 - `elira_response_bytes_total`.
 
 Не обновляются `elira_connections_in_flight` и
@@ -888,7 +888,8 @@ TCP-путь пишет запись после получения заголо�
   `elira_route_duration_seconds_{sum,count}{route}`;
 - `elira_upstream_requests_total{upstream,class}` и
   `elira_upstream_duration_seconds_{sum,count}{upstream}`;
-- `elira_cache_requests_total{result="hit"|"miss"}`;
+- `elira_cache_requests_total{result="hit"|"miss"}` и
+  `elira_route_cache_requests_total{route,result="hit"|"miss"|"stale"}`;
 - `elira_request_bytes_total`, `elira_response_bytes_total`;
 - `elira_reloads_total{result="ok"|"failed"}`.
 
