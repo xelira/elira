@@ -237,7 +237,8 @@ HTTP:
 Static files:
 
 - index files, MIME types, `ETag`, `If-None-Match`, `If-Modified-Since`
-- single and multipart byte ranges; `HEAD`; precompressed `.br`/`.gz` siblings
+- single and multipart byte ranges, `If-Range` and strong `ETag`s; `HEAD`;
+  precompressed `.br`/`.gz` siblings
 - on-the-fly compression; path traversal and symlink escapes rejected
 - `sendfile(2)` for plain HTTP/1.1 GET/HEAD, including single ranges,
   conditionals and protected routes

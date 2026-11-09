@@ -13,7 +13,7 @@ use bytes::Bytes;
 use futures_util::TryStreamExt;
 use http::header::{
     ACCEPT_RANGES, ALLOW, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG,
-    IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, VARY,
+    IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE, LAST_MODIFIED, VARY,
 };
 use http::{Method, Request, Response, StatusCode};
 use http_body_util::combinators::BoxBody;
@@ -336,26 +336,41 @@ impl Files {
             Multi(Vec<ByteRange>),
         }
 
-        let selection = match req
+        let range_allowed = match req
             .headers()
-            .get(http::header::RANGE)
+            .get(IF_RANGE)
             .and_then(|value| value.to_str().ok())
         {
-            Some(value) => match parse_ranges(value, len) {
-                Some(Ok(mut ranges)) if ranges.len() == 1 => Selection::Single(ranges.remove(0)),
-                Some(Ok(ranges)) => Selection::Multi(ranges),
-                Some(Err(())) => {
-                    let mut response =
-                        text(StatusCode::RANGE_NOT_SATISFIABLE, "range not satisfiable");
-                    response.headers_mut().insert(
-                        CONTENT_RANGE,
-                        http::HeaderValue::from_str(&format!("bytes */{len}")).expect("ASCII"),
-                    );
-                    return response;
-                }
+            Some(condition) => if_range_matches(condition, &etag, modified),
+            None => true,
+        };
+
+        let selection = if !range_allowed {
+            Selection::Full
+        } else {
+            match req
+                .headers()
+                .get(http::header::RANGE)
+                .and_then(|value| value.to_str().ok())
+            {
+                Some(value) => match parse_ranges(value, len) {
+                    Some(Ok(mut ranges)) if ranges.len() == 1 => {
+                        Selection::Single(ranges.remove(0))
+                    }
+                    Some(Ok(ranges)) => Selection::Multi(ranges),
+                    Some(Err(())) => {
+                        let mut response =
+                            text(StatusCode::RANGE_NOT_SATISFIABLE, "range not satisfiable");
+                        response.headers_mut().insert(
+                            CONTENT_RANGE,
+                            http::HeaderValue::from_str(&format!("bytes */{len}")).expect("ASCII"),
+                        );
+                        return response;
+                    }
+                    None => Selection::Full,
+                },
                 None => Selection::Full,
-            },
-            None => Selection::Full,
+            }
         };
 
         let status = match &selection {
@@ -491,7 +506,24 @@ pub fn etag(len: u64, modified: Option<SystemTime>) -> String {
         .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
         .map(|duration| duration.as_millis())
         .unwrap_or(0);
-    format!("W/\"{len:x}-{stamp:x}\"")
+    format!("\"{len:x}-{stamp:x}\"")
+}
+
+/// RFC 7233 If-Range: a strong entity tag or an exact Last-Modified date.
+/// Weak tags never match, since a weak validator cannot prove that the
+/// selected bytes are still the same representation.
+fn if_range_matches(condition: &str, etag: &str, modified: Option<SystemTime>) -> bool {
+    let condition = condition.trim();
+    if condition.starts_with('"') {
+        return condition == etag;
+    }
+    if condition.starts_with("W/") {
+        return false;
+    }
+    match modified {
+        Some(modified) => httpdate::fmt_http_date(modified) == condition,
+        None => false,
+    }
 }
 
 fn not_modified(
@@ -786,6 +818,22 @@ mod tests {
             parse_ranges(&format!("bytes={many}"), 1000),
             Some(Err(()))
         ));
+    }
+
+    #[test]
+    fn if_range_requires_a_strong_match() {
+        let modified = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let tag = etag(10, Some(modified));
+        assert!(!tag.starts_with("W/"));
+        assert!(if_range_matches(&tag, &tag, Some(modified)));
+        assert!(if_range_matches(
+            &httpdate::fmt_http_date(modified),
+            &tag,
+            Some(modified)
+        ));
+        assert!(!if_range_matches("W/\"weak\"", &tag, Some(modified)));
+        assert!(!if_range_matches("\"other\"", &tag, Some(modified)));
+        assert!(!if_range_matches("\"other\"", &tag, None));
     }
 
     #[test]

@@ -507,6 +507,30 @@ root = "{}"
     assert!(range.contains("content-range: bytes 0-4/11"), "{range}");
     assert!(range.ends_with("hello"));
 
+    let if_range = roundtrip(
+        addr,
+        &format!(
+            "GET /file.txt HTTP/1.1\r\nHost: example.com\r\nRange: bytes=0-4\r\n\
+             If-Range: {etag}\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await;
+    assert_eq!(
+        status(&if_range),
+        "HTTP/1.1 206 Partial Content",
+        "{if_range}"
+    );
+    assert!(if_range.ends_with("hello"), "{if_range}");
+
+    let stale_range = roundtrip(
+        addr,
+        "GET /file.txt HTTP/1.1\r\nHost: example.com\r\nRange: bytes=0-4\r\n\
+         If-Range: \"stale\"\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&stale_range), "HTTP/1.1 200 OK", "{stale_range}");
+    assert!(stale_range.ends_with("hello world"), "{stale_range}");
+
     let multi = roundtrip(
         addr,
         "GET /file.txt HTTP/1.1\r\nHost: example.com\r\nRange: bytes=0-4,6-10\r\nConnection: close\r\n\r\n",

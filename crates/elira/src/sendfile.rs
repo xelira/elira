@@ -79,8 +79,8 @@ pub(crate) async fn try_serve(
         match name.as_str() {
             "host" => host = Some(value.to_owned()),
             "user-agent" => user_agent = Some(value.to_owned()),
-            // Multi-range and upgrade need hyper.
-            "upgrade" => return None,
+            // Multi-range, If-Range and upgrade need hyper.
+            "upgrade" | "if-range" => return None,
             _ => {}
         }
     }
