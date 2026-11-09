@@ -95,6 +95,7 @@ struct Inner {
     tunnel_idle: Option<Duration>,
     buffer_bytes: usize,
     max_app_response: usize,
+    max_upstream_response: usize,
     fastcgi_pool: elira_fastcgi::Pool,
     refreshing: Arc<Mutex<HashSet<String>>>,
 }
@@ -143,6 +144,7 @@ struct RouteEntry {
     cache: Option<bool>,
     cache_ttl: Option<Duration>,
     access_log: bool,
+    max_upstream_response: Option<usize>,
     fastcgi_param: Vec<(String, String)>,
     cgi_param: Vec<(String, String)>,
 }
@@ -686,6 +688,7 @@ impl Proxy {
                 cache: route.cache_enabled,
                 cache_ttl: route.cache_ttl_secs.map(Duration::from_secs),
                 access_log: route.access_log,
+                max_upstream_response: route.max_upstream_response_bytes,
                 fastcgi_param: route
                     .fastcgi_param
                     .iter()
@@ -808,6 +811,7 @@ impl Proxy {
                 },
                 buffer_bytes: cfg.limits.response_buffer_bytes,
                 max_app_response: cfg.limits.max_response_bytes,
+                max_upstream_response: cfg.limits.max_upstream_response_bytes,
                 fastcgi_pool: elira_fastcgi::Pool::new(
                     cfg.limits.fastcgi_pool_idle,
                     Duration::from_secs(cfg.limits.fastcgi_pool_idle_secs),
@@ -1518,6 +1522,12 @@ impl Proxy {
             .get(CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default();
+        let response_cap = entry
+            .max_upstream_response
+            .unwrap_or(self.inner.max_upstream_response);
+        if response_cap > 0 && upstream_len.is_some_and(|length| length > response_cap) {
+            return Err(text(StatusCode::BAD_GATEWAY, "upstream response too large"));
+        }
         let compress_with = if self.inner.compression.enabled
             && parts.status == StatusCode::OK
             && !is_head
@@ -1567,13 +1577,22 @@ impl Proxy {
             }
         }
 
+        let body = if response_cap > 0 {
+            capped_body(body, response_cap)
+        } else {
+            body
+        };
+
         let cacheable = self.inner.cache.is_some()
             && cache_allowed
             && is_get
             && requested_upgrade.is_none()
             && parts.status == StatusCode::OK
             && upstream_len
-                .map(|length| length <= self.inner.cache_max_item)
+                .map(|length| {
+                    length <= self.inner.cache_max_item
+                        && (response_cap == 0 || length <= response_cap)
+                })
                 .unwrap_or(false)
             && cacheable_response(&parts.headers);
 
@@ -3112,6 +3131,57 @@ pub fn timeout_body(body: Body, idle: Duration) -> Body {
     .boxed()
 }
 
+/// A body that errors after `limit` data bytes.
+fn capped_body(body: Body, limit: usize) -> Body {
+    CappedBody {
+        inner: body,
+        limit,
+        seen: 0,
+    }
+    .boxed()
+}
+
+struct CappedBody {
+    inner: Body,
+    limit: usize,
+    seen: usize,
+}
+
+impl HttpBody for CappedBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.as_mut().get_mut();
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    this.seen = this.seen.saturating_add(data.len());
+                    if this.seen > this.limit {
+                        return Poll::Ready(Some(Err(Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "upstream response too large",
+                        )))));
+                    }
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            other => other,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
 struct IdleBody {
     inner: Body,
     idle: Duration,
@@ -3210,6 +3280,17 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn capped_body_errors_after_the_limit() {
+        let frames = futures_util::stream::iter(vec![
+            Ok::<_, BoxError>(Frame::data(Bytes::from_static(b"0123456789"))),
+            Ok::<_, BoxError>(Frame::data(Bytes::from_static(b"abc"))),
+        ]);
+        let body = capped_body(BodyExt::boxed(StreamBody::new(frames)), 10);
+        let err = BodyExt::collect(body).await.expect_err("over the cap");
+        assert!(err.to_string().contains("upstream response too large"));
+    }
 
     #[test]
     fn canonical_host_ignores_port_and_case() {

@@ -67,6 +67,21 @@ async fn upstream() -> SocketAddr {
                     }
                 }
 
+                if text.starts_with("GET /chunked ") {
+                    let mut response = String::from(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\
+                         Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                    );
+                    for _ in 0..8 {
+                        response.push_str("200\r\n");
+                        response.push_str(&"y".repeat(512));
+                        response.push_str("\r\n");
+                    }
+                    response.push_str("0\r\n\r\n");
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    return;
+                }
+
                 let body = if text.starts_with("GET /big ") {
                     "x".repeat(4096)
                 } else {
@@ -569,6 +584,80 @@ async fn compresses_large_text_for_clients_that_ask() {
         "{gz}"
     );
     assert!(!gz.contains(&"x".repeat(4096)));
+}
+
+#[tokio::test]
+async fn caps_an_upstream_response_with_a_known_length() {
+    let upstream = upstream().await;
+    let mut config = NO_DEFAULT.replace("{upstream}", &upstream.to_string());
+    config.push_str("\n[limits]\nmax_upstream_response_bytes = 1024\n");
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let response = roundtrip(
+        addr,
+        "GET /big HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&response), "HTTP/1.1 502 Bad Gateway", "{response}");
+    assert!(
+        response.contains("upstream response too large"),
+        "{response}"
+    );
+}
+
+#[tokio::test]
+async fn caps_a_chunked_upstream_response_while_streaming() {
+    let upstream = upstream().await;
+    let mut config = NO_DEFAULT.replace("{upstream}", &upstream.to_string());
+    config.push_str("\n[limits]\nmax_upstream_response_bytes = 1024\n");
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let response = roundtrip(
+        addr,
+        "GET /chunked HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&response), "HTTP/1.1 200 OK", "{response}");
+    let body = response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .unwrap_or(&response);
+    let count = body.matches('y').count();
+    assert!(
+        count <= 1024,
+        "streamed past the cap: {count} bytes\n{response}"
+    );
+}
+
+#[tokio::test]
+async fn per_route_upstream_cap_overrides_the_global_one() {
+    let upstream = upstream().await;
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[limits]
+max_upstream_response_bytes = 1024
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "example.com"
+upstream = "app"
+max_upstream_response_bytes = 8192
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let response = roundtrip(
+        addr,
+        "GET /big HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&response), "HTTP/1.1 200 OK", "{response}");
+    assert!(response.ends_with(&"x".repeat(4096)), "{response}");
 }
 
 #[tokio::test]

@@ -122,6 +122,7 @@ HTTP/1.1-соединении подглядывается до hyper, и про
 | `upstream_body_timeout_secs` | целое, секунды | `30` | прервать upstream, который перестал отдавать тело |
 | `websocket_idle_secs` | целое, секунды | `3600` | закрыть websocket/CONNECT после простоя; `0` выключает |
 | `max_response_bytes` | целое > 0 | `67108864` | предел потокового ответа FastCGI/CGI |
+| `max_upstream_response_bytes` | целое ≥ 0 | `0` | предел ответа проксируемого upstream; `0` — без лимита |
 | `connection_drain_secs` | целое > 0 | `5` | сколько ждать дозавершения соединения при остановке |
 | `shutdown_timeout_secs` | целое > 0 | `15` | общий предел остановки листенера |
 | `fastcgi_pool_idle` | целое ≥ 0 | `16` | idle-соединений FastCGI на бэкенд |
@@ -149,6 +150,11 @@ HTTP/1.1-соединении подглядывается до hyper, и про
   Таймер сбрасывается в момент прихода запроса, а не окончания ответа.
 - `max_body_bytes` проверяет только `Content-Length`. Тело, пришедшее chunked,
   этим лимитом не ограничивается: для него нужно буферизовать поток.
+- `max_upstream_response_bytes` защищает от «тяжёлого» бэкенда. Если
+  `Content-Length` уже больше лимита, клиент сразу получает `502 upstream
+  response too large`; иначе поток обрывается на том же пределе. `0` выключает
+  проверку. Кэширование ответа с `Content-Length` выше лимита также
+  отключается.
 - `requests_per_second` включает token bucket на каждый IP. Превышение даёт
   `429` с `Retry-After: 1`. `burst` — глубина ведра; при `0` она равна
   `requests_per_second`.
@@ -575,6 +581,7 @@ advisory-lock `.elira-cache.lock`, а `max_bytes` считается по все
 | `burst` | целое ≥ 0 | равен rate | глубина bucket'а маршрута |
 | `max_body_bytes` | целое ≥ 0 | глобальный лимит | свой предел `Content-Length` |
 | `max_response_bytes` | целое > 0 | `limits.max_response_bytes` | свой предел потокового ответа |
+| `max_upstream_response_bytes` | целое > 0 | `limits.max_upstream_response_bytes` | свой предел ответа upstream'а |
 | `cache_enabled` | bool | глобальный | использовать ли общий кэш для маршрута |
 | `cache_ttl_secs` | целое > 0 | глобальный | свой TTL записей маршрута |
 | `access_log` | bool | `true` | писать ли запросы этого маршрута в access-лог |
