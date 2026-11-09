@@ -422,6 +422,21 @@ pub struct Upstream {
     /// within this many seconds. Defaults to 30.
     #[serde(default)]
     pub dns_ttl_secs: Option<u64>,
+
+    /// Eject a server after this many consecutive transport failures. Zero
+    /// disables passive ejection.
+    #[serde(default)]
+    pub failures_before_eject: u32,
+
+    /// How long an ejected server is skipped.
+    #[serde(default = "Upstream::default_eject_secs")]
+    pub eject_secs: u64,
+}
+
+impl Upstream {
+    fn default_eject_secs() -> u64 {
+        30
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1507,6 +1522,11 @@ impl Config {
                     name: up.name.clone(),
                 });
             }
+            if up.failures_before_eject > 0 && up.eject_secs == 0 {
+                return Err(Error::BadEjectTimeout {
+                    name: up.name.clone(),
+                });
+            }
             if up.tls && up.servers.iter().any(|addr| addr.starts_with("unix:")) {
                 return Err(Error::TlsOverUnix {
                     name: up.name.clone(),
@@ -2009,6 +2029,9 @@ pub enum Error {
 
     #[error("upstream \"{name}\": dns_ttl_secs must be greater than zero")]
     BadDnsTtl { name: String },
+
+    #[error("upstream \"{name}\": eject_secs must be greater than zero when failures_before_eject is set")]
+    BadEjectTimeout { name: String },
 
     #[error("upstream \"{name}\": TLS over a unix socket is not supported")]
     TlsOverUnix { name: String },
@@ -3222,6 +3245,36 @@ root = "/srv/www"
             cfg.cache.dir.as_deref().map(|p| p.to_str().unwrap()),
             Some("/var/cache/elira")
         );
+    }
+
+    #[test]
+    fn passive_ejection_needs_a_cooldown() {
+        let base = r#"
+listen = "127.0.0.1:8080"
+
+[[upstreams]]
+name = "app"
+servers = ["127.0.0.1:9000"]
+failures_before_eject = 3
+eject_secs = 15
+
+[[routes]]
+host = "*"
+upstream = "app"
+"#;
+        let cfg = Config::parse(base).expect("valid");
+        assert_eq!(cfg.upstreams[0].failures_before_eject, 3);
+        assert_eq!(cfg.upstreams[0].eject_secs, 15);
+
+        let zero = base.replace("eject_secs = 15", "eject_secs = 0");
+        assert!(matches!(
+            Config::parse(&zero),
+            Err(Error::BadEjectTimeout { .. })
+        ));
+
+        let default = base.replace("eject_secs = 15\n", "");
+        let cfg = Config::parse(&default).expect("default cooldown");
+        assert_eq!(cfg.upstreams[0].eject_secs, 30);
     }
 
     #[test]

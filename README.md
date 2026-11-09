@@ -197,8 +197,8 @@ Routing:
 
 Upstreams:
 
-- round robin and least connections, active health checks, retries for bodyless
-  idempotent requests
+- round robin and least connections, active health checks, passive ejection
+  after repeated transport failures, retries for bodyless idempotent requests
 - streaming FastCGI over TCP (including DNS names) or unix sockets with an
   idle connection pool, streaming CGI scripts, and native `.so` modules
   (in-process or in a child runner) and sandboxed WebAssembly modules

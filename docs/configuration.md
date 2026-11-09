@@ -546,6 +546,8 @@ advisory-lock `.elira-cache.lock`, а `max_bytes` считается по все
 | `dns_ttl_secs` | целое > 0 | `30` | предел жизни соединения в пуле; имя резолвится заново при новом соединении |
 | `h2_pool` | bool | `false` | собственный HTTP/2-пул Elira; на plain TCP — h2c prior knowledge |
 | `h3_pool` | bool | `false` | собственный HTTP/3-пул; требует `tls = true` |
+| `failures_before_eject` | целое ≥ 0 | `0` | сколько транспортных ошибок подряд до пассивного отключения |
+| `eject_secs` | целое > 0 | `30` | на сколько секунд отключать сервер |
 
 - `name` не может быть пустым или повторяться.
 - `servers` не может быть пустым; каждый элемент — `host:port` с портом
@@ -563,6 +565,12 @@ advisory-lock `.elira-cache.lock`, а `max_bytes` считается по все
   мог уже начать обработку.
 - Все серверы помечены мёртвыми — трафик всё равно идёт (fail-open), иначе
   сломанная проверка превратилась бы в простой.
+- `failures_before_eject` включает пассивную эвикцию: после указанного числа
+  подряд ошибок соединения или таймаутов сервер пропускается на `eject_secs`.
+  HTTP-ответы, включая `5xx`, ошибкой не считаются. Успешный запрос сбрасывает
+  счётчик и снимает эвикцию; если отключены все серверы, выбор всё равно
+  возвращается к ним (fail-open). Текущее время эвикции видно в `/status` как
+  `ejected_for_ms`.
 - `h3_pool = true` использует QUIC/h3-пул (SNI, ALPN h3, до 4 соединений);
   статистика connections/active/total видна в `/status`.
 - `h2_pool = true` заменяет legacy-клиент на собственный HTTP/2-пул: до
@@ -575,10 +583,6 @@ advisory-lock `.elira-cache.lock`, а `max_bytes` считается по все
 - С `tls = true` соединение идёт по HTTPS; `sni` нужен, когда в `servers` стоит
   IP, а сертификат выписан на имя. Health-проба для TLS-бэкенда делает настоящее
   рукопожатие теми же настройками доверия; для unix-сокета проба идёт по нему.
-- Health-флаги сбрасываются при сборке нового runtime, но при включённых
-  проверках reload сначала опрашивает серверы, а потом публикует новое
-  состояние.
-- Один upstream можно использовать в нескольких маршрутах.
 - Health-флаги сбрасываются при сборке нового runtime, но при включённых
   проверках reload сначала опрашивает серверы, а потом публикует новое
   состояние.
@@ -895,6 +899,7 @@ elira check --config elira.toml
 | `unknown key exchange group "..."` | опечатка в имени curve | `X25519`, `secp256r1`, ... |
 | `QUIC requires TLS 1.3 cipher suites` | TLS 1.2 suite в `[http3]` | оставьте только `TLS13_*` |
 | `request headers cannot override hop-by-hop...` | `Connection`/`Transfer-Encoding` в request-заголовках | уберите framing-заголовки |
+| `eject_secs must be greater than zero...` | эвикция без cooldown | задайте `eject_secs` |
 | `route N: timeout_secs must be greater than zero` | нулевой таймаут | уберите поле или поставьте больше нуля |
 | `http3.cert must not be empty` | `[http3]` без сертификата | задайте `cert` и `key` |
 | `health.path must start with '/'...` | путь без `/` | `/health` |

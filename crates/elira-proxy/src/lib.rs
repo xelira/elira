@@ -10,7 +10,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -364,6 +364,10 @@ struct Pool {
     servers: Vec<ServerAddr>,
     health: Vec<AtomicBool>,
     active: Vec<AtomicUsize>,
+    passive: Vec<Passive>,
+    failures_before_eject: u32,
+    eject_for: Duration,
+    started: Instant,
     next: AtomicUsize,
     balance: Balance,
     retries: u32,
@@ -379,6 +383,12 @@ struct ActiveGuard<'a> {
     active: &'a AtomicUsize,
 }
 
+/// Consecutive transport failures and the end of a passive ejection.
+struct Passive {
+    failures: AtomicU32,
+    ejected_until_ms: AtomicU64,
+}
+
 impl Drop for ActiveGuard<'_> {
     fn drop(&mut self) {
         self.active.fetch_sub(1, Ordering::Relaxed);
@@ -389,17 +399,18 @@ impl Pool {
     fn pick(&self) -> usize {
         let count = self.servers.len();
         let start = self.next.fetch_add(1, Ordering::Relaxed);
+        let now = self.now_ms();
 
         match self.balance {
             Balance::RoundRobin => {
                 for offset in 0..count {
                     let index = (start + offset) % count;
-                    if self.health[index].load(Ordering::Relaxed) {
+                    if self.available(index, now) {
                         return index;
                     }
                 }
                 // Everything looks down. Send traffic anyway: a broken probe
-                // should not turn into an outage.
+                // or a stale ejection must not turn into an outage.
                 start % count
             }
             Balance::LeastConn => {
@@ -408,7 +419,7 @@ impl Pool {
 
                 for offset in 0..count {
                     let index = (start + offset) % count;
-                    if !self.health[index].load(Ordering::Relaxed) {
+                    if !self.available(index, now) {
                         continue;
                     }
                     let active = self.active[index].load(Ordering::Relaxed);
@@ -421,6 +432,45 @@ impl Pool {
                 best.unwrap_or(start % count)
             }
         }
+    }
+
+    fn available(&self, index: usize, now_ms: u64) -> bool {
+        self.health[index].load(Ordering::Relaxed)
+            && self.passive[index].ejected_until_ms.load(Ordering::Relaxed) <= now_ms
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
+    }
+
+    fn record_success(&self, index: usize) {
+        let passive = &self.passive[index];
+        passive.failures.store(0, Ordering::Relaxed);
+        if passive.ejected_until_ms.swap(0, Ordering::Relaxed) != 0 {
+            tracing::info!(upstream = %self.servers[index], "upstream restored after ejection");
+        }
+    }
+
+    fn record_failure(&self, index: usize) {
+        if self.failures_before_eject == 0 {
+            return;
+        }
+        let passive = &self.passive[index];
+        let failures = passive.failures.fetch_add(1, Ordering::Relaxed) + 1;
+        if failures < self.failures_before_eject {
+            return;
+        }
+
+        passive.failures.store(0, Ordering::Relaxed);
+        let until = self
+            .now_ms()
+            .saturating_add(self.eject_for.as_millis() as u64);
+        passive.ejected_until_ms.store(until, Ordering::Relaxed);
+        tracing::warn!(
+            upstream = %self.servers[index],
+            seconds = self.eject_for.as_secs(),
+            "upstream ejected after transport failures"
+        );
     }
 
     fn enter(&self, index: usize) -> ActiveGuard<'_> {
@@ -477,6 +527,10 @@ impl Proxy {
                             "address": server.to_string(),
                             "healthy": pool.health[index].load(Ordering::Relaxed),
                             "active": pool.active[index].load(Ordering::Relaxed),
+                            "ejected_for_ms": pool.passive[index]
+                                .ejected_until_ms
+                                .load(Ordering::Relaxed)
+                                .saturating_sub(pool.now_ms()),
                         })
                     })
                     .collect();
@@ -532,6 +586,12 @@ impl Proxy {
             }
             let health = (0..servers.len()).map(|_| AtomicBool::new(true)).collect();
             let active = (0..servers.len()).map(|_| AtomicUsize::new(0)).collect();
+            let passive = (0..servers.len())
+                .map(|_| Passive {
+                    failures: AtomicU32::new(0),
+                    ejected_until_ms: AtomicU64::new(0),
+                })
+                .collect();
 
             // Each pool gets its own connector: trust and ALPN may differ
             // between upstreams.
@@ -558,6 +618,10 @@ impl Proxy {
                     servers,
                     health,
                     active,
+                    passive,
+                    failures_before_eject: up.failures_before_eject,
+                    eject_for: Duration::from_secs(up.eject_secs),
+                    started: Instant::now(),
                     next: AtomicUsize::new(0),
                     balance: up.balance,
                     retries: up.retries,
@@ -1593,11 +1657,18 @@ impl Proxy {
                 .map_err(|_| text(StatusCode::BAD_GATEWAY, "bad request"))?;
             *upstream.headers_mut() = template;
 
-            return self
+            let result = self
                 .forward_upgrade(upstream, client, upgrade, server, route_timeout)
                 .await;
+            match &result {
+                Ok(_) => pool.record_success(index),
+                Err(response) if response.status() == StatusCode::BAD_GATEWAY => {
+                    pool.record_failure(index);
+                }
+                Err(_) => {}
+            }
+            return result;
         }
-
         let attempts = if can_retry {
             pool.retries as usize + 1
         } else {
@@ -1627,16 +1698,19 @@ impl Proxy {
 
             match send_request(pool, &server, upstream, route_timeout).await {
                 Ok(answer) => {
+                    pool.record_success(index);
                     response = Some(answer);
                     break;
                 }
                 Err(SendError::Failed(err)) => {
+                    pool.record_failure(index);
                     tracing::warn!(upstream = %server, error = %err, "upstream request failed");
                     if attempt + 1 == attempts {
                         return Err(text(StatusCode::BAD_GATEWAY, "bad gateway"));
                     }
                 }
                 Err(SendError::Timeout) => {
+                    pool.record_failure(index);
                     tracing::warn!(upstream = %server, "upstream timed out");
                     if attempt + 1 == attempts {
                         return Err(text(StatusCode::GATEWAY_TIMEOUT, "gateway timeout"));
@@ -3571,6 +3645,19 @@ mod tests {
             ],
             health: vec![AtomicBool::new(true), AtomicBool::new(true)],
             active: vec![AtomicUsize::new(0), AtomicUsize::new(5)],
+            passive: vec![
+                Passive {
+                    failures: AtomicU32::new(0),
+                    ejected_until_ms: AtomicU64::new(0),
+                },
+                Passive {
+                    failures: AtomicU32::new(0),
+                    ejected_until_ms: AtomicU64::new(0),
+                },
+            ],
+            failures_before_eject: 0,
+            eject_for: Duration::from_secs(30),
+            started: Instant::now(),
             next: AtomicUsize::new(0),
             balance: Balance::LeastConn,
             retries: 0,
@@ -3585,6 +3672,57 @@ mod tests {
         assert_eq!(pool.pick(), 0);
         pool.active[0].store(10, Ordering::Relaxed);
         assert_eq!(pool.pick(), 1);
+    }
+
+    #[test]
+    fn passive_ejection_skips_a_failing_server_until_the_cooldown() {
+        let tls = TlsOptions::default();
+        let client =
+            Client::builder(TokioExecutor::new()).build(https_connector(&tls).expect("connector"));
+        let pool = Pool {
+            name: "test".to_owned(),
+            servers: vec![
+                ServerAddr::Tcp("127.0.0.1:1".parse().unwrap()),
+                ServerAddr::Tcp("127.0.0.1:2".parse().unwrap()),
+            ],
+            health: vec![AtomicBool::new(true), AtomicBool::new(true)],
+            active: vec![AtomicUsize::new(0), AtomicUsize::new(0)],
+            passive: vec![
+                Passive {
+                    failures: AtomicU32::new(0),
+                    ejected_until_ms: AtomicU64::new(0),
+                },
+                Passive {
+                    failures: AtomicU32::new(0),
+                    ejected_until_ms: AtomicU64::new(0),
+                },
+            ],
+            failures_before_eject: 2,
+            eject_for: Duration::from_secs(30),
+            started: Instant::now(),
+            next: AtomicUsize::new(0),
+            balance: Balance::RoundRobin,
+            retries: 0,
+            scheme: "http",
+            client,
+            tls,
+            health_path: None,
+            h2: None,
+            h3: None,
+        };
+
+        pool.record_failure(0);
+        pool.next.store(0, Ordering::Relaxed);
+        assert_eq!(pool.pick(), 0, "one failure must not eject the server");
+
+        pool.record_failure(0);
+        pool.next.store(0, Ordering::Relaxed);
+        assert_eq!(pool.pick(), 1, "the ejected server is skipped");
+
+        // A successful request clears both the counter and the ejection.
+        pool.record_success(0);
+        pool.next.store(0, Ordering::Relaxed);
+        assert_eq!(pool.pick(), 0);
     }
 
     #[test]

@@ -783,6 +783,51 @@ request_remove_headers = ["X-Client-Secret"]
 }
 
 #[tokio::test]
+async fn passive_ejection_skips_a_dead_upstream() {
+    let healthy = upstream().await;
+    // Bind and drop a listener to get a port that refuses connections.
+    let dead = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind dead")
+        .local_addr()
+        .expect("dead addr");
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[upstreams]]
+name = "app"
+servers = ["{dead}", "{healthy}"]
+failures_before_eject = 1
+eject_secs = 30
+
+[[routes]]
+host = "example.com"
+upstream = "app"
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let first = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&first), "HTTP/1.1 502 Bad Gateway", "{first}");
+
+    // The dead server is now ejected; the round robin position that would
+    // have selected it must fall through to the healthy one.
+    for _ in 0..3 {
+        let response = roundtrip(
+            addr,
+            "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert_eq!(status(&response), "HTTP/1.1 200 OK", "{response}");
+    }
+}
+
+#[tokio::test]
 async fn retries_a_dead_upstream_for_get() {
     let upstream = upstream().await;
     let config = format!(
