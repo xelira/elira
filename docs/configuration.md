@@ -585,6 +585,7 @@ advisory-lock `.elira-cache.lock`, а `max_bytes` считается по все
 | `balance` | `round_robin` \| `least_conn` \| `hash` | `round_robin` | как выбирать сервер |
 | `hash_key` | строка | `"ip"` | ключ для `balance = "hash"`: `ip`, `authorization`, `header:NAME`, `cookie:NAME`, `uri` |
 | `retries` | целое 0..5 | `0` | дополнительные попытки на ошибку соединения |
+| `retry_on` | массив строк | `["error","timeout"]` | условия повтора: `error`, `timeout`, коды 5xx |
 | `tls` | bool | `false` | подключаться к серверам по HTTPS |
 | `sni` | строка | нет | имя для SNI и проверки сертификата |
 | `health_path` | путь | `health.path` | свой путь health-пробы |
@@ -624,8 +625,10 @@ advisory-lock `.elira-cache.lock`, а `max_bytes` считается по все
 - `hash_key` допустим только вместе с `balance = "hash"`.
 - `retries` работает для `GET`, `HEAD`, `OPTIONS` без тела, а также для
   `PUT`/`DELETE`, если тело буферизовано через `request_buffer_bytes` или
-  `request_spool_bytes`. Повтор происходит при ошибке соединения или таймауте,
-  не при ответе 5xx — бэкенд мог уже начать обработку.
+  `request_spool_bytes`. `retry_on` выбирает условия: `error`, `timeout` и/или
+  коды `500..599`; пустой список оставляет значения по умолчанию — `error` и
+  `timeout`. Повтор по 5xx отбрасывает уже полученный ответ и идёт на другой
+  сервер, поэтому включайте его только для идемпотентных маршрутов.
 - Все серверы помечены мёртвыми — трафик всё равно идёт (fail-open), иначе
   сломанная проверка превратилась бы в простой.
 - `failures_before_eject` включает пассивную эвикцию: после указанного числа
@@ -983,6 +986,7 @@ elira check --config elira.toml
 | `unix_tls needs a [tls] section...` | Unix TLS без сертификата | добавьте `[tls]` |
 | `weights must contain one positive value per server` | длина не совпала | выровняйте `weights` и `servers` |
 | `weights and balance = "hash" cannot be combined` | веса с hash | уберите `weights` |
+| `"..." is not a retry condition` | мусор в `retry_on` | `error`, `timeout` или 5xx |
 | `route N: timeout_secs must be greater than zero` | нулевой таймаут | уберите поле или поставьте больше нуля |
 | `http3.cert must not be empty` | `[http3]` без сертификата | задайте `cert` и `key` |
 | `health.path must start with '/'...` | путь без `/` | `/health` |

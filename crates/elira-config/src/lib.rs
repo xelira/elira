@@ -444,6 +444,11 @@ pub struct Upstream {
     #[serde(default)]
     pub retries: u32,
 
+    /// Conditions that trigger a retry: `error`, `timeout`, or 5xx status
+    /// codes. Empty keeps the default (error and timeout).
+    #[serde(default)]
+    pub retry_on: Vec<String>,
+
     /// Connect to the servers with TLS (https).
     #[serde(default)]
     pub tls: bool,
@@ -1657,6 +1662,18 @@ impl Config {
                     retries: up.retries,
                 });
             }
+            for condition in &up.retry_on {
+                let valid = matches!(condition.as_str(), "error" | "timeout")
+                    || condition
+                        .parse::<u16>()
+                        .is_ok_and(|code| (500..=599).contains(&code));
+                if !valid {
+                    return Err(Error::BadRetryCondition {
+                        name: up.name.clone(),
+                        condition: condition.clone(),
+                    });
+                }
+            }
             if up.h3_pool && !up.tls {
                 return Err(Error::H3PoolNeedsTls {
                     name: up.name.clone(),
@@ -2260,6 +2277,9 @@ pub enum Error {
 
     #[error("upstream \"{name}\" has {retries} retries, the maximum is 5")]
     TooManyRetries { name: String, retries: u32 },
+
+    #[error("upstream \"{name}\": {condition:?} is not a retry condition")]
+    BadRetryCondition { name: String, condition: String },
 
     #[error("upstream \"{upstream}\": \"{addr}\" is not host:port")]
     BadServer { upstream: String, addr: String },
@@ -3514,6 +3534,33 @@ root = "/srv/www"
             cfg.cache.dir.as_deref().map(|p| p.to_str().unwrap()),
             Some("/var/cache/elira")
         );
+    }
+
+    #[test]
+    fn retry_conditions_are_validated() {
+        let base = r#"
+listen = "127.0.0.1:8080"
+
+[[upstreams]]
+name = "app"
+servers = ["127.0.0.1:9000"]
+retries = 2
+retry_on = ["error", "timeout", "502", "504"]
+
+[[routes]]
+host = "*"
+upstream = "app"
+"#;
+        let cfg = Config::parse(base).expect("valid");
+        assert_eq!(cfg.upstreams[0].retry_on.len(), 4);
+
+        for condition in ["400", "200", "nope"] {
+            let text = base.replace("\"504\"", &format!("\"{condition}\""));
+            assert!(
+                matches!(Config::parse(&text), Err(Error::BadRetryCondition { .. })),
+                "{condition}"
+            );
+        }
     }
 
     #[test]

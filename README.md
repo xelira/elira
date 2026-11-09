@@ -204,7 +204,8 @@ Upstreams:
   connections; active health checks with configurable method, expected status
   and Host, passive ejection
   after repeated transport failures, retries for idempotent requests,
-  including buffered `PUT`/`DELETE` bodies
+  including buffered `PUT`/`DELETE` bodies, with a configurable `retry_on`
+  policy for errors, timeouts and 5xx statuses
 - streaming FastCGI over TCP (including DNS names) or unix sockets with an
   idle connection pool, streaming CGI scripts, and native `.so` modules
   (in-process or in a child runner) and sandboxed WebAssembly modules

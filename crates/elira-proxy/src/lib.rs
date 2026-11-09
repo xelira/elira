@@ -498,6 +498,7 @@ struct Pool {
     weights: Vec<u32>,
     total_weight: u64,
     weighted: bool,
+    retry_on: RetryOn,
     next: AtomicUsize,
     balance: Balance,
     retries: u32,
@@ -514,6 +515,46 @@ struct Pool {
 
 struct ActiveGuard<'a> {
     active: &'a AtomicUsize,
+}
+
+/// Conditions that make an upstream attempt retryable.
+struct RetryOn {
+    error: bool,
+    timeout: bool,
+    statuses: Vec<u16>,
+}
+
+impl RetryOn {
+    fn parse(conditions: &[String]) -> Self {
+        if conditions.is_empty() {
+            return Self {
+                error: true,
+                timeout: true,
+                statuses: Vec::new(),
+            };
+        }
+        let mut retry = Self {
+            error: false,
+            timeout: false,
+            statuses: Vec::new(),
+        };
+        for condition in conditions {
+            match condition.as_str() {
+                "error" => retry.error = true,
+                "timeout" => retry.timeout = true,
+                _ => {
+                    if let Ok(status) = condition.parse::<u16>() {
+                        retry.statuses.push(status);
+                    }
+                }
+            }
+        }
+        retry
+    }
+
+    fn status(&self, status: u16) -> bool {
+        self.statuses.contains(&status)
+    }
 }
 
 /// Consecutive transport failures and the end of a passive ejection.
@@ -840,6 +881,7 @@ impl Proxy {
                     weights,
                     total_weight,
                     weighted,
+                    retry_on: RetryOn::parse(&up.retry_on),
                     next: AtomicUsize::new(0),
                     balance: up.balance,
                     retries: up.retries,
@@ -2055,6 +2097,15 @@ impl Proxy {
 
             match send_request(pool, &server, upstream, route_timeout).await {
                 Ok(answer) => {
+                    if attempt + 1 < attempts && pool.retry_on.status(answer.status().as_u16()) {
+                        pool.record_success(index);
+                        tracing::warn!(
+                            upstream = %server,
+                            status = answer.status().as_u16(),
+                            "upstream returned a retryable status"
+                        );
+                        continue;
+                    }
                     pool.record_success(index);
                     response = Some(answer);
                     break;
@@ -2065,7 +2116,7 @@ impl Proxy {
                     }
                     pool.record_failure(index);
                     tracing::warn!(upstream = %server, error = %err, "upstream request failed");
-                    if attempt + 1 == attempts {
+                    if !pool.retry_on.error || attempt + 1 == attempts {
                         return Err(text(StatusCode::BAD_GATEWAY, "bad gateway"));
                     }
                 }
@@ -2075,7 +2126,7 @@ impl Proxy {
                     }
                     pool.record_failure(index);
                     tracing::warn!(upstream = %server, "upstream timed out");
-                    if attempt + 1 == attempts {
+                    if !pool.retry_on.timeout || attempt + 1 == attempts {
                         return Err(text(StatusCode::GATEWAY_TIMEOUT, "gateway timeout"));
                     }
                 }
@@ -4398,6 +4449,7 @@ mod tests {
             weights: vec![1, 1],
             total_weight: 2,
             weighted: false,
+            retry_on: RetryOn::parse(&[]),
             next: AtomicUsize::new(0),
             balance: Balance::LeastConn,
             retries: 0,
@@ -4448,6 +4500,7 @@ mod tests {
             weights: vec![1, 3],
             total_weight: 4,
             weighted: true,
+            retry_on: RetryOn::parse(&[]),
             next: AtomicUsize::new(0),
             balance: Balance::LeastConn,
             retries: 0,
@@ -4549,6 +4602,7 @@ mod tests {
             weights: vec![1, 1],
             total_weight: 2,
             weighted: false,
+            retry_on: RetryOn::parse(&[]),
             next: AtomicUsize::new(0),
             balance: Balance::RoundRobin,
             retries: 0,
