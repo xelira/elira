@@ -1288,6 +1288,83 @@ upstream = "app"
 }
 
 #[tokio::test]
+async fn concurrent_cache_misses_share_one_upstream_fetch() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = hits.clone();
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind counted upstream");
+    let upstream = listener.local_addr().expect("counted addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let counter = counter.clone();
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let Ok(read) = stream.read(&mut chunk).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        return;
+                    }
+                    head.extend_from_slice(&chunk[..read]);
+                    if head.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                counter.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\ncached",
+                    )
+                    .await;
+            });
+        }
+    });
+
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[cache]
+enabled = true
+ttl_secs = 60
+max_item_bytes = 4096
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "example.com"
+upstream = "app"
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        tasks.push(tokio::spawn(roundtrip(
+            addr,
+            "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+        )));
+    }
+    for task in tasks {
+        let response = task.await.expect("request task");
+        assert_eq!(status(&response), "HTTP/1.1 200 OK", "{response}");
+        assert!(response.ends_with("cached"), "{response}");
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn retries_a_dead_upstream_for_get() {
     let upstream = upstream().await;
     let config = format!(

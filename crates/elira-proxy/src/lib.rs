@@ -37,7 +37,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::io::BufReader;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UnixStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{watch, Semaphore};
 use tokio::time::Sleep;
 use tokio_util::io::{ReaderStream, StreamReader};
 
@@ -140,6 +140,63 @@ impl Drop for SpoolPermit {
     }
 }
 
+/// Single-flight coordination for cache misses. One request fills the entry;
+/// the rest wait briefly and re-check the cache instead of stampeding the
+/// upstream.
+struct CacheFlights {
+    entries: Mutex<HashMap<String, watch::Sender<bool>>>,
+}
+
+enum CacheFlight {
+    Leader(CacheFlightGuard),
+    Follower(watch::Receiver<bool>),
+}
+
+struct CacheFlightGuard {
+    flights: Arc<CacheFlights>,
+    key: String,
+    done: watch::Sender<bool>,
+}
+
+impl CacheFlights {
+    fn new() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn enter(self: &Arc<Self>, key: &str) -> CacheFlight {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(done) = entries.get(key) {
+            return CacheFlight::Follower(done.subscribe());
+        }
+        let (done, _) = watch::channel(false);
+        entries.insert(key.to_owned(), done.clone());
+        CacheFlight::Leader(CacheFlightGuard {
+            flights: self.clone(),
+            key: key.to_owned(),
+            done,
+        })
+    }
+}
+
+impl Drop for CacheFlightGuard {
+    fn drop(&mut self) {
+        {
+            let mut entries = self
+                .flights
+                .entries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            entries.remove(&self.key);
+        }
+        let _ = self.done.send(true);
+    }
+}
+
 struct Inner {
     router: Router,
     pools: Vec<Arc<Pool>>,
@@ -152,6 +209,7 @@ struct Inner {
     max_headers: usize,
     max_header_bytes: usize,
     cache: Option<Arc<Cache>>,
+    cache_flights: Arc<CacheFlights>,
     cache_max_item: usize,
     limiter: Option<Arc<RateLimiter>>,
     trusted_proxies: Vec<ipnet::IpNet>,
@@ -1136,6 +1194,7 @@ impl Proxy {
                 max_headers: cfg.limits.max_headers,
                 max_header_bytes: cfg.limits.max_header_bytes,
                 cache,
+                cache_flights: Arc::new(CacheFlights::new()),
                 cache_max_item,
                 limiter,
                 trusted_proxies,
@@ -1841,74 +1900,94 @@ impl Proxy {
         let mut body = Some(body);
 
         let cache_allowed = entry.cache != Some(false);
+        let mut _cache_flight: Option<CacheFlightGuard> = None;
         if is_get && requested_upgrade.is_none() && cache_allowed {
             if let Some(cache) = &self.inner.cache {
-                let now = Instant::now();
-                if let Some((hit, stale)) = cache.get_stale(&cache_key, &request_headers, now) {
-                    let age = hit.age(now);
-                    let body_len = hit.body.len();
-                    let cached_status = hit.status;
-                    let cached_type = hit
-                        .headers
-                        .iter()
-                        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
-                        .map(|(_, value)| value.clone())
-                        .unwrap_or_default();
-                    let cached_encoding = hit
-                        .headers
-                        .iter()
-                        .any(|(name, _)| name.eq_ignore_ascii_case("content-encoding"));
-                    let validators = validators_from_entry(&hit);
-                    let mut response = cache_response(hit);
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+                loop {
+                    let now = Instant::now();
+                    if let Some((hit, stale)) = cache.get_stale(&cache_key, &request_headers, now) {
+                        let age = hit.age(now);
+                        let body_len = hit.body.len();
+                        let cached_status = hit.status;
+                        let cached_type = hit
+                            .headers
+                            .iter()
+                            .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+                            .map(|(_, value)| value.clone())
+                            .unwrap_or_default();
+                        let cached_encoding = hit
+                            .headers
+                            .iter()
+                            .any(|(name, _)| name.eq_ignore_ascii_case("content-encoding"));
+                        let validators = validators_from_entry(&hit);
+                        let mut response = cache_response(hit);
 
-                    // A cached body is stored identity-encoded, so it still
-                    // has to go through the same negotiation as a fresh one.
-                    if !is_head
-                        && !cached_encoding
-                        && cached_status == StatusCode::OK.as_u16()
-                        && self.inner.compression.enabled
-                        && body_len >= self.inner.compression.min_bytes
-                        && compressible(&cached_type)
-                    {
-                        if let Some(encoding) = preferred_encoding(&request_headers) {
-                            let headers = response.headers_mut();
-                            headers.remove(CONTENT_LENGTH);
-                            headers.remove(http::header::ETAG);
-                            headers.insert(CONTENT_ENCODING, HeaderValue::from_static(encoding));
-                            headers.append(VARY, HeaderValue::from_static("accept-encoding"));
-                            let body = std::mem::replace(response.body_mut(), empty());
-                            *response.body_mut() = compress(body, encoding);
+                        // A cached body is stored identity-encoded, so it still
+                        // has to go through the same negotiation as a fresh one.
+                        if !is_head
+                            && !cached_encoding
+                            && cached_status == StatusCode::OK.as_u16()
+                            && self.inner.compression.enabled
+                            && body_len >= self.inner.compression.min_bytes
+                            && compressible(&cached_type)
+                        {
+                            if let Some(encoding) = preferred_encoding(&request_headers) {
+                                let headers = response.headers_mut();
+                                headers.remove(CONTENT_LENGTH);
+                                headers.remove(http::header::ETAG);
+                                headers
+                                    .insert(CONTENT_ENCODING, HeaderValue::from_static(encoding));
+                                headers.append(VARY, HeaderValue::from_static("accept-encoding"));
+                                let body = std::mem::replace(response.body_mut(), empty());
+                                *response.body_mut() = compress(body, encoding);
+                            }
+                        }
+
+                        if let Ok(value) = HeaderValue::from_str(&age.to_string()) {
+                            response.headers_mut().insert("age", value);
+                        }
+                        response.headers_mut().insert(
+                            "x-cache",
+                            HeaderValue::from_static(if stale { "STALE" } else { "HIT" }),
+                        );
+                        response.extensions_mut().insert(Labels {
+                            route: entry.label.clone(),
+                            upstream: Some(pool.name.clone()),
+                            access_log: entry.access_log,
+                            access_log_sample: entry.access_log_sample,
+                        });
+                        if stale {
+                            self.refresh(
+                                cache.clone(),
+                                cache_key.clone(),
+                                template.clone(),
+                                request_headers.clone(),
+                                validators,
+                                upstream_path.clone(),
+                                pool.clone(),
+                                route_timeout,
+                                entry.cache_ttl,
+                            );
+                        }
+                        self.apply_route(&mut response, entry, &request_id);
+                        return Ok(response);
+                    }
+
+                    match self.inner.cache_flights.enter(&cache_key) {
+                        CacheFlight::Leader(guard) => {
+                            _cache_flight = Some(guard);
+                            break;
+                        }
+                        CacheFlight::Follower(mut done) => {
+                            if tokio::time::Instant::now() >= deadline {
+                                break;
+                            }
+                            if !*done.borrow() {
+                                let _ = tokio::time::timeout_at(deadline, done.changed()).await;
+                            }
                         }
                     }
-
-                    if let Ok(value) = HeaderValue::from_str(&age.to_string()) {
-                        response.headers_mut().insert("age", value);
-                    }
-                    response.headers_mut().insert(
-                        "x-cache",
-                        HeaderValue::from_static(if stale { "STALE" } else { "HIT" }),
-                    );
-                    response.extensions_mut().insert(Labels {
-                        route: entry.label.clone(),
-                        upstream: Some(pool.name.clone()),
-                        access_log: entry.access_log,
-                        access_log_sample: entry.access_log_sample,
-                    });
-                    if stale {
-                        self.refresh(
-                            cache.clone(),
-                            cache_key.clone(),
-                            template.clone(),
-                            request_headers.clone(),
-                            validators,
-                            upstream_path.clone(),
-                            pool.clone(),
-                            route_timeout,
-                            entry.cache_ttl,
-                        );
-                    }
-                    self.apply_route(&mut response, entry, &request_id);
-                    return Ok(response);
                 }
             }
         }

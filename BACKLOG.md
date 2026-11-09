@@ -51,6 +51,7 @@ Living list for the self-improvement loop. One item per session.
 - [x] CRL checks for client certificates on TCP and QUIC.
 - [x] Per-route concurrency limit for proxied requests.
 - [x] Request body buffering and spooling for early release and retries.
+- [x] Single-flight cache fills for concurrent misses.
 - [x] Per-route FastCGI pool size.
 - [x] Purge tests through the admin listener in both single and worker mode.
 - [x] Per-route cache enable/TTL overrides.

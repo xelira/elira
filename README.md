@@ -248,6 +248,7 @@ Static files:
 Cache:
 
 - small `GET` responses with `X-Cache: HIT`, `MISS` or `STALE`
+- single-flight miss filling, so concurrent misses share one upstream fetch
 - `Vary`, `Cache-Control`, `s-maxage`/`max-age`, `Age`
 - `Authorization`/`Cookie` requests never read or write the cache
 - optional disk bodies that survive a restart, and stale-while-revalidate with
