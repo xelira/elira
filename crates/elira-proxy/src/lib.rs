@@ -95,6 +95,8 @@ struct Inner {
     server_header: bool,
     alt_svc: Option<HeaderValue>,
     max_body_bytes: usize,
+    max_headers: usize,
+    max_header_bytes: usize,
     cache: Option<Arc<Cache>>,
     cache_max_item: usize,
     limiter: Option<Arc<RateLimiter>>,
@@ -1064,6 +1066,8 @@ impl Proxy {
                         .ok()
                 }),
                 max_body_bytes: cfg.limits.max_body_bytes,
+                max_headers: cfg.limits.max_headers,
+                max_header_bytes: cfg.limits.max_header_bytes,
                 cache,
                 cache_max_item,
                 limiter,
@@ -1261,6 +1265,15 @@ impl Proxy {
         peer: SocketAddr,
         scheme: &'static str,
     ) -> Response<Body> {
+        if self.headers_too_large(req.headers()) {
+            let mut response = text(
+                StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+                "request headers too large",
+            );
+            self.apply_global_error_page(&mut response, peer).await;
+            return response;
+        }
+
         if let Some(limiter) = &self.inner.limiter {
             if !limiter.check(&peer.ip(), Instant::now()) {
                 let mut response = text(StatusCode::TOO_MANY_REQUESTS, "too many requests");
@@ -1279,6 +1292,13 @@ impl Proxy {
                 response
             }
         }
+    }
+
+    /// Approximate header accounting for protocols that do not enforce the
+    /// limits themselves, notably HTTP/3. HTTP/1.1 and HTTP/2 already reject
+    /// oversized lists before the proxy sees them.
+    fn headers_too_large(&self, headers: &HeaderMap) -> bool {
+        !headers_within_limits(headers, self.inner.max_headers, self.inner.max_header_bytes)
     }
 
     /// Only a trusted peer may extend the chain; everyone else starts a new
@@ -3417,6 +3437,17 @@ fn validators_from_entry(entry: &elira_cache::Entry) -> HeaderMap {
     validators
 }
 
+fn headers_within_limits(headers: &HeaderMap, max_headers: usize, max_bytes: usize) -> bool {
+    if headers.len() > max_headers {
+        return false;
+    }
+    let bytes: usize = headers
+        .iter()
+        .map(|(name, value)| name.as_str().len() + value.as_bytes().len() + 4)
+        .sum();
+    bytes <= max_bytes
+}
+
 fn rendezvous(key: &str, server: &str) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for byte in key.bytes().chain(std::iter::once(0)).chain(server.bytes()) {
@@ -3881,6 +3912,19 @@ mod tests {
             canonical_host("[::1]:8080").map(|h| h.1),
             Some("[::1]:8080".to_owned())
         );
+    }
+
+    #[test]
+    fn header_limits_count_names_values_and_overhead() {
+        let mut headers = HeaderMap::new();
+        headers.insert(HeaderName::from_static("a"), HeaderValue::from_static("1"));
+        assert!(headers_within_limits(&headers, 1, 6));
+        assert!(!headers_within_limits(&headers, 1, 5));
+        assert!(!headers_within_limits(&headers, 0, 100));
+
+        headers.insert(HeaderName::from_static("b"), HeaderValue::from_static("2"));
+        assert!(!headers_within_limits(&headers, 1, 100));
+        assert!(headers_within_limits(&headers, 2, 100));
     }
 
     #[test]

@@ -140,6 +140,7 @@
 - Потоковый лимит тела запроса для chunked-загрузок.
 - Настраиваемые health-пробы: метод, ожидаемые коды, Host.
 - `If-Range` и сильные `ETag` для диапазонов.
+- Лимиты количества и размера заголовков для HTTP/3.
 - `Cache-Control: must-revalidate` запрещает stale-выдачу; `Expires`/`Date`
   задают TTL, если `max-age` нет. Запросы с `no-cache`/`no-store` обходят кэш.
 - Заголовки `Forwarded` и `X-Forwarded-Port` к upstream.

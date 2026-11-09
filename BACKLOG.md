@@ -45,6 +45,7 @@ Living list for the self-improvement loop. One item per session.
 - [x] Streaming request-body cap for chunked uploads.
 - [x] Configurable health probe method, status codes and Host.
 - [x] `If-Range` with strong ETags and exact Last-Modified dates.
+- [x] Header count and size limits for HTTP/3.
 - [x] Per-route FastCGI pool size.
 - [x] Purge tests through the admin listener in both single and worker mode.
 - [x] Per-route cache enable/TTL overrides.
