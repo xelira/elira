@@ -166,6 +166,46 @@ async fn silent_upstream() -> SocketAddr {
     addr
 }
 
+/// An HTTP upstream that answers after a delay, used by concurrency tests.
+async fn slow_upstream(delay: Duration) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind slow upstream");
+    let addr = listener.local_addr().expect("slow addr");
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let Ok(read) = stream.read(&mut chunk).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        return;
+                    }
+                    head.extend_from_slice(&chunk[..read]);
+                    if head.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                tokio::time::sleep(delay).await;
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nslow",
+                    )
+                    .await;
+            });
+        }
+    });
+
+    addr
+}
+
 /// A TCP server that echoes bytes back. Used by the CONNECT tests.
 async fn tcp_echo() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind echo");
@@ -1105,6 +1145,51 @@ upstream = "app"
         }
     }
     assert_eq!((one, two), (6, 2));
+}
+
+#[tokio::test]
+async fn route_max_concurrent_limits_proxied_requests() {
+    let upstream = slow_upstream(Duration::from_millis(300)).await;
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "example.com"
+upstream = "app"
+max_concurrent = 1
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let first = tokio::spawn(roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    ));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let limited = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(
+        status(&limited),
+        "HTTP/1.1 503 Service Unavailable",
+        "{limited}"
+    );
+    assert!(
+        limited.to_ascii_lowercase().contains("retry-after: 1"),
+        "{limited}"
+    );
+
+    let first = first.await.expect("first request");
+    assert_eq!(status(&first), "HTTP/1.1 200 OK", "{first}");
+    assert!(first.ends_with("slow"), "{first}");
 }
 
 #[tokio::test]

@@ -308,6 +308,7 @@ struct RouteEntry {
     body_limit: Option<usize>,
     error_pages: Vec<(StatusCode, String, Arc<Files>)>,
     app_permits: Option<Arc<Semaphore>>,
+    proxy_permits: Option<Arc<Semaphore>>,
     max_response: Option<usize>,
     fastcgi_pool: Option<Arc<elira_fastcgi::Pool>>,
     cache: Option<bool>,
@@ -960,6 +961,12 @@ impl Proxy {
                 }
                 _ => None,
             };
+            let proxy_permits = match &target {
+                Target::Proxy(_) => route
+                    .max_concurrent
+                    .map(|limit| Arc::new(Semaphore::new(limit))),
+                _ => None,
+            };
 
             let entry = RouteEntry {
                 label: format!(
@@ -1006,6 +1013,7 @@ impl Proxy {
                 body_limit: route.max_body_bytes,
                 error_pages,
                 app_permits,
+                proxy_permits,
                 max_response: route.max_response_bytes,
                 cache: route.cache_enabled,
                 cache_ttl: route.cache_ttl_secs.map(Duration::from_secs),
@@ -1611,6 +1619,24 @@ impl Proxy {
             req = req.map(|body| capped_request_body(body, body_limit, hit));
         }
 
+        let proxy_permit = match &entry.proxy_permits {
+            Some(permits) => match permits.clone().try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    let mut response = text(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "too many concurrent requests",
+                    );
+                    response
+                        .headers_mut()
+                        .insert(http::header::RETRY_AFTER, HeaderValue::from_static("1"));
+                    self.apply_error_page(&mut response, entry, peer).await;
+                    return Err(response);
+                }
+            },
+            None => None,
+        };
+
         let pool = match &entry.target {
             Target::Proxy(pool) => pool,
             Target::Files(files) => {
@@ -1870,7 +1896,14 @@ impl Proxy {
             *upstream.headers_mut() = template;
 
             let result = self
-                .forward_upgrade(upstream, client, upgrade, server, route_timeout)
+                .forward_upgrade(
+                    upstream,
+                    client,
+                    upgrade,
+                    server,
+                    route_timeout,
+                    proxy_permit,
+                )
                 .await;
             match &result {
                 Ok(_) => pool.record_success(index),
@@ -2118,6 +2151,14 @@ impl Proxy {
 
         let body = match self.inner.body_timeout {
             Some(idle) => timeout_body(body, idle),
+            None => body,
+        };
+        let body = match proxy_permit {
+            Some(permit) => PermitBody {
+                inner: body,
+                _permit: permit,
+            }
+            .boxed(),
             None => body,
         };
         let mut response = builder
@@ -2766,6 +2807,7 @@ impl Proxy {
         upgrade: HeaderValue,
         server: ServerAddr,
         timeout: Duration,
+        client_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> Result<Response<Body>, Response<Body>> {
         // Tunnels outlive the connection task that the accept loop tracks,
         // so they need their own bound.
@@ -2815,6 +2857,7 @@ impl Proxy {
 
         tokio::spawn(async move {
             let _permit = permit;
+            let _client_permit = client_permit;
             match client_upgrade.await {
                 Ok(client) => {
                     let mut client = TokioIo::new(client);
@@ -3779,6 +3822,31 @@ impl HttpBody for SpooledBody {
 
     fn size_hint(&self) -> SizeHint {
         SizeHint::with_exact(self.length)
+    }
+}
+
+struct PermitBody {
+    inner: Body,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl HttpBody for PermitBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        Pin::new(&mut self.as_mut().get_mut().inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
     }
 }
 
