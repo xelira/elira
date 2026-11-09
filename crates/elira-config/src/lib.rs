@@ -32,6 +32,10 @@ pub struct Config {
     #[serde(default)]
     pub streams: Vec<Stream>,
 
+    /// Server-level path rewrites applied before route selection.
+    #[serde(default)]
+    pub rewrites: Vec<Rewrite>,
+
     /// Permission bits for the unix socket, for example `0o660`.
     #[serde(default)]
     pub listen_unix_mode: Option<u32>,
@@ -165,6 +169,25 @@ pub enum StreamTransport {
     #[default]
     Tcp,
     Udp,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Rewrite {
+    pub pattern: String,
+    pub replacement: String,
+    #[serde(default)]
+    pub flag: RewriteFlag,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RewriteFlag {
+    #[default]
+    Last,
+    Break,
+    Redirect,
+    Permanent,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1503,6 +1526,12 @@ impl Config {
             }
         }
 
+        for rewrite in &self.rewrites {
+            if rewrite.pattern.is_empty() || rewrite.replacement.is_empty() {
+                return Err(Error::BadRewrite);
+            }
+        }
+
         let mut listener_names = HashSet::new();
         listener_names.insert("default".to_owned());
         if self.listen_unix.is_some() {
@@ -2435,6 +2464,9 @@ pub enum Error {
 
     #[error("stream listen must not use port 0")]
     BadStreamListen,
+
+    #[error("rewrite pattern and replacement must not be empty")]
+    BadRewrite,
 
     #[error("stream needs at least one upstream")]
     EmptyStream,
@@ -4283,6 +4315,28 @@ root = "/srv/www"
             Config::parse(&no_tls),
             Err(Error::UnixTlsWithoutTls)
         ));
+    }
+
+    #[test]
+    fn rewrite_rules_are_validated() {
+        let base = r#"
+listen = "127.0.0.1:8080"
+
+[[rewrites]]
+pattern = "^/old/(.*)$"
+replacement = "/new/$1"
+flag = "last"
+
+[[routes]]
+host = "*"
+root = "/srv/www"
+"#;
+        let cfg = Config::parse(base).expect("valid");
+        assert_eq!(cfg.rewrites.len(), 1);
+        assert_eq!(cfg.rewrites[0].flag, RewriteFlag::Last);
+
+        let empty = base.replace("^/old/(.*)$", "");
+        assert!(matches!(Config::parse(&empty), Err(Error::BadRewrite)));
     }
 
     #[test]

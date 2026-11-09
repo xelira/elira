@@ -43,7 +43,7 @@ use tokio_util::io::{ReaderStream, StreamReader};
 
 use elira_auth::{BasicAuth, IpAcl};
 use elira_cache::Cache;
-use elira_config::{Balance, Compression, Config, Health};
+use elira_config::{Balance, Compression, Config, Health, RewriteFlag};
 use elira_limit::RateLimiter;
 use elira_tls::ClientIdentity;
 use elira_upstream::{https_connector, TlsOptions};
@@ -234,6 +234,7 @@ impl SpoolLease {
 
 struct Inner {
     routers: HashMap<String, Router>,
+    rewrites: Vec<CompiledRewrite>,
     pools: Vec<Arc<Pool>>,
     tunnels: Arc<Semaphore>,
     connect: Option<Vec<Authority>>,
@@ -406,6 +407,48 @@ impl RequestVars {
     }
 }
 
+fn expand_rewrite(template: &str, captures: &regex::Captures<'_>) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut chars = template.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '$' {
+            out.push(ch);
+            continue;
+        }
+        if chars.peek() == Some(&'$') {
+            chars.next();
+            out.push('$');
+            continue;
+        }
+        let mut name = String::new();
+        while let Some(ch) = chars.peek() {
+            if ch.is_ascii_alphanumeric() || *ch == '_' {
+                name.push(*ch);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        if name.is_empty() {
+            out.push('$');
+            continue;
+        }
+        let value = if let Ok(index) = name.parse::<usize>() {
+            captures.get(index).map(|capture| capture.as_str())
+        } else {
+            captures.name(&name).map(|capture| capture.as_str())
+        };
+        match value {
+            Some(value) => out.push_str(value),
+            None => {
+                out.push('$');
+                out.push_str(&name);
+            }
+        }
+    }
+    out
+}
+
 fn parse_request_key(value: Option<&str>) -> RequestKey {
     match value {
         None | Some("ip") => RequestKey::Ip,
@@ -528,6 +571,12 @@ struct RouteEntry {
     etag: bool,
     fastcgi_param: Vec<(String, String)>,
     cgi_param: Vec<(String, String)>,
+}
+
+struct CompiledRewrite {
+    regex: regex::Regex,
+    replacement: String,
+    flag: RewriteFlag,
 }
 
 struct Router {
@@ -1397,6 +1446,23 @@ impl Proxy {
             .map(|(name, entries)| (name, Router::from_entries(entries)))
             .collect();
 
+        let rewrites = cfg
+            .rewrites
+            .iter()
+            .map(|rewrite| {
+                let regex =
+                    regex::Regex::new(&rewrite.pattern).map_err(|err| Error::RouteConfig {
+                        host: "rewrite".to_owned(),
+                        reason: err.to_string(),
+                    })?;
+                Ok(CompiledRewrite {
+                    regex,
+                    replacement: rewrite.replacement.clone(),
+                    flag: rewrite.flag,
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+
         let connect =
             if cfg.connect.enabled {
                 let mut allowed = Vec::with_capacity(cfg.connect.allow.len());
@@ -1449,6 +1515,7 @@ impl Proxy {
         Ok(Self {
             inner: Arc::new(Inner {
                 routers,
+                rewrites,
                 pools: all_pools,
                 tunnels: Arc::new(Semaphore::new(cfg.limits.max_connections)),
                 connect,
@@ -1815,6 +1882,72 @@ impl Proxy {
             .map_err(|_| text(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"))
     }
 
+    #[allow(clippy::result_large_err)]
+    fn apply_rewrites(&self, req: &mut Request<Body>) -> Result<(), Response<Body>> {
+        let mut path = req.uri().path().to_owned();
+        let mut query = req.uri().query().map(str::to_owned);
+
+        for _ in 0..10 {
+            let mut restart = false;
+            for rewrite in &self.inner.rewrites {
+                let Some(captures) = rewrite.regex.captures(&path) else {
+                    continue;
+                };
+                let target = expand_rewrite(&rewrite.replacement, &captures);
+                match rewrite.flag {
+                    RewriteFlag::Redirect | RewriteFlag::Permanent => {
+                        let status = if rewrite.flag == RewriteFlag::Permanent {
+                            StatusCode::MOVED_PERMANENTLY
+                        } else {
+                            StatusCode::FOUND
+                        };
+                        let Ok(location) = HeaderValue::from_str(&target) else {
+                            return Err(text(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "rewrite location is not a valid header value",
+                            ));
+                        };
+                        let mut response = text(status, "redirect");
+                        response.headers_mut().insert(LOCATION, location);
+                        return Err(response);
+                    }
+                    RewriteFlag::Break | RewriteFlag::Last => {
+                        let (new_path, new_query) = match target.split_once('?') {
+                            Some((path, query)) => (path.to_owned(), Some(query.to_owned())),
+                            None => (target, None),
+                        };
+                        path = if new_path.starts_with('/') {
+                            new_path
+                        } else {
+                            format!("/{new_path}")
+                        };
+                        query = new_query;
+                        restart = rewrite.flag == RewriteFlag::Last;
+                        break;
+                    }
+                }
+            }
+            if !restart {
+                break;
+            }
+        }
+
+        let path_and_query = match query {
+            Some(query) => format!("{path}?{query}"),
+            None => path,
+        };
+        let Ok(path_and_query) = path_and_query.parse::<http::uri::PathAndQuery>() else {
+            return Err(text(StatusCode::BAD_REQUEST, "bad rewrite target"));
+        };
+        let mut parts = req.uri().clone().into_parts();
+        parts.path_and_query = Some(path_and_query);
+        let Ok(uri) = Uri::from_parts(parts) else {
+            return Err(text(StatusCode::BAD_REQUEST, "bad rewrite target"));
+        };
+        *req.uri_mut() = uri;
+        Ok(())
+    }
+
     async fn forward(
         &self,
         mut req: Request<Body>,
@@ -1901,6 +2034,10 @@ impl Proxy {
             .filter(|value| !value.is_empty() && value.len() <= 64)
             .map(str::to_owned)
             .unwrap_or_else(elira_accesslog::request_id);
+
+        if !self.inner.rewrites.is_empty() {
+            self.apply_rewrites(&mut req)?;
+        }
 
         let entry = self
             .router(listener)

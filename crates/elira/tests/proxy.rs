@@ -1247,6 +1247,56 @@ return = { status = 204 }
 }
 
 #[tokio::test]
+async fn rewrite_rules_change_the_path_and_redirect() {
+    let root = temp_root("rewrite");
+    std::fs::create_dir_all(root.join("new")).unwrap();
+    std::fs::write(root.join("new").join("hello.txt"), "rewritten").unwrap();
+
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[rewrites]]
+pattern = "^/old/(.*)$"
+replacement = "/new/$1"
+flag = "last"
+
+[[rewrites]]
+pattern = "^/go$"
+replacement = "/target"
+flag = "redirect"
+
+[[routes]]
+host = "*"
+root = "{}"
+"#,
+        root.display()
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let rewritten = roundtrip(
+        addr,
+        "GET /old/hello.txt HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&rewritten), "HTTP/1.1 200 OK", "{rewritten}");
+    assert!(rewritten.ends_with("rewritten"), "{rewritten}");
+
+    let redirected = roundtrip(
+        addr,
+        "GET /go HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&redirected), "HTTP/1.1 302 Found", "{redirected}");
+    assert!(
+        redirected
+            .to_ascii_lowercase()
+            .contains("location: /target"),
+        "{redirected}"
+    );
+}
+
+#[tokio::test]
 async fn route_request_headers_are_set_and_removed() {
     let upstream = upstream().await;
     let config = format!(
