@@ -7,6 +7,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::io::SeekFrom;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -18,7 +19,7 @@ use std::time::{Duration, Instant};
 use async_compression::tokio::bufread::{BrotliEncoder, GzipEncoder};
 use bytes::Bytes;
 use futures_util::stream::BoxStream;
-use futures_util::{StreamExt, TryStreamExt};
+use futures_util::{Stream, StreamExt, TryStreamExt};
 use http::header::{
     HeaderName, HeaderValue, ACCEPT_ENCODING, ALT_SVC, AUTHORIZATION, CACHE_CONTROL, CONNECTION,
     CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HOST, LOCATION, SERVER, SET_COOKIE,
@@ -34,7 +35,7 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::io::BufReader;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UnixStream};
 use tokio::sync::Semaphore;
 use tokio::time::Sleep;
@@ -102,6 +103,8 @@ struct Inner {
     body_timeout: Option<Duration>,
     tunnel_idle: Option<Duration>,
     buffer_bytes: usize,
+    spool_bytes: usize,
+    spooled: AtomicU64,
     max_app_response: usize,
     max_upstream_response: usize,
     error_pages: Vec<(StatusCode, String, Arc<Files>)>,
@@ -622,6 +625,7 @@ impl Proxy {
                 "bytes": bytes,
                 "entries": entries,
             })),
+            "spooled": self.inner.spooled.load(Ordering::Relaxed),
         })
     }
 
@@ -1032,6 +1036,8 @@ impl Proxy {
                     secs => Some(Duration::from_secs(secs)),
                 },
                 buffer_bytes: cfg.limits.response_buffer_bytes,
+                spool_bytes: cfg.limits.response_spool_bytes,
+                spooled: AtomicU64::new(0),
                 max_app_response: cfg.limits.max_response_bytes,
                 max_upstream_response: cfg.limits.max_upstream_response_bytes,
                 error_pages: match &cfg.error_root {
@@ -1905,22 +1911,41 @@ impl Proxy {
         };
 
         // Buffer small complete responses so the upstream socket is free
-        // before a slow client finishes reading. Larger bodies stream.
-        let body = if !cacheable
-            && self.inner.buffer_bytes > 0
-            && !is_head
-            && upstream_len
-                .map(|length| length <= self.inner.buffer_bytes)
-                .unwrap_or(false)
-        {
-            match BodyExt::collect(body).await {
-                Ok(collected) => Full::new(collected.to_bytes())
-                    .map_err(|never| match never {})
-                    .boxed(),
-                Err(err) => {
-                    tracing::warn!(error = %err, "failed to buffer an upstream response");
-                    return Err(text(StatusCode::BAD_GATEWAY, "bad gateway"));
+        // before a slow client finishes reading. Larger bodies up to the
+        // spool limit go to an unlinked temporary file; anything beyond that
+        // streams straight through.
+        let body = if !cacheable && !is_head {
+            match upstream_len {
+                Some(length)
+                    if self.inner.buffer_bytes > 0 && length <= self.inner.buffer_bytes =>
+                {
+                    match BodyExt::collect(body).await {
+                        Ok(collected) => Full::new(collected.to_bytes())
+                            .map_err(|never| match never {})
+                            .boxed(),
+                        Err(err) => {
+                            tracing::warn!(error = %err, "failed to buffer an upstream response");
+                            return Err(text(StatusCode::BAD_GATEWAY, "bad gateway"));
+                        }
+                    }
                 }
+                Some(length)
+                    if self.inner.spool_bytes > 0
+                        && length > self.inner.buffer_bytes
+                        && length <= self.inner.spool_bytes =>
+                {
+                    match spool_body(body, length).await {
+                        Ok(body) => {
+                            self.inner.spooled.fetch_add(1, Ordering::Relaxed);
+                            body
+                        }
+                        Err(err) => {
+                            tracing::warn!(error = %err, "failed to spool an upstream response");
+                            return Err(text(StatusCode::BAD_GATEWAY, "bad gateway"));
+                        }
+                    }
+                }
+                _ => body,
             }
         } else {
             body
@@ -3481,6 +3506,83 @@ pub fn timeout_body(body: Body, idle: Duration) -> Body {
 }
 
 /// A body that errors after `limit` data bytes.
+/// Write a fully known response body to an unlinked temporary file and return
+/// a body that reads it back. This releases the upstream connection before a
+/// slow client drains the response.
+async fn spool_body(mut body: Body, expected: usize) -> Result<Body, BoxError> {
+    let file = tempfile::tempfile()?;
+    let mut file = tokio::fs::File::from_std(file);
+    let mut seen = 0usize;
+    let mut trailers = None;
+
+    while let Some(frame) = body.frame().await {
+        let frame = frame?;
+        match frame.into_data() {
+            Ok(data) => {
+                seen = seen.saturating_add(data.len());
+                if seen > expected {
+                    return Err(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "upstream body is longer than Content-Length",
+                    )));
+                }
+                file.write_all(&data).await?;
+            }
+            Err(frame) => {
+                if let Ok(map) = frame.into_trailers() {
+                    trailers = Some(map);
+                }
+            }
+        }
+    }
+
+    if seen != expected {
+        return Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "upstream body is shorter than Content-Length",
+        )));
+    }
+
+    file.seek(SeekFrom::Start(0)).await?;
+    Ok(SpooledBody {
+        stream: ReaderStream::new(file),
+        trailers,
+        length: expected as u64,
+    }
+    .boxed())
+}
+
+struct SpooledBody {
+    stream: ReaderStream<tokio::fs::File>,
+    trailers: Option<HeaderMap>,
+    length: u64,
+}
+
+impl HttpBody for SpooledBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.as_mut().get_mut();
+        match Pin::new(&mut this.stream).poll_next(cx) {
+            Poll::Ready(Some(Ok(data))) => Poll::Ready(Some(Ok(Frame::data(data)))),
+            Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(Box::new(err)))),
+            Poll::Ready(None) => match this.trailers.take() {
+                Some(trailers) => Poll::Ready(Some(Ok(Frame::trailers(trailers)))),
+                None => Poll::Ready(None),
+            },
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::with_exact(self.length)
+    }
+}
+
 fn capped_body(body: Body, limit: usize) -> Body {
     CappedBody {
         inner: body,

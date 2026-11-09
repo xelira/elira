@@ -747,6 +747,25 @@ max_upstream_response_bytes = 8192
 }
 
 #[tokio::test]
+async fn spools_a_large_upstream_response_to_disk() {
+    let upstream = upstream().await;
+    let mut config = NO_DEFAULT.replace("{upstream}", &upstream.to_string());
+    config.push_str("\n[limits]\nresponse_buffer_bytes = 4\nresponse_spool_bytes = 8192\n");
+    let (addr, _stop, _metrics, runtime) = start_full(&config).await;
+
+    let response = roundtrip(
+        addr,
+        "GET /big HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&response), "HTTP/1.1 200 OK", "{response}");
+    assert!(response.ends_with(&"x".repeat(4096)));
+
+    let status = runtime.load().proxy().status();
+    assert_eq!(status["spooled"], 1, "{status}");
+}
+
+#[tokio::test]
 async fn rejects_bodies_over_the_limit() {
     let upstream = upstream().await;
     let mut config = NO_DEFAULT.replace("{upstream}", &upstream.to_string());

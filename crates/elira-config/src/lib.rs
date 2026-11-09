@@ -159,6 +159,12 @@ pub struct Limits {
     /// straight through.
     #[serde(default)]
     pub response_buffer_bytes: usize,
+
+    /// Spool an upstream response up to this many bytes to a temporary file,
+    /// freeing the upstream connection before the client drains it. Zero
+    /// disables disk spooling.
+    #[serde(default)]
+    pub response_spool_bytes: usize,
 }
 
 impl Default for Limits {
@@ -179,6 +185,7 @@ impl Default for Limits {
             connection_drain_secs: Self::default_drain_timeout_secs(),
             shutdown_timeout_secs: Self::default_shutdown_timeout_secs(),
             response_buffer_bytes: 0,
+            response_spool_bytes: 0,
             max_response_bytes: Self::default_max_response_bytes(),
             max_upstream_response_bytes: 0,
             fastcgi_pool_idle: Self::default_fastcgi_pool_idle(),
@@ -3307,6 +3314,24 @@ upstream = "app"
             Config::parse(&with_round_robin),
             Err(Error::HashKeyWithoutHashBalance { .. })
         ));
+    }
+
+    #[test]
+    fn response_spool_is_configured() {
+        let text = r#"
+listen = "127.0.0.1:8080"
+
+[limits]
+response_buffer_bytes = 1024
+response_spool_bytes = 4096
+
+[[routes]]
+host = "*"
+root = "/srv/www"
+"#;
+        let cfg = Config::parse(text).expect("valid");
+        assert_eq!(cfg.limits.response_buffer_bytes, 1024);
+        assert_eq!(cfg.limits.response_spool_bytes, 4096);
     }
 
     #[test]

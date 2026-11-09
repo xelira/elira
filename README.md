@@ -48,6 +48,7 @@ max_body_bytes = 8388608
 requests_per_second = 100
 burst = 200
 response_buffer_bytes = 65536
+response_spool_bytes = 8388608
 trusted_proxies = ["10.0.0.0/8"]
 
 [compression]
@@ -224,7 +225,7 @@ HTTP:
 
 - HTTP/1.1, HTTP/2 (TLS or h2c with prior knowledge), HTTP/3 over QUIC
 - body progress timeouts, websocket/CONNECT idle timeout
-- optional buffering of small upstream responses
+- optional memory or temporary-file buffering of upstream responses
 - gzip/brotli, `Alt-Svc`, `Server` hiding, `X-Request-Id`
 
 Static files:
