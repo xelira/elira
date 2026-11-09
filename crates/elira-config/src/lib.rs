@@ -608,6 +608,11 @@ pub struct Route {
     #[serde(default)]
     pub burst: Option<u32>,
 
+    /// What identifies a client for this route's limiter: `ip` (default),
+    /// `authorization`, `header:NAME` or `cookie:NAME`.
+    #[serde(default)]
+    pub rate_key: Option<String>,
+
     /// Overrides `limits.max_body_bytes` for this route.
     #[serde(default)]
     pub max_body_bytes: Option<usize>,
@@ -1101,6 +1106,22 @@ fn substitute_env(text: &str) -> Result<String, Error> {
     Ok(out)
 }
 
+fn valid_rate_key(value: &str) -> bool {
+    if value == "ip" || value == "authorization" {
+        return true;
+    }
+    if let Some(name) = value.strip_prefix("header:") {
+        return HeaderName::from_bytes(name.as_bytes()).is_ok();
+    }
+    if let Some(name) = value.strip_prefix("cookie:") {
+        return !name.is_empty()
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.');
+    }
+    false
+}
+
 fn parse_param(value: &str) -> Option<(String, String)> {
     let (name, value) = value.split_once(':')?;
     let name = name.trim();
@@ -1583,6 +1604,17 @@ impl Config {
             if route.requests_per_second == Some(0) {
                 return Err(Error::BadRouteRate { index });
             }
+            if let Some(key) = &route.rate_key {
+                if route.requests_per_second.is_none() {
+                    return Err(Error::RateKeyWithoutRate { index });
+                }
+                if !valid_rate_key(key) {
+                    return Err(Error::BadRateKey {
+                        index,
+                        key: key.clone(),
+                    });
+                }
+            }
 
             if route.error_root.is_some() && route.error_pages.is_empty() {
                 return Err(Error::ErrorRootWithoutPages { index });
@@ -2021,6 +2053,14 @@ pub enum Error {
 
     #[error("route {index}: error_root needs at least one error_pages entry")]
     ErrorRootWithoutPages { index: usize },
+
+    #[error("route {index}: rate_key needs requests_per_second")]
+    RateKeyWithoutRate { index: usize },
+
+    #[error(
+        "route {index}: {key:?} is not a rate key (ip, authorization, header:NAME, cookie:NAME)"
+    )]
+    BadRateKey { index: usize, key: String },
 
     #[error("route {index}: \"{page}\" is not \"STATUS /path\"")]
     BadErrorPage { index: usize, page: String },
@@ -2917,6 +2957,40 @@ root = "/srv/www"
         assert!(matches!(
             Config::parse(&bad),
             Err(Error::BadGlobalErrorPage { .. })
+        ));
+    }
+
+    #[test]
+    fn route_rate_key_is_validated() {
+        let base = r#"
+listen = "127.0.0.1:8080"
+
+[[routes]]
+host = "*"
+root = "/srv/www"
+requests_per_second = 10
+rate_key = "header:X-Api-Key"
+"#;
+        let cfg = Config::parse(base).expect("valid");
+        assert_eq!(cfg.routes[0].rate_key.as_deref(), Some("header:X-Api-Key"));
+
+        for key in ["ip", "authorization", "cookie:session"] {
+            let text = base.replace("header:X-Api-Key", key);
+            assert!(Config::parse(&text).is_ok(), "{key}");
+        }
+
+        for key in ["header:", "query:q", "cookie:"] {
+            let text = base.replace("header:X-Api-Key", key);
+            assert!(
+                matches!(Config::parse(&text), Err(Error::BadRateKey { .. })),
+                "{key}"
+            );
+        }
+
+        let without_rate = base.replace("requests_per_second = 10\n", "");
+        assert!(matches!(
+            Config::parse(&without_rate),
+            Err(Error::RateKeyWithoutRate { .. })
         ));
     }
 

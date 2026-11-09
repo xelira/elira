@@ -597,6 +597,7 @@ advisory-lock `.elira-cache.lock`, а `max_bytes` считается по все
 | `timeout_secs` | целое > 0 | `limits.upstream_timeout_secs` | таймаут ответа upstream'а для этого маршрута |
 | `requests_per_second` | целое > 0 | глобальный лимит | свой token bucket для маршрута |
 | `burst` | целое ≥ 0 | равен rate | глубина bucket'а маршрута |
+| `rate_key` | строка | `"ip"` | ключ лимита: `ip`, `authorization`, `header:NAME`, `cookie:NAME` |
 | `max_body_bytes` | целое ≥ 0 | глобальный лимит | свой предел `Content-Length` |
 | `max_response_bytes` | целое > 0 | `limits.max_response_bytes` | свой предел потокового ответа |
 | `max_upstream_response_bytes` | целое > 0 | `limits.max_upstream_response_bytes` | свой предел ответа upstream'а |
@@ -683,6 +684,12 @@ advisory-lock `.elira-cache.lock`, а `max_bytes` считается по все
   Ноль отклоняется при загрузке. Истёкший таймаут — `504`.
 - `requests_per_second`/`burst` создают отдельный limiter на маршрут; отказ —
   `429`. `max_body_bytes` проверяет `Content-Length` до обращения к upstream.
+- `rate_key` выбирает, что считает одним клиентом: адрес peer'а (`ip`,
+  по умолчанию), полный `Authorization`, значение заголовка
+  (`header:X-Api-Key`) или cookie (`cookie:session`). Без выбранного заголовка
+  или cookie запрос попадает в bucket IP, поэтому лимит нельзя обойти их
+  отсутствием. Ключи хешируются случайным ключом процесса и не хранятся в
+  исходном виде. `rate_key` требует `requests_per_second` на том же маршруте.
 - `error_pages` подменяет тело ответа с указанным статусом файлом. Статус
   сохраняется, даже если файл существует. `error_root` нужен, когда маршрут
   проксирует, а не отдаёт статику. Страницы применяются и к локальным отказам
@@ -850,6 +857,8 @@ elira check --config elira.toml
 | `log.sample must be a fraction between 0 and 1` | сэмплирование вне диапазона | задайте `0.0`..`1.0` |
 | `route N: client_auth needs tls.client_auth...` | маршрут требует сертификат без TLS-проверки | включите `tls.client_auth` |
 | `route N: client_cn/client_issuer_cn need client_auth = true` | фильтр без требования сертификата | добавьте `client_auth = true` |
+| `route N: rate_key needs requests_per_second` | ключ без собственного лимита | задайте `requests_per_second` |
+| `route N: "..." is not a rate key` | неизвестный ключ | `ip`, `authorization`, `header:NAME`, `cookie:NAME` |
 | `route N: timeout_secs must be greater than zero` | нулевой таймаут | уберите поле или поставьте больше нуля |
 | `http3.cert must not be empty` | `[http3]` без сертификата | задайте `cert` и `key` |
 | `health.path must start with '/'...` | путь без `/` | `/health` |

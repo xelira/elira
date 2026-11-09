@@ -1,31 +1,36 @@
 //! Per-client rate limiting.
 //!
-//! Each peer address owns a token bucket. All buckets live in one map behind a
-//! single mutex: the critical section is a hash lookup and a couple of float
+//! Each key owns a token bucket. All buckets live in one map behind a single
+//! mutex: the critical section is a hash lookup and a couple of float
 //! operations, so a contended check costs less than the connection handling it
 //! guards. Time is always supplied by the caller rather than read here, which
 //! keeps the refill arithmetic testable.
+//!
+//! Keys are hashed with a per-process random state before they reach the map.
+//! Header, cookie and authorization values are therefore not retained in
+//! memory, and a client cannot grow the table by sending crafted keys that
+//! collide with the map's own hashing.
 
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::hash::{BuildHasher, Hash, RandomState};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-/// Hard cap on tracked peers. Without it a peer that rotates source addresses
-/// could grow the map for as long as it keeps connecting.
+/// Hard cap on tracked keys. Without it a client that rotates keys could grow
+/// the map for as long as it keeps connecting.
 const MAX_ENTRIES: usize = 10_000;
 
-/// Peers idle for longer than this are dropped when the map is over its cap.
+/// Keys idle for longer than this are dropped when the map is over its cap.
 const IDLE_TTL: Duration = Duration::from_secs(60);
 
 struct Bucket {
     tokens: f64,
-    /// Last time this peer was seen. Refreshed on rejected checks too: the
+    /// Last time this key was seen. Refreshed on rejected checks too: the
     /// client is active even when it is being throttled.
     last_seen: Instant,
 }
 
-/// Token-bucket rate limiter keyed by peer address.
+/// Token-bucket rate limiter keyed by the caller.
 ///
 /// `rate` is sustained tokens per second and `burst` is the bucket capacity. A
 /// rate of zero disables limiting entirely.
@@ -34,7 +39,8 @@ pub struct RateLimiter {
     // meaningful because tokens accumulate over sub-second intervals.
     rate: f64,
     burst: f64,
-    buckets: Mutex<HashMap<IpAddr, Bucket>>,
+    hasher: RandomState,
+    buckets: Mutex<HashMap<u64, Bucket>>,
 }
 
 impl RateLimiter {
@@ -44,31 +50,34 @@ impl RateLimiter {
         Self {
             rate: f64::from(rate),
             burst: f64::from(burst),
+            hasher: RandomState::new(),
             buckets: Mutex::new(HashMap::new()),
         }
     }
 
     /// Returns `true` when the request is allowed, spending one token.
     ///
-    /// `now` is supplied by the caller so tests can move time forward without
-    /// sleeping.
-    pub fn check(&self, peer: IpAddr, now: Instant) -> bool {
+    /// `key` identifies the bucket: a peer address, a header value, a cookie,
+    /// or anything else the caller considers one client. `now` is supplied by
+    /// the caller so tests can move time forward without sleeping.
+    pub fn check<K: Hash + ?Sized>(&self, key: &K, now: Instant) -> bool {
         if self.rate == 0.0 {
             // Limiting is off; skip the lock so the disabled path stays as
             // cheap as the map never being allocated.
             return true;
         }
 
+        let key = self.hasher.hash_one(key);
         let mut buckets = self.lock();
 
-        if let Some(bucket) = buckets.get_mut(&peer) {
+        if let Some(bucket) = buckets.get_mut(&key) {
             return refill_and_take(bucket, self.rate, self.burst, now);
         }
 
         if buckets.len() >= MAX_ENTRIES {
             prune(&mut buckets, now);
             if buckets.len() >= MAX_ENTRIES {
-                // Every tracked peer is still active. Refusing the newcomer is
+                // Every tracked key is still active. Refusing the newcomer is
                 // preferable to evicting a live entry, and it costs nothing.
                 return false;
             }
@@ -82,7 +91,7 @@ impl RateLimiter {
         };
         let allowed = refill_and_take(&mut bucket, self.rate, self.burst, now);
         if allowed {
-            buckets.insert(peer, bucket);
+            buckets.insert(key, bucket);
         }
         // A first request that fails (only possible with a burst below one)
         // leaves a bucket no future request could ever use, so it is not worth
@@ -90,12 +99,12 @@ impl RateLimiter {
         allowed
     }
 
-    /// Number of peers currently tracked. Intended for tests and metrics.
+    /// Number of keys currently tracked. Intended for tests and metrics.
     pub fn tracked(&self) -> usize {
         self.lock().len()
     }
 
-    fn lock(&self) -> MutexGuard<'_, HashMap<IpAddr, Bucket>> {
+    fn lock(&self) -> MutexGuard<'_, HashMap<u64, Bucket>> {
         // A panic while holding the lock leaves at most one bucket in a
         // half-updated state; recovering keeps the limiter serving traffic
         // instead of turning the poison flag into an outage.
@@ -140,14 +149,14 @@ fn refill_and_take(bucket: &mut Bucket, rate: f64, burst: f64, now: Instant) -> 
     }
 }
 
-fn prune(buckets: &mut HashMap<IpAddr, Bucket>, now: Instant) {
+fn prune(buckets: &mut HashMap<u64, Bucket>, now: Instant) {
     buckets.retain(|_, bucket| now.saturating_duration_since(bucket.last_seen) <= IDLE_TTL);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
 
     fn peer(index: u32) -> IpAddr {
         IpAddr::V4(Ipv4Addr::from(index))
@@ -160,21 +169,21 @@ mod tests {
         let t0 = Instant::now();
 
         for _ in 0..4 {
-            assert!(limiter.check(client, t0));
+            assert!(limiter.check(&client, t0));
         }
-        assert!(!limiter.check(client, t0));
+        assert!(!limiter.check(&client, t0));
 
         // 250 ms at 4 tokens/s is exactly one token.
         let t1 = t0 + Duration::from_millis(250);
-        assert!(limiter.check(client, t1));
-        assert!(!limiter.check(client, t1));
+        assert!(limiter.check(&client, t1));
+        assert!(!limiter.check(&client, t1));
 
         // A long idle period refills, but never beyond the burst.
         let t2 = t0 + Duration::from_secs(10);
         for _ in 0..4 {
-            assert!(limiter.check(client, t2));
+            assert!(limiter.check(&client, t2));
         }
-        assert!(!limiter.check(client, t2));
+        assert!(!limiter.check(&client, t2));
     }
 
     #[test]
@@ -183,17 +192,17 @@ mod tests {
         let client = peer(1);
         let t0 = Instant::now();
 
-        assert!(limiter.check(client, t0));
-        assert!(!limiter.check(client, t0));
+        assert!(limiter.check(&client, t0));
+        assert!(!limiter.check(&client, t0));
 
         // Half a token is not enough, and the failed attempt must not take it.
         let t1 = t0 + Duration::from_millis(500);
-        assert!(!limiter.check(client, t1));
+        assert!(!limiter.check(&client, t1));
 
         // Exactly one token has accrued since the successful check.
         let t2 = t0 + Duration::from_secs(1);
-        assert!(limiter.check(client, t2));
-        assert!(!limiter.check(client, t2));
+        assert!(limiter.check(&client, t2));
+        assert!(!limiter.check(&client, t2));
     }
 
     #[test]
@@ -202,7 +211,7 @@ mod tests {
         let t0 = Instant::now();
 
         for i in 0..1_000 {
-            assert!(limiter.check(peer(i), t0));
+            assert!(limiter.check(&peer(i), t0));
         }
         assert_eq!(limiter.tracked(), 0);
     }
@@ -212,8 +221,8 @@ mod tests {
         let limiter = RateLimiter::default();
         let t0 = Instant::now();
 
-        assert!(limiter.check(peer(1), t0));
-        assert!(limiter.check(peer(1), t0));
+        assert!(limiter.check(&peer(1), t0));
+        assert!(limiter.check(&peer(1), t0));
         assert_eq!(limiter.tracked(), 0);
     }
 
@@ -223,14 +232,14 @@ mod tests {
         let t0 = Instant::now();
 
         for i in 0..MAX_ENTRIES as u32 {
-            assert!(limiter.check(peer(i), t0));
+            assert!(limiter.check(&peer(i), t0));
         }
         assert_eq!(limiter.tracked(), MAX_ENTRIES);
 
         // One second past the idle TTL the whole table is stale, so the
         // newcomer displaces it.
         let t1 = t0 + IDLE_TTL + Duration::from_secs(1);
-        assert!(limiter.check(peer(MAX_ENTRIES as u32), t1));
+        assert!(limiter.check(&peer(MAX_ENTRIES as u32), t1));
         assert_eq!(limiter.tracked(), 1);
     }
 
@@ -240,10 +249,10 @@ mod tests {
         let t0 = Instant::now();
 
         for i in 0..MAX_ENTRIES as u32 {
-            assert!(limiter.check(peer(i), t0));
+            assert!(limiter.check(&peer(i), t0));
         }
 
-        assert!(!limiter.check(peer(MAX_ENTRIES as u32), t0));
+        assert!(!limiter.check(&peer(MAX_ENTRIES as u32), t0));
         assert_eq!(limiter.tracked(), MAX_ENTRIES);
     }
 
@@ -252,9 +261,20 @@ mod tests {
         let limiter = RateLimiter::new(10, 10);
         let t0 = Instant::now();
 
-        assert!(limiter.check(peer(1), t0));
-        assert!(limiter.check(peer(2), t0));
-        assert!(limiter.check(peer(1), t0));
+        assert!(limiter.check(&peer(1), t0));
+        assert!(limiter.check(&peer(2), t0));
+        assert!(limiter.check(&peer(1), t0));
+        assert_eq!(limiter.tracked(), 2);
+    }
+
+    #[test]
+    fn string_keys_are_independent() {
+        let limiter = RateLimiter::new(1, 1);
+        let t0 = Instant::now();
+
+        assert!(limiter.check("api-key-a", t0));
+        assert!(!limiter.check("api-key-a", t0));
+        assert!(limiter.check("api-key-b", t0));
         assert_eq!(limiter.tracked(), 2);
     }
 }

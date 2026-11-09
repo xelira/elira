@@ -1899,6 +1899,55 @@ error_pages = ["401 /401.html", "429 /429.html"]
 }
 
 #[tokio::test]
+async fn route_rate_limit_can_be_keyed_by_a_header() {
+    let upstream = upstream().await;
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "example.com"
+upstream = "app"
+requests_per_second = 1
+burst = 1
+rate_key = "header:x-api-key"
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    async fn get(addr: SocketAddr, key: Option<&str>) -> String {
+        let header = key
+            .map(|key| format!("X-Api-Key: {key}\r\n"))
+            .unwrap_or_default();
+        roundtrip(
+            addr,
+            &format!("GET / HTTP/1.1\r\nHost: example.com\r\n{header}Connection: close\r\n\r\n"),
+        )
+        .await
+    }
+
+    assert_eq!(status(&get(addr, Some("key-a")).await), "HTTP/1.1 200 OK");
+    assert_eq!(
+        status(&get(addr, Some("key-a")).await),
+        "HTTP/1.1 429 Too Many Requests"
+    );
+    // A different key has its own bucket.
+    assert_eq!(status(&get(addr, Some("key-b")).await), "HTTP/1.1 200 OK");
+
+    // Without the header the peer address is the key, and that bucket is
+    // still full.
+    assert_eq!(status(&get(addr, None).await), "HTTP/1.1 200 OK");
+    assert_eq!(
+        status(&get(addr, None).await),
+        "HTTP/1.1 429 Too Many Requests"
+    );
+}
+
+#[tokio::test]
 async fn route_rate_limit_and_body_cap_apply() {
     let upstream = upstream().await;
     let config = format!(

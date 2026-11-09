@@ -4,6 +4,7 @@
 //! headers from the client, never forward hop-by-hop headers, and pick an
 //! upstream before touching the body.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::SocketAddr;
@@ -20,7 +21,7 @@ use futures_util::stream::BoxStream;
 use futures_util::{StreamExt, TryStreamExt};
 use http::header::{
     HeaderName, HeaderValue, ACCEPT_ENCODING, ALT_SVC, AUTHORIZATION, CACHE_CONTROL, CONNECTION,
-    CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HOST, LOCATION, SERVER, SET_COOKIE,
+    CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HOST, LOCATION, SERVER, SET_COOKIE,
     TRANSFER_ENCODING, UPGRADE, VARY, WWW_AUTHENTICATE,
 };
 use http::uri::Authority;
@@ -132,6 +133,79 @@ enum ModuleTarget {
     Sandbox(Arc<elira_module::ProcessModule>),
 }
 
+#[derive(Clone, Debug)]
+enum RateKey {
+    Ip,
+    Authorization,
+    Header(HeaderName),
+    Cookie(String),
+}
+
+fn parse_rate_key(value: Option<&str>) -> RateKey {
+    match value {
+        None | Some("ip") => RateKey::Ip,
+        Some("authorization") => RateKey::Authorization,
+        Some(value) => {
+            if let Some(name) = value.strip_prefix("header:") {
+                HeaderName::from_bytes(name.as_bytes())
+                    .map(RateKey::Header)
+                    .unwrap_or(RateKey::Ip)
+            } else if let Some(name) = value.strip_prefix("cookie:") {
+                RateKey::Cookie(name.to_owned())
+            } else {
+                RateKey::Ip
+            }
+        }
+    }
+}
+
+/// The value that identifies one bucket. A missing header or cookie falls
+/// back to the peer address, so a client cannot dodge the limiter by omitting
+/// it.
+fn rate_key_value<'a>(
+    key: &RateKey,
+    headers: &'a HeaderMap,
+    peer: std::net::IpAddr,
+) -> Cow<'a, str> {
+    let header = |name: &HeaderName| headers.get(name).and_then(|value| value.to_str().ok());
+    match key {
+        RateKey::Ip => Cow::Owned(peer.to_string()),
+        RateKey::Authorization => header(&AUTHORIZATION)
+            .map(Cow::Borrowed)
+            .unwrap_or_else(|| Cow::Owned(peer.to_string())),
+        RateKey::Header(name) => header(name)
+            .map(Cow::Borrowed)
+            .unwrap_or_else(|| Cow::Owned(peer.to_string())),
+        RateKey::Cookie(name) => cookie_value(headers, name)
+            .map(Cow::Borrowed)
+            .unwrap_or_else(|| Cow::Owned(peer.to_string())),
+    }
+}
+
+fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    for header in headers.get_all(COOKIE) {
+        let Ok(header) = header.to_str() else {
+            continue;
+        };
+        for part in header.split(';') {
+            let Some((key, value)) = part.trim().split_once('=') else {
+                continue;
+            };
+            if key.trim() != name {
+                continue;
+            }
+            let value = value.trim();
+            return Some(
+                value
+                    .strip_prefix('"')
+                    .and_then(|value| value.strip_suffix('"'))
+                    .unwrap_or(value),
+            );
+        }
+    }
+    None
+}
+
 struct ClientCertRule {
     subject_cn: Option<String>,
     issuer_cn: Option<String>,
@@ -164,6 +238,7 @@ struct RouteEntry {
     acl: Option<Arc<IpAcl>>,
     timeout: Option<Duration>,
     limiter: Option<Arc<RateLimiter>>,
+    rate_key: RateKey,
     body_limit: Option<usize>,
     error_pages: Vec<(StatusCode, String, Arc<Files>)>,
     app_permits: Option<Arc<Semaphore>>,
@@ -691,6 +766,7 @@ impl Proxy {
                 acl,
                 timeout: route.timeout_secs.map(Duration::from_secs),
                 limiter,
+                rate_key: parse_rate_key(route.rate_key.as_deref()),
                 body_limit: route.max_body_bytes,
                 error_pages,
                 app_permits,
@@ -892,7 +968,8 @@ impl Proxy {
             }
         }
         if let Some(limiter) = &entry.limiter {
-            if !limiter.check(peer, Instant::now()) {
+            let bucket = rate_key_value(&entry.rate_key, headers, peer);
+            if !limiter.check(bucket.as_ref(), Instant::now()) {
                 return None;
             }
         }
@@ -911,7 +988,7 @@ impl Proxy {
     /// Spend one rate-limit token, if the limiter is on.
     pub fn rate_allows(&self, peer: std::net::IpAddr) -> bool {
         match &self.inner.limiter {
-            Some(limiter) => limiter.check(peer, Instant::now()),
+            Some(limiter) => limiter.check(&peer, Instant::now()),
             None => true,
         }
     }
@@ -998,7 +1075,7 @@ impl Proxy {
         scheme: &'static str,
     ) -> Response<Body> {
         if let Some(limiter) = &self.inner.limiter {
-            if !limiter.check(peer.ip(), Instant::now()) {
+            if !limiter.check(&peer.ip(), Instant::now()) {
                 let mut response = text(StatusCode::TOO_MANY_REQUESTS, "too many requests");
                 response
                     .headers_mut()
@@ -1221,7 +1298,8 @@ impl Proxy {
         }
 
         if let Some(limiter) = &entry.limiter {
-            if !limiter.check(peer.ip(), Instant::now()) {
+            let bucket = rate_key_value(&entry.rate_key, req.headers(), peer.ip());
+            if !limiter.check(bucket.as_ref(), Instant::now()) {
                 let mut response = text(StatusCode::TOO_MANY_REQUESTS, "too many requests");
                 response
                     .headers_mut()
