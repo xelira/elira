@@ -2061,6 +2061,126 @@ upstream = "app"
     );
 }
 
+#[tokio::test]
+async fn route_level_mtls_checks_the_certificate_identity() {
+    use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
+
+    let ca_key = KeyPair::generate().expect("ca key");
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params
+        .distinguished_name
+        .push(DnType::CommonName, "client-ca");
+    let ca = ca_params.self_signed(&ca_key).expect("ca");
+
+    let server_key = KeyPair::generate().expect("server key");
+    let server_params =
+        CertificateParams::new(vec!["localhost".to_owned()]).expect("server params");
+    let server = server_params
+        .signed_by(&server_key, &ca, &ca_key)
+        .expect("server cert");
+
+    let make_client = |cn: &str| {
+        let key = KeyPair::generate().expect("client key");
+        let mut params = CertificateParams::new(Vec::<String>::new()).expect("client params");
+        params.distinguished_name.push(DnType::CommonName, cn);
+        let cert = params.signed_by(&key, &ca, &ca_key).expect("client cert");
+        (cert, key)
+    };
+    let (client, client_key) = make_client("service-a");
+    let (other, other_key) = make_client("service-b");
+
+    let root = temp_root("route-mtls");
+    std::fs::write(root.join("server.pem"), server.pem()).unwrap();
+    std::fs::write(root.join("server.key"), server_key.serialize_pem()).unwrap();
+    std::fs::write(root.join("ca.pem"), ca.pem()).unwrap();
+
+    let upstream = upstream().await;
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[tls]
+cert = "{cert}"
+key = "{key}"
+client_ca = "{ca}"
+client_auth = "optional"
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "localhost"
+upstream = "app"
+client_auth = true
+client_cn = "service-a"
+client_issuer_cn = "client-ca"
+"#,
+        cert = root.join("server.pem").display(),
+        key = root.join("server.key").display(),
+        ca = root.join("ca.pem").display(),
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(ca.der().clone()).expect("add ca");
+    let base = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("versions")
+        .with_root_certificates(roots);
+
+    async fn ask(addr: SocketAddr, config: Arc<rustls::ClientConfig>) -> String {
+        let name = rustls::pki_types::ServerName::try_from("localhost").expect("server name");
+        let connector = tokio_rustls::TlsConnector::from(config);
+        let tcp = TcpStream::connect(addr).await.expect("connect");
+        let mut tls = connector.connect(name, tcp).await.expect("handshake");
+        tls.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("write");
+
+        let mut response = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match tokio::time::timeout(Duration::from_secs(3), tls.read(&mut chunk)).await {
+                Ok(Ok(0)) | Err(_) => break,
+                Ok(Ok(read)) => response.extend_from_slice(&chunk[..read]),
+                Ok(Err(_)) => break,
+            }
+        }
+        String::from_utf8_lossy(&response).to_string()
+    }
+
+    let anonymous = ask(addr, Arc::new(base.clone().with_no_client_auth())).await;
+    assert_eq!(status(&anonymous), "HTTP/1.1 403 Forbidden", "{anonymous}");
+
+    let mut wrong = base
+        .clone()
+        .with_client_auth_cert(
+            vec![rustls::pki_types::CertificateDer::from(
+                other.der().to_vec(),
+            )],
+            rustls::pki_types::PrivateKeyDer::Pkcs8(other_key.serialize_der().into()),
+        )
+        .expect("client auth config");
+    wrong.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let wrong = ask(addr, Arc::new(wrong)).await;
+    assert_eq!(status(&wrong), "HTTP/1.1 403 Forbidden", "{wrong}");
+
+    let mut accepted = base
+        .with_client_auth_cert(
+            vec![rustls::pki_types::CertificateDer::from(
+                client.der().to_vec(),
+            )],
+            rustls::pki_types::PrivateKeyDer::Pkcs8(client_key.serialize_der().into()),
+        )
+        .expect("client auth config");
+    accepted.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let accepted = ask(addr, Arc::new(accepted)).await;
+    assert_eq!(status(&accepted), "HTTP/1.1 200 OK", "{accepted}");
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn proxies_to_a_unix_socket_upstream() {

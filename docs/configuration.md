@@ -589,6 +589,9 @@ advisory-lock `.elira-cache.lock`, а `max_bytes` считается по все
 | `try_files` | массив строк | `[]` | кандидаты, если путь не найден; `$uri` подставляется |
 | `autoindex` | bool | `false` | генерировать листинг каталога |
 | `auth_file` | путь | нет | htpasswd с bcrypt-хешами |
+| `client_auth` | bool | `false` | требовать проверенный клиентский сертификат |
+| `client_cn` | строка | нет | требуемый CN субъекта сертификата |
+| `client_issuer_cn` | строка | нет | требуемый CN издателя сертификата |
 | `ip_allow` | массив CIDR | `[]` | кому разрешено; пусто — всем |
 | `ip_deny` | массив CIDR | `[]` | кому запрещено; сильнее `ip_allow` |
 | `timeout_secs` | целое > 0 | `limits.upstream_timeout_secs` | таймаут ответа upstream'а для этого маршрута |
@@ -667,6 +670,13 @@ advisory-lock `.elira-cache.lock`, а `max_bytes` считается по все
   `WWW-Authenticate: Basic realm="elira"`. Пароли проверяются bcrypt.
 - `ip_allow`/`ip_deny` сравнивают адрес peer'а (с учётом PROXY protocol).
   `ip_deny` проверяется первым. Отказ — `403`.
+- `client_auth = true` требует проверенный клиентский сертификат на этом
+  маршруте; без него — `403`. `client_cn` и `client_issuer_cn` дополнительно
+  сверяют CN субъекта и издателя. Для этого листенер должен запрашивать
+  сертификаты: `tls.client_auth = "optional"` (сертификат проверяется, если
+  прислан) или `"required"`. При включённом HTTP/3 то же нужно и в
+  `http3.client_auth`. Фильтры без `client_auth = true` отклоняются при
+  загрузке.
 - Маршруты с `auth_file` или ACL не используют zero-copy `sendfile`:
   проверка доступа должна пройти в общем пути.
 - `timeout_secs` переопределяет общий таймаут для запросов этого маршрута.
@@ -838,6 +848,8 @@ elira check --config elira.toml
 | `"..." is not "STATUS /path"` | битый глобальный `error_pages` | формат `404 /404.html` |
 | `global error_pages need error_root` | страницы без каталога | добавьте `error_root` |
 | `log.sample must be a fraction between 0 and 1` | сэмплирование вне диапазона | задайте `0.0`..`1.0` |
+| `route N: client_auth needs tls.client_auth...` | маршрут требует сертификат без TLS-проверки | включите `tls.client_auth` |
+| `route N: client_cn/client_issuer_cn need client_auth = true` | фильтр без требования сертификата | добавьте `client_auth = true` |
 | `route N: timeout_secs must be greater than zero` | нулевой таймаут | уберите поле или поставьте больше нуля |
 | `http3.cert must not be empty` | `[http3]` без сертификата | задайте `cert` и `key` |
 | `health.path must start with '/'...` | путь без `/` | `/health` |

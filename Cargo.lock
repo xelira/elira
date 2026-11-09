@@ -866,6 +866,7 @@ dependencies = [
  "elira-h3upstream",
  "elira-limit",
  "elira-module",
+ "elira-tls",
  "elira-upstream",
  "elira-wasm",
  "futures-util",

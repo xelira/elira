@@ -117,6 +117,8 @@
 - Глобальные `error_pages`/`error_root`: страницы для `401`, `403`, `404` без
   маршрута, `429` и ошибок upstream.
 - Сэмплирование access-лога: `log.sample` и `access_log_sample` на маршруте.
+- Per-route mTLS: `client_auth`, `client_cn`, `client_issuer_cn`; работает на
+  HTTP/1.1, HTTP/2 и HTTP/3.
 - `Cache-Control: must-revalidate` запрещает stale-выдачу; `Expires`/`Date`
   задают TTL, если `max-age` нет. Запросы с `no-cache`/`no-store` обходят кэш.
 - Заголовки `Forwarded` и `X-Forwarded-Port` к upstream.

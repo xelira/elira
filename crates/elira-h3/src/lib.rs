@@ -192,6 +192,20 @@ async fn connection(
         .and_then(|map| map.lock().ok().and_then(|map| map.get(&transport).copied()))
         .unwrap_or(transport);
 
+    let client_cert = conn
+        .peer_identity()
+        .and_then(|identity| {
+            identity
+                .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+                .ok()
+        })
+        .and_then(|chain| {
+            chain
+                .first()
+                .and_then(|leaf| elira_tls::ClientIdentity::parse(leaf.as_ref()))
+        })
+        .map(Arc::new);
+
     let mut conn =
         h3::server::Connection::<h3_quinn::Connection, Bytes>::new(h3_quinn::Connection::new(conn))
             .await?;
@@ -201,9 +215,21 @@ async fn connection(
         let proxy = proxy.clone();
         let metrics = metrics.clone();
         let log = log.clone();
+        let client_cert = client_cert.clone();
 
         tokio::spawn(async move {
-            if let Err(err) = request(req, stream, peer, proxy, metrics, body_timeout, log).await {
+            if let Err(err) = request(
+                req,
+                stream,
+                peer,
+                proxy,
+                metrics,
+                body_timeout,
+                log,
+                client_cert,
+            )
+            .await
+            {
                 tracing::debug!(%peer, error = %err, "http/3 request failed");
             }
         });
@@ -218,6 +244,7 @@ async fn connection(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn request<S, B>(
     req: Request<()>,
     stream: h3::server::RequestStream<S, B>,
@@ -226,6 +253,7 @@ async fn request<S, B>(
     metrics: Arc<Metrics>,
     body_timeout: Option<std::time::Duration>,
     log: Arc<dyn Fn(&Entry) + Send + Sync>,
+    client_cert: Option<Arc<elira_tls::ClientIdentity>>,
 ) -> Result<(), BoxError>
 where
     S: h3::quic::BidiStream<B> + Send + 'static,
@@ -299,7 +327,10 @@ where
     let body = StreamBody::new(ReceiverStream::new(rx)).boxed();
 
     let (parts, ()) = req.into_parts();
-    let request = Request::from_parts(parts, body);
+    let mut request = Request::from_parts(parts, body);
+    if let Some(identity) = &client_cert {
+        request.extensions_mut().insert(identity.as_ref().clone());
+    }
 
     let response = proxy().handle(request, peer, "https").await;
     let status = response.status();
@@ -312,12 +343,14 @@ where
         .map(|labels| labels.access_log)
         .unwrap_or(true);
     let mut upstream = None;
+    let mut log_sample = 1.0;
     if let Some(labels) = response.extensions().get::<elira_proxy::Labels>().cloned() {
         metrics.record_route(&labels.route, status_code, elapsed);
         if let Some(name) = &labels.upstream {
             metrics.record_upstream(name, status_code, elapsed);
         }
         upstream = labels.upstream;
+        log_sample = labels.access_log_sample;
     }
     match response
         .headers()
@@ -363,6 +396,7 @@ where
     }
     send.finish().await?;
 
+    let write_log = log_request && elira_accesslog::sampled(&id, log_sample);
     let entry = Entry {
         peer: peer.ip(),
         method,
@@ -376,7 +410,7 @@ where
         request_id: id,
         upstream,
     };
-    if log_request {
+    if write_log {
         log(&entry);
     }
 

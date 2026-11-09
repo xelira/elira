@@ -43,6 +43,7 @@ use elira_auth::{BasicAuth, IpAcl};
 use elira_cache::Cache;
 use elira_config::{Balance, Compression, Config, Health};
 use elira_limit::RateLimiter;
+use elira_tls::ClientIdentity;
 use elira_upstream::{https_connector, TlsOptions};
 
 pub mod files;
@@ -131,6 +132,26 @@ enum ModuleTarget {
     Sandbox(Arc<elira_module::ProcessModule>),
 }
 
+struct ClientCertRule {
+    subject_cn: Option<String>,
+    issuer_cn: Option<String>,
+}
+
+impl ClientCertRule {
+    fn allows(&self, identity: Option<&ClientIdentity>) -> bool {
+        let Some(identity) = identity else {
+            return false;
+        };
+        self.subject_cn
+            .as_deref()
+            .is_none_or(|cn| identity.subject_cn.as_deref() == Some(cn))
+            && self
+                .issuer_cn
+                .as_deref()
+                .is_none_or(|cn| identity.issuer_cn.as_deref() == Some(cn))
+    }
+}
+
 struct RouteEntry {
     label: String,
     prefix: String,
@@ -152,6 +173,7 @@ struct RouteEntry {
     cache_ttl: Option<Duration>,
     access_log: bool,
     access_log_sample: f64,
+    client_auth: Option<ClientCertRule>,
     max_upstream_response: Option<usize>,
     fastcgi_param: Vec<(String, String)>,
     cgi_param: Vec<(String, String)>,
@@ -677,6 +699,10 @@ impl Proxy {
                 cache_ttl: route.cache_ttl_secs.map(Duration::from_secs),
                 access_log: route.access_log,
                 access_log_sample: route.access_log_sample.unwrap_or(cfg.log.sample),
+                client_auth: route.client_auth.then(|| ClientCertRule {
+                    subject_cn: route.client_cn.clone(),
+                    issuer_cn: route.client_issuer_cn.clone(),
+                }),
                 max_upstream_response: route.max_upstream_response_bytes,
                 fastcgi_param: route
                     .fastcgi_param
@@ -1166,6 +1192,14 @@ impl Proxy {
             .router
             .pick(&key, req.uri().path())
             .ok_or_else(|| text(StatusCode::NOT_FOUND, "no route"))?;
+
+        if let Some(rule) = &entry.client_auth {
+            if !rule.allows(req.extensions().get::<ClientIdentity>()) {
+                let mut response = text(StatusCode::FORBIDDEN, "client certificate required");
+                self.apply_error_page(&mut response, entry, peer).await;
+                return Err(response);
+            }
+        }
 
         // A route may set a stricter cap than the global one.
         if let Some(limit) = entry.body_limit {

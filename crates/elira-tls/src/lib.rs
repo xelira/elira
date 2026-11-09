@@ -375,6 +375,36 @@ fn load_client_ca(path: &Path) -> Result<RootCertStore, Error> {
     Ok(roots)
 }
 
+/// Identity taken from a verified client certificate during the TLS handshake.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClientIdentity {
+    pub subject_cn: Option<String>,
+    pub issuer_cn: Option<String>,
+}
+
+impl ClientIdentity {
+    /// Parse the common names out of a DER-encoded leaf certificate.
+    pub fn parse(leaf: &[u8]) -> Option<Self> {
+        let (_, certificate) = x509_parser::parse_x509_certificate(leaf).ok()?;
+        let subject = certificate.subject();
+        let subject_cn = subject
+            .iter_common_name()
+            .next()
+            .and_then(|value| value.as_str().ok())
+            .map(str::to_owned);
+        let issuer = certificate.issuer();
+        let issuer_cn = issuer
+            .iter_common_name()
+            .next()
+            .and_then(|value| value.as_str().ok())
+            .map(str::to_owned);
+        Some(Self {
+            subject_cn,
+            issuer_cn,
+        })
+    }
+}
+
 /// Expiry of the leaf certificate, for an operational gauge.
 pub fn certificate_expiry(path: &Path) -> Result<std::time::SystemTime, Error> {
     let chain = load_chain(path)?;

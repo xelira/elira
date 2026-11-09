@@ -327,6 +327,7 @@ pub async fn serve_unix(
                         metrics,
                         &mut stop,
                         None,
+                        None,
                     )
                     .await;
                 });
@@ -446,6 +447,7 @@ async fn serve_stream(
                 metrics,
                 stop,
                 Some(acme.clone()),
+                None,
             )
             .await;
             return;
@@ -458,7 +460,17 @@ async fn serve_stream(
                     secure: true,
                     ..conn
                 };
-                serve_conn(io, peer, runtime, conn, metrics, stop, Some(acme.clone())).await;
+                serve_conn(
+                    io,
+                    peer,
+                    runtime,
+                    conn,
+                    metrics,
+                    stop,
+                    Some(acme.clone()),
+                    None,
+                )
+                .await;
             }
             Err(err) if err.kind() == std::io::ErrorKind::ConnectionAborted => {
                 tracing::debug!(%peer, "acme validation connection");
@@ -485,7 +497,7 @@ async fn serve_stream(
                     secure: false,
                     ..conn
                 };
-                serve_conn(stream, peer, runtime, conn, metrics, stop, None).await;
+                serve_conn(stream, peer, runtime, conn, metrics, stop, None, None).await;
                 return;
             }
         }
@@ -513,6 +525,12 @@ async fn serve_stream(
                 Ok(Ok(stream)) => {
                     metrics.tls_handshake(true);
                     let h2 = stream.get_ref().1.alpn_protocol() == Some(b"h2".as_slice());
+                    let identity = stream
+                        .get_ref()
+                        .1
+                        .peer_certificates()
+                        .and_then(|chain| chain.first())
+                        .and_then(|leaf| elira_tls::ClientIdentity::parse(leaf.as_ref()));
                     let conn = ConnOptions { h2, ..conn };
                     serve_conn(
                         stream,
@@ -522,6 +540,7 @@ async fn serve_stream(
                         metrics,
                         stop,
                         options.acme.clone(),
+                        identity,
                     )
                     .await;
                 }
@@ -535,10 +554,11 @@ async fn serve_stream(
                 }
             }
         }
-        None => serve_conn(stream, peer, runtime, conn, metrics, stop, None).await,
+        None => serve_conn(stream, peer, runtime, conn, metrics, stop, None, None).await,
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve_conn<I>(
     io: I,
     peer: SocketAddr,
@@ -547,6 +567,7 @@ async fn serve_conn<I>(
     metrics: Arc<Metrics>,
     stop: &mut watch::Receiver<bool>,
     acme: Option<Arc<elira_acme::Acme>>,
+    client_cert: Option<elira_tls::ClientIdentity>,
 ) where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -558,16 +579,22 @@ async fn serve_conn<I>(
     let body_timeout = opts.body_timeout;
     let metrics_for_service = metrics.clone();
     let acme_for_service = acme.clone();
+    let client_cert = client_cert.map(Arc::new);
 
-    let service = service_fn(move |req: hyper::Request<Incoming>| {
+    let service = service_fn(move |mut req: hyper::Request<Incoming>| {
         let runtime = runtime.clone();
         let idle = idle_for_service.clone();
         let metrics = metrics_for_service.clone();
         let acme = acme_for_service.clone();
+        let client_cert = client_cert.clone();
         async move {
             // Reset the keep-alive watchdog: a request means the client is
             // still there, even if the response takes a while.
             idle.notify_one();
+
+            if let Some(identity) = &client_cert {
+                req.extensions_mut().insert(identity.as_ref().clone());
+            }
 
             // Load per request, so a reload applies to the next request on
             // an existing keep-alive connection.
@@ -643,7 +670,7 @@ async fn serve_conn<I>(
             }
             let bytes = response.body().size_hint().exact().unwrap_or(0);
             metrics.response_bytes(bytes);
-            let write_log = access_log && sample_request(&id, access_log_sample);
+            let write_log = access_log && elira_accesslog::sampled(&id, access_log_sample);
             let entry = Entry {
                 peer: peer.ip(),
                 method,
@@ -1047,30 +1074,9 @@ async fn idle_watch(idle: Arc<tokio::sync::Notify>, timeout: Duration) {
     }
 }
 
-/// Decide whether a request makes it into the access log. Request ids are
-/// already random 64-bit values, so they double as the sampling draw.
-pub(crate) fn sample_request(request_id: &str, rate: f64) -> bool {
-    if rate >= 1.0 {
-        return true;
-    }
-    if rate <= 0.0 {
-        return false;
-    }
-    let value = u64::from_str_radix(request_id, 16).unwrap_or(0);
-    (value as f64) < rate * (u64::MAX as f64)
-}
-
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-
-    #[test]
-    fn sampling_respects_the_boundaries() {
-        assert!(sample_request("0000000000000000", 1.0));
-        assert!(!sample_request("0000000000000000", 0.0));
-        assert!(sample_request("0000000000000000", 0.5));
-        assert!(!sample_request("ffffffffffffffff", 0.5));
-    }
 
     #[tokio::test]
     async fn reuse_port_lets_two_listeners_share_a_port() {

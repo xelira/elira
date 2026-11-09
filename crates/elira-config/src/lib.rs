@@ -640,6 +640,18 @@ pub struct Route {
     #[serde(default)]
     pub access_log_sample: Option<f64>,
 
+    /// Require a verified client certificate on this route.
+    #[serde(default)]
+    pub client_auth: bool,
+
+    /// Require this subject common name.
+    #[serde(default)]
+    pub client_cn: Option<String>,
+
+    /// Require this issuer common name.
+    #[serde(default)]
+    pub client_issuer_cn: Option<String>,
+
     /// Error pages as `STATUS /path.html`, served from `error_root` or `root`.
     #[serde(default)]
     pub error_pages: Vec<String>,
@@ -1592,6 +1604,41 @@ impl Config {
                 }
             }
 
+            if (route.client_cn.is_some() || route.client_issuer_cn.is_some()) && !route.client_auth
+            {
+                return Err(Error::RouteClientFilterWithoutAuth { index });
+            }
+            if route.client_auth {
+                let listener_ok = self
+                    .tls
+                    .as_ref()
+                    .is_some_and(|tls| tls.client_auth != ClientAuthMode::Off);
+                if !listener_ok {
+                    return Err(Error::RouteClientAuthWithoutTls { index });
+                }
+                if self
+                    .http3
+                    .as_ref()
+                    .is_some_and(|http3| http3.client_auth == ClientAuthMode::Off)
+                {
+                    return Err(Error::RouteClientAuthWithoutHttp3 { index });
+                }
+            }
+            if route
+                .client_cn
+                .as_ref()
+                .is_some_and(|cn| cn.trim().is_empty())
+            {
+                return Err(Error::EmptyClientCn { index });
+            }
+            if route
+                .client_issuer_cn
+                .as_ref()
+                .is_some_and(|cn| cn.trim().is_empty())
+            {
+                return Err(Error::EmptyClientIssuerCn { index });
+            }
+
             if let Some(path) = &route.auth_file {
                 if path.as_os_str().is_empty() {
                     return Err(Error::EmptyAuthFile { index });
@@ -1926,6 +1973,21 @@ pub enum Error {
 
     #[error("route {index}: access_log_sample must be between 0 and 1")]
     BadRouteLogSample { index: usize },
+
+    #[error("route {index}: client_cn/client_issuer_cn need client_auth = true")]
+    RouteClientFilterWithoutAuth { index: usize },
+
+    #[error("route {index}: client_auth needs tls.client_auth = \"optional\" or \"required\"")]
+    RouteClientAuthWithoutTls { index: usize },
+
+    #[error("route {index}: client_auth needs http3.client_auth = \"optional\" or \"required\"")]
+    RouteClientAuthWithoutHttp3 { index: usize },
+
+    #[error("route {index}: client_cn must not be empty")]
+    EmptyClientCn { index: usize },
+
+    #[error("route {index}: client_issuer_cn must not be empty")]
+    EmptyClientIssuerCn { index: usize },
 
     #[error("log.sample must be a fraction between 0 and 1")]
     BadLogSample,
@@ -2747,6 +2809,50 @@ error_pages = ["404 nope"]
         assert!(matches!(
             Config::parse(text),
             Err(Error::BadErrorPage { .. })
+        ));
+    }
+
+    #[test]
+    fn route_client_auth_needs_a_tls_listener() {
+        let text = r#"
+listen = "127.0.0.1:8080"
+
+[tls]
+cert = "/tmp/cert.pem"
+key = "/tmp/key.pem"
+client_ca = "/tmp/ca.pem"
+client_auth = "optional"
+
+[[routes]]
+host = "*"
+root = "/srv/www"
+client_auth = true
+client_cn = "service-a"
+client_issuer_cn = "client-ca"
+"#;
+        let cfg = Config::parse(text).expect("valid");
+        assert!(cfg.routes[0].client_auth);
+        assert_eq!(cfg.routes[0].client_cn.as_deref(), Some("service-a"));
+
+        let no_tls = text.replace(
+            "[tls]\ncert = \"/tmp/cert.pem\"\nkey = \"/tmp/key.pem\"\nclient_ca = \"/tmp/ca.pem\"\nclient_auth = \"optional\"\n",
+            "",
+        );
+        assert!(matches!(
+            Config::parse(&no_tls),
+            Err(Error::RouteClientAuthWithoutTls { .. })
+        ));
+
+        let no_flag = text.replace("client_auth = true\n", "");
+        assert!(matches!(
+            Config::parse(&no_flag),
+            Err(Error::RouteClientFilterWithoutAuth { .. })
+        ));
+
+        let empty_cn = text.replace("client_cn = \"service-a\"", "client_cn = \" \"");
+        assert!(matches!(
+            Config::parse(&empty_cn),
+            Err(Error::EmptyClientCn { .. })
         ));
     }
 

@@ -15,6 +15,7 @@ elira-fastcgi = { path = "../elira-fastcgi" }
 elira-h2 = { path = "../elira-h2" }
 elira-h3upstream = { path = "../elira-h3upstream" }
 elira-module = { path = "../elira-module" }
+elira-tls = { path = "../elira-tls" }
 elira-upstream = { path = "../elira-upstream" }
 elira-wasm = { path = "../elira-wasm" }
 elira-limit = { path = "../elira-limit" }

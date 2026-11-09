@@ -390,6 +390,19 @@ pub fn request_id() -> String {
     format!("{x:016x}")
 }
 
+/// Decide whether a request makes it into the access log. Request ids are
+/// already random 64-bit values, so they double as the sampling draw.
+pub fn sampled(request_id: &str, rate: f64) -> bool {
+    if rate >= 1.0 {
+        return true;
+    }
+    if rate <= 0.0 {
+        return false;
+    }
+    let value = u64::from_str_radix(request_id, 16).unwrap_or(0);
+    (value as f64) < rate * (u64::MAX as f64)
+}
+
 fn version_str(version: http::Version) -> &'static str {
     match version {
         http::Version::HTTP_09 => "HTTP/0.9",
@@ -510,6 +523,14 @@ fn push_num(out: &mut String, key: &str, value: u128) {
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn sampling_respects_the_boundaries() {
+        assert!(sampled("0000000000000000", 1.0));
+        assert!(!sampled("0000000000000000", 0.0));
+        assert!(sampled("0000000000000000", 0.5));
+        assert!(!sampled("ffffffffffffffff", 0.5));
+    }
 
     fn entry() -> Entry {
         Entry {

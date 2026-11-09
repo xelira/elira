@@ -266,7 +266,7 @@ pub(crate) async fn try_serve(
     metrics.observe(status.as_u16(), started.elapsed());
     metrics.connection_finished();
 
-    if fast.access_log && crate::server::sample_request(&entry.request_id, fast.access_log_sample) {
+    if fast.access_log && elira_accesslog::sampled(&entry.request_id, fast.access_log_sample) {
         current.write_log(&entry);
     }
 

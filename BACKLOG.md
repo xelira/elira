@@ -28,6 +28,7 @@ Living list for the self-improvement loop. One item per session.
 - [x] Per-route/global cap on proxied upstream responses.
 - [x] Error pages for local errors and a global fallback.
 - [x] Access-log sampling globally and per route.
+- [x] Per-route mTLS with subject and issuer CN filters.
 - [x] Per-route FastCGI pool size.
 - [x] Purge tests through the admin listener in both single and worker mode.
 - [x] Per-route cache enable/TTL overrides.
