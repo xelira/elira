@@ -169,6 +169,11 @@ pub struct Limits {
     /// disables disk spooling.
     #[serde(default)]
     pub response_spool_bytes: usize,
+
+    /// Total bytes that may be held in spool files at once. Zero means no
+    /// global cap. A response that does not fit streams instead of waiting.
+    #[serde(default)]
+    pub spool_budget_bytes: u64,
 }
 
 impl Default for Limits {
@@ -190,6 +195,7 @@ impl Default for Limits {
             shutdown_timeout_secs: Self::default_shutdown_timeout_secs(),
             response_buffer_bytes: 0,
             response_spool_bytes: 0,
+            spool_budget_bytes: 0,
             max_response_bytes: Self::default_max_response_bytes(),
             max_upstream_response_bytes: 0,
             fastcgi_pool_idle: Self::default_fastcgi_pool_idle(),
@@ -3583,6 +3589,7 @@ listen = "127.0.0.1:8080"
 [limits]
 response_buffer_bytes = 1024
 response_spool_bytes = 4096
+spool_budget_bytes = 1048576
 
 [[routes]]
 host = "*"
@@ -3591,6 +3598,7 @@ root = "/srv/www"
         let cfg = Config::parse(text).expect("valid");
         assert_eq!(cfg.limits.response_buffer_bytes, 1024);
         assert_eq!(cfg.limits.response_spool_bytes, 4096);
+        assert_eq!(cfg.limits.spool_budget_bytes, 1_048_576);
     }
 
     #[test]

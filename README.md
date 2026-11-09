@@ -231,7 +231,8 @@ HTTP:
 - optional TLS and HTTP/2 on the unix listener, using the same `[tls]`
 - body progress timeouts, websocket/CONNECT idle timeout and request-body caps
   enforced on streamed uploads, not only `Content-Length`
-- optional memory or temporary-file buffering of upstream responses
+- optional memory or temporary-file buffering of upstream responses, with a
+  global spool budget
 - gzip/brotli, `Alt-Svc`, `Server` hiding, `X-Request-Id`
 
 Static files:

@@ -86,6 +86,60 @@ pub struct Proxy {
     inner: Arc<Inner>,
 }
 
+/// Shared byte budget for temporary spool files. Zero total means unlimited;
+/// the used counter is still maintained for `/status`.
+struct SpoolBudget {
+    total: u64,
+    used: Mutex<u64>,
+}
+
+struct SpoolPermit {
+    budget: Arc<SpoolBudget>,
+    bytes: u64,
+}
+
+impl SpoolBudget {
+    fn new(total: u64) -> Self {
+        Self {
+            total,
+            used: Mutex::new(0),
+        }
+    }
+
+    fn reserve(self: &Arc<Self>, bytes: u64) -> Option<SpoolPermit> {
+        let mut used = self
+            .used
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.total > 0 && used.saturating_add(bytes) > self.total {
+            return None;
+        }
+        *used = used.saturating_add(bytes);
+        Some(SpoolPermit {
+            budget: self.clone(),
+            bytes,
+        })
+    }
+
+    fn used(&self) -> u64 {
+        *self
+            .used
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl Drop for SpoolPermit {
+    fn drop(&mut self) {
+        let mut used = self
+            .budget
+            .used
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *used = used.saturating_sub(self.bytes);
+    }
+}
+
 struct Inner {
     router: Router,
     pools: Vec<Arc<Pool>>,
@@ -106,6 +160,7 @@ struct Inner {
     tunnel_idle: Option<Duration>,
     buffer_bytes: usize,
     spool_bytes: usize,
+    spool_budget: Arc<SpoolBudget>,
     spooled: AtomicU64,
     max_app_response: usize,
     max_upstream_response: usize,
@@ -657,6 +712,8 @@ impl Proxy {
                 "entries": entries,
             })),
             "spooled": self.inner.spooled.load(Ordering::Relaxed),
+            "spool_budget": self.inner.spool_budget.total,
+            "spool_used": self.inner.spool_budget.used(),
         })
     }
 
@@ -1083,6 +1140,7 @@ impl Proxy {
                 },
                 buffer_bytes: cfg.limits.response_buffer_bytes,
                 spool_bytes: cfg.limits.response_spool_bytes,
+                spool_budget: Arc::new(SpoolBudget::new(cfg.limits.spool_budget_bytes)),
                 spooled: AtomicU64::new(0),
                 max_app_response: cfg.limits.max_response_bytes,
                 max_upstream_response: cfg.limits.max_upstream_response_bytes,
@@ -2026,14 +2084,23 @@ impl Proxy {
                         && length > self.inner.buffer_bytes
                         && length <= self.inner.spool_bytes =>
                 {
-                    match spool_body(body, length).await {
-                        Ok(body) => {
-                            self.inner.spooled.fetch_add(1, Ordering::Relaxed);
+                    match self.inner.spool_budget.reserve(length as u64) {
+                        Some(permit) => match spool_body(body, length, permit).await {
+                            Ok(body) => {
+                                self.inner.spooled.fetch_add(1, Ordering::Relaxed);
+                                body
+                            }
+                            Err(err) => {
+                                tracing::warn!(error = %err, "failed to spool an upstream response");
+                                return Err(text(StatusCode::BAD_GATEWAY, "bad gateway"));
+                            }
+                        },
+                        None => {
+                            tracing::debug!(
+                                length,
+                                "spool budget exhausted, streaming the response"
+                            );
                             body
-                        }
-                        Err(err) => {
-                            tracing::warn!(error = %err, "failed to spool an upstream response");
-                            return Err(text(StatusCode::BAD_GATEWAY, "bad gateway"));
                         }
                     }
                 }
@@ -3635,7 +3702,11 @@ pub fn timeout_body(body: Body, idle: Duration) -> Body {
 /// Write a fully known response body to an unlinked temporary file and return
 /// a body that reads it back. This releases the upstream connection before a
 /// slow client drains the response.
-async fn spool_body(mut body: Body, expected: usize) -> Result<Body, BoxError> {
+async fn spool_body(
+    mut body: Body,
+    expected: usize,
+    permit: SpoolPermit,
+) -> Result<Body, BoxError> {
     let file = tempfile::tempfile()?;
     let mut file = tokio::fs::File::from_std(file);
     let mut seen = 0usize;
@@ -3674,6 +3745,7 @@ async fn spool_body(mut body: Body, expected: usize) -> Result<Body, BoxError> {
         stream: ReaderStream::new(file),
         trailers,
         length: expected as u64,
+        _permit: permit,
     }
     .boxed())
 }
@@ -3682,6 +3754,7 @@ struct SpooledBody {
     stream: ReaderStream<tokio::fs::File>,
     trailers: Option<HeaderMap>,
     length: u64,
+    _permit: SpoolPermit,
 }
 
 impl HttpBody for SpooledBody {
@@ -3925,6 +3998,26 @@ mod tests {
         headers.insert(HeaderName::from_static("b"), HeaderValue::from_static("2"));
         assert!(!headers_within_limits(&headers, 1, 100));
         assert!(headers_within_limits(&headers, 2, 100));
+    }
+
+    #[test]
+    fn spool_budget_reserves_and_releases_bytes() {
+        let budget = Arc::new(SpoolBudget::new(100));
+        let first = budget.reserve(60).expect("first reservation");
+        assert_eq!(budget.used(), 60);
+        assert!(budget.reserve(50).is_none(), "over budget");
+
+        let second = budget.reserve(40).expect("fits exactly");
+        assert_eq!(budget.used(), 100);
+        drop(first);
+        assert_eq!(budget.used(), 40);
+        drop(second);
+        assert_eq!(budget.used(), 0);
+
+        let unlimited = Arc::new(SpoolBudget::new(0));
+        let permit = unlimited.reserve(u64::MAX).expect("unlimited");
+        drop(permit);
+        assert_eq!(unlimited.used(), 0);
     }
 
     #[test]
