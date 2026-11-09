@@ -16,9 +16,13 @@ use thiserror::Error;
 pub struct Config {
     pub listen: SocketAddr,
 
-    /// Optional HTTP/1.1 listener on a unix socket. TLS is not applied here.
+    /// Optional HTTP/1.1 listener on a unix socket.
     #[serde(default)]
     pub listen_unix: Option<PathBuf>,
+
+    /// Terminate TLS on the unix socket using the `[tls]` settings.
+    #[serde(default)]
+    pub unix_tls: bool,
 
     /// Accept HTTP/2 with prior knowledge on plain TCP (h2c).
     #[serde(default)]
@@ -1243,6 +1247,12 @@ impl Config {
                 return Err(Error::EmptyUnixListen);
             }
         }
+        if self.unix_tls && self.listen_unix.is_none() {
+            return Err(Error::UnixTlsWithoutListener);
+        }
+        if self.unix_tls && self.tls.is_none() {
+            return Err(Error::UnixTlsWithoutTls);
+        }
         if self.limits.max_header_bytes < 8192 {
             return Err(Error::MaxHeaderBytesTooSmall);
         }
@@ -1956,6 +1966,12 @@ pub enum Error {
 
     #[error("listen_unix must not be empty")]
     EmptyUnixListen,
+
+    #[error("unix_tls needs listen_unix")]
+    UnixTlsWithoutListener,
+
+    #[error("unix_tls needs a [tls] section with a certificate")]
+    UnixTlsWithoutTls,
 
     #[error("limits.max_header_bytes must be at least 8192, hyper refuses smaller buffers")]
     MaxHeaderBytesTooSmall,
@@ -3313,6 +3329,39 @@ upstream = "app"
         assert!(matches!(
             Config::parse(&with_round_robin),
             Err(Error::HashKeyWithoutHashBalance { .. })
+        ));
+    }
+
+    #[test]
+    fn unix_tls_needs_a_listener_and_certificate() {
+        let base = r#"
+listen = "127.0.0.1:8080"
+listen_unix = "/run/elira.sock"
+unix_tls = true
+
+[tls]
+cert = "/tmp/cert.pem"
+key = "/tmp/key.pem"
+
+[[routes]]
+host = "*"
+root = "/srv/www"
+"#;
+        assert!(Config::parse(base).is_ok());
+
+        let no_listener = base.replace("listen_unix = \"/run/elira.sock\"\n", "");
+        assert!(matches!(
+            Config::parse(&no_listener),
+            Err(Error::UnixTlsWithoutListener)
+        ));
+
+        let no_tls = base.replace(
+            "[tls]\ncert = \"/tmp/cert.pem\"\nkey = \"/tmp/key.pem\"\n",
+            "",
+        );
+        assert!(matches!(
+            Config::parse(&no_tls),
+            Err(Error::UnixTlsWithoutTls)
         ));
     }
 

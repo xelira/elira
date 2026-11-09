@@ -52,10 +52,13 @@ include = ["/etc/elira/conf.d/*.toml"]
 пишется ошибка, а старый конфиг продолжает работать. Что применяется сразу, а что
 требует рестарта, разобрано в разделе «Ограничения и поведение».
 
-`listen_unix` поднимает второй слушатель на файловом сокете. TLS, PROXY
-protocol и `sendfile` на нём не применяются; peer для логов и ACL —
-`127.0.0.1`. Сокет не удаляется при старте: существующий файл означает
-ошибку, а не молчаливую замену чужого сокета.
+`listen_unix` поднимает второй слушатель на файловом сокете. PROXY protocol и
+`sendfile` на нём не применяются; peer для логов и ACL — `127.0.0.1`. С
+`unix_tls = true` тот же сокет терминирует TLS настройками `[tls]`, включая
+SNI-сертификаты, mTLS, OCSP и ALPN `h2`/`http/1.1`; сертификат перечитывается
+по `SIGHUP` для новых соединений. Без `[tls]` комбинация отклоняется. Сокет не
+удаляется при старте: существующий файл означает ошибку, а не молчаливую
+замену чужого сокета.
 
 Адреса везде имеют вид `IP:порт` (тип `SocketAddr` в TOML-строке), поэтому
 `localhost:8080` не подходит — нужен `127.0.0.1:8080` или `[::1]:8080`.
@@ -68,6 +71,7 @@ protocol и `sendfile` на нём не применяются; peer для ло
 | --- | --- | --- | --- |
 | `listen` | `IP:порт` | нет, обязательно | TCP-адрес основного HTTP-листенера |
 | `listen_unix` | путь | нет | дополнительный HTTP/1.1 на unix-сокете |
+| `unix_tls` | bool | `false` | завершать TLS на `listen_unix` настройками `[tls]` |
 | `h2c` | bool | `false` | HTTP/2 prior knowledge без TLS |
 | `workers` | 1..64 | `1` | процессы-воркеры с SO_REUSEPORT; нужен `reuse_port = true` |
 | `proxy_protocol` | bool | `false` | ждать PROXY protocol (v1/v2) на каждом соединении |
@@ -923,6 +927,8 @@ elira check --config elira.toml
 | `eject_secs must be greater than zero...` | эвикция без cooldown | задайте `eject_secs` |
 | `hash_key needs balance = "hash"` | ключ без hash-балансировки | добавьте `balance = "hash"` |
 | `"..." is not a hash key` | неизвестный ключ | `ip`, `authorization`, `header:NAME`, `cookie:NAME`, `uri` |
+| `unix_tls needs listen_unix` | TLS на сокете без сокета | задайте `listen_unix` |
+| `unix_tls needs a [tls] section...` | Unix TLS без сертификата | добавьте `[tls]` |
 | `route N: timeout_secs must be greater than zero` | нулевой таймаут | уберите поле или поставьте больше нуля |
 | `http3.cert must not be empty` | `[http3]` без сертификата | задайте `cert` и `key` |
 | `health.path must start with '/'...` | путь без `/` | `/health` |

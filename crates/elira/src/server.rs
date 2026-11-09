@@ -135,6 +135,10 @@ impl Runtime {
         self.http3.as_ref()
     }
 
+    pub fn tls(&self) -> Option<&Arc<rustls::ServerConfig>> {
+        self.tls.as_ref()
+    }
+
     pub fn access_log(&self) -> Option<&Arc<crate::access_log::AccessLog>> {
         self.access_log.as_ref()
     }
@@ -175,6 +179,7 @@ pub struct Options {
     pub proxy_protocol: bool,
     pub sendfile: bool,
     pub h2c: bool,
+    pub unix_tls: bool,
     pub body_timeout: Option<Duration>,
     pub drain_timeout: Duration,
     pub shutdown_timeout: Duration,
@@ -191,6 +196,7 @@ impl Options {
             proxy_protocol: cfg.proxy_protocol,
             sendfile: cfg.sendfile,
             h2c: cfg.h2c,
+            unix_tls: cfg.unix_tls,
             body_timeout: match cfg.limits.request_body_timeout_secs {
                 0 => None,
                 secs => Some(Duration::from_secs(secs)),
@@ -293,8 +299,8 @@ pub fn bind_unix(path: &std::path::Path) -> std::io::Result<UnixListener> {
     UnixListener::bind(path)
 }
 
-/// Accept plain HTTP/1.1 on a unix socket. There is no TLS and no PROXY
-/// protocol; the peer address is localhost for logs and ACLs.
+/// Accept HTTP/1.1 (or HTTP/2 over TLS) on a unix socket. PROXY protocol is
+/// not applied; the peer address is localhost for logs and ACLs.
 pub async fn serve_unix(
     listener: UnixListener,
     runtime: Arc<ArcSwap<Runtime>>,
@@ -303,6 +309,7 @@ pub async fn serve_unix(
     stop: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     let permits = Arc::new(Semaphore::new(options.max_connections));
+    let unix_tls = options.unix_tls;
     let mut stop = stop;
     let mut connections = tokio::task::JoinSet::new();
 
@@ -328,17 +335,63 @@ pub async fn serve_unix(
                 };
                 connections.spawn(async move {
                     let _permit = permit;
-                    serve_conn(
-                        stream,
-                        "127.0.0.1:0".parse().expect("loopback"),
-                        runtime,
-                        conn,
-                        metrics,
-                        &mut stop,
-                        None,
-                        None,
-                    )
-                    .await;
+                    if !unix_tls {
+                        serve_conn(
+                            stream,
+                            "127.0.0.1:0".parse().expect("loopback"),
+                            runtime,
+                            conn,
+                            metrics,
+                            &mut stop,
+                            None,
+                            None,
+                        )
+                        .await;
+                        return;
+                    }
+
+                    let Some(config) = runtime.load().tls().cloned() else {
+                        return;
+                    };
+                    let acceptor = TlsAcceptor::from(config);
+                    match tokio::time::timeout(Duration::from_secs(10), acceptor.accept(stream))
+                        .await
+                    {
+                        Ok(Ok(stream)) => {
+                            metrics.tls_handshake(true);
+                            let h2 = stream.get_ref().1.alpn_protocol() == Some(b"h2".as_slice());
+                            let identity = stream
+                                .get_ref()
+                                .1
+                                .peer_certificates()
+                                .and_then(|chain| chain.first())
+                                .and_then(|leaf| elira_tls::ClientIdentity::parse(leaf.as_ref()));
+                            let conn = ConnOptions {
+                                h2,
+                                secure: true,
+                                ..conn
+                            };
+                            serve_conn(
+                                stream,
+                                "127.0.0.1:0".parse().expect("loopback"),
+                                runtime,
+                                conn,
+                                metrics,
+                                &mut stop,
+                                None,
+                                identity,
+                            )
+                            .await;
+                        }
+                        Ok(Err(err)) => {
+                            metrics.tls_handshake(false);
+                            tracing::debug!(error = %err, "unix tls handshake failed");
+                        }
+                        Err(_) => {
+                            metrics.tls_handshake(false);
+                            tracing::debug!("unix tls handshake timed out");
+                        }
+                    }
                 });
             }
         }

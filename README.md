@@ -31,7 +31,8 @@ running. This needs `reuse_port = true`. The same readiness moment sends
 ```toml
 listen = "0.0.0.0:8080"
 # include = ["/etc/elira/conf.d/*.toml"]   # ${ENV} is substituted in values
-listen_unix = "/run/elira.sock"   # optional plain HTTP/1.1 listener
+listen_unix = "/run/elira.sock"   # optional unix listener
+unix_tls = false                  # true terminates TLS with [tls]
 # h2c = true                      # HTTP/2 with prior knowledge on plain TCP
 # workers = 4                     # needs reuse_port = true
 
@@ -224,6 +225,7 @@ TLS:
 HTTP:
 
 - HTTP/1.1, HTTP/2 (TLS or h2c with prior knowledge), HTTP/3 over QUIC
+- optional TLS and HTTP/2 on the unix listener, using the same `[tls]`
 - body progress timeouts, websocket/CONNECT idle timeout
 - optional memory or temporary-file buffering of upstream responses
 - gzip/brotli, `Alt-Svc`, `Server` hiding, `X-Request-Id`

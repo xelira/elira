@@ -2682,6 +2682,101 @@ root = "{}"
     let _ = stop_tx.send(true);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn unix_listener_serves_tls() {
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+    use tokio::net::{UnixListener, UnixStream};
+
+    let ca_key = KeyPair::generate().expect("ca key");
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca = ca_params.self_signed(&ca_key).expect("ca");
+
+    let server_key = KeyPair::generate().expect("server key");
+    let server_params =
+        CertificateParams::new(vec!["localhost".to_owned()]).expect("server params");
+    let server = server_params
+        .signed_by(&server_key, &ca, &ca_key)
+        .expect("server cert");
+
+    let dir = temp_root("unix-tls");
+    std::fs::write(dir.join("server.pem"), server.pem()).unwrap();
+    std::fs::write(dir.join("server.key"), server_key.serialize_pem()).unwrap();
+    std::fs::write(dir.join("ca.pem"), ca.pem()).unwrap();
+    std::fs::write(dir.join("index.html"), "tls over unix").unwrap();
+
+    let path = dir.join("elira.sock");
+    let listener = UnixListener::bind(&path).expect("bind unix listener");
+
+    let cfg = Config::parse(&format!(
+        r#"
+listen = "127.0.0.1:0"
+listen_unix = "{}"
+unix_tls = true
+
+[tls]
+cert = "{}"
+key = "{}"
+
+[[routes]]
+host = "*"
+root = "{}"
+"#,
+        path.display(),
+        dir.join("server.pem").display(),
+        dir.join("server.key").display(),
+        dir.display()
+    ))
+    .expect("config");
+
+    let runtime = Arc::new(ArcSwap::from_pointee(
+        Runtime::build(&cfg).expect("runtime"),
+    ));
+    let metrics = Arc::new(Metrics::new());
+    let (stop_tx, stop_rx) = watch::channel(false);
+    tokio::spawn(server::serve_unix(
+        listener,
+        runtime,
+        Options::from_config(&cfg),
+        metrics,
+        stop_rx,
+    ));
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(ca.der().clone()).expect("add ca");
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let client = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
+    let name = rustls::pki_types::ServerName::try_from("localhost").expect("server name");
+    let stream = UnixStream::connect(&path).await.expect("connect unix");
+    let mut tls = connector
+        .connect(name, stream)
+        .await
+        .expect("tls handshake");
+    tls.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("write");
+
+    let mut response = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        match tokio::time::timeout(Duration::from_secs(3), tls.read(&mut chunk)).await {
+            Ok(Ok(0)) | Err(_) => break,
+            Ok(Ok(read)) => response.extend_from_slice(&chunk[..read]),
+            Ok(Err(_)) => break,
+        }
+    }
+    let response = String::from_utf8_lossy(&response).to_string();
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.ends_with("tls over unix"), "{response}");
+    let _ = stop_tx.send(true);
+}
+
 #[tokio::test]
 async fn stale_cache_entry_is_served_while_it_refreshes() {
     use std::sync::atomic::{AtomicUsize, Ordering};
