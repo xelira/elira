@@ -3252,6 +3252,100 @@ upstream = "app"
 }
 
 #[tokio::test]
+async fn grpc_request_trailers_reach_the_h2_upstream() {
+    use futures_util::stream as futures_stream;
+    use http_body_util::BodyExt;
+    use hyper::body::{Bytes, Frame};
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind grpc upstream");
+    let upstream = listener.local_addr().expect("grpc addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let service = hyper::service::service_fn(
+                    |request: hyper::Request<hyper::body::Incoming>| async move {
+                        let collected = request.into_body().collect().await.expect("request body");
+                        let saw = collected
+                            .trailers()
+                            .and_then(|trailers| trailers.get("x-request-trailer"))
+                            .and_then(|value| value.to_str().ok())
+                            .map(|value| value == "yes")
+                            .unwrap_or(false);
+                        Ok::<_, std::convert::Infallible>(
+                            hyper::Response::builder()
+                                .status(200)
+                                .header("x-saw-request-trailer", if saw { "yes" } else { "no" })
+                                .body(http_body_util::Full::new(Bytes::from_static(b"ok")))
+                                .expect("response"),
+                        )
+                    },
+                );
+                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+h2c = true
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+h2_pool = true
+
+[[routes]]
+host = "*"
+upstream = "app"
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let tcp = TcpStream::connect(addr).await.expect("connect");
+    let (mut sender, connection) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tcp))
+            .await
+            .expect("h2 handshake");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let mut trailers = http::HeaderMap::new();
+    trailers.insert("x-request-trailer", http::HeaderValue::from_static("yes"));
+    let frames = futures_stream::iter(vec![
+        Ok::<_, std::convert::Infallible>(Frame::data(Bytes::from_static(b"payload"))),
+        Ok(Frame::trailers(trailers)),
+    ]);
+    let body = http_body_util::StreamBody::new(frames).boxed();
+    let request = hyper::Request::builder()
+        .method(http::Method::POST)
+        .uri("http://example.com/grpc")
+        .header("te", "trailers")
+        .header("content-type", "application/grpc")
+        .body(body)
+        .expect("request");
+
+    let response = sender.send_request(request).await.expect("grpc request");
+    assert_eq!(response.status(), http::StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-saw-request-trailer")
+            .and_then(|value| value.to_str().ok()),
+        Some("yes")
+    );
+}
+
+#[tokio::test]
 async fn cache_hit_is_compressed_for_clients_that_ask() {
     let upstream = upstream().await;
     let config = format!(
