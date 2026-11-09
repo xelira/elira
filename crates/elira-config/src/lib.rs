@@ -488,6 +488,10 @@ pub struct Http3 {
     /// Allow 0-RTT early data on QUIC.
     #[serde(default)]
     pub early_data: bool,
+
+    /// 32-byte ticket key shared by all QUIC workers.
+    #[serde(default)]
+    pub ticket_key: Option<PathBuf>,
 }
 
 impl Http3 {
@@ -978,6 +982,11 @@ pub struct Tls {
     /// on startup and on SIGHUP, so an external renewal hook can replace it.
     #[serde(default)]
     pub ocsp: Option<PathBuf>,
+
+    /// 32-byte key used to encrypt TLS tickets. Sharing this file between
+    /// workers makes stateless sessions resumable across processes.
+    #[serde(default)]
+    pub ticket_key: Option<PathBuf>,
 
     /// Command that refreshes `ocsp` and then triggers a reload.
     #[serde(default)]
@@ -1623,6 +1632,13 @@ impl Config {
             }
             validate_tls_list("http3.cipher_suites", &http3.cipher_suites)?;
             validate_tls_list("http3.curves", &http3.curves)?;
+            if http3
+                .ticket_key
+                .as_ref()
+                .is_some_and(|path| path.as_os_str().is_empty())
+            {
+                return Err(Error::EmptyTicketKey);
+            }
             if http3.client_auth != ClientAuthMode::Off {
                 match &http3.client_ca {
                     Some(path) if !path.as_os_str().is_empty() => {}
@@ -1730,6 +1746,13 @@ impl Config {
             }
             validate_tls_list("tls.cipher_suites", &tls.cipher_suites)?;
             validate_tls_list("tls.curves", &tls.curves)?;
+            if tls
+                .ticket_key
+                .as_ref()
+                .is_some_and(|path| path.as_os_str().is_empty())
+            {
+                return Err(Error::EmptyTicketKey);
+            }
             if tls.ocsp_hook.as_ref().is_some_and(|path| {
                 path.as_os_str().is_empty()
                     || (tls.ocsp.is_none()
@@ -2419,6 +2442,8 @@ pub enum Error {
     #[error("client_crl must not be empty")]
     EmptyClientCrl,
 
+    #[error("ticket_key must not be empty")]
+    EmptyTicketKey,
     #[error("client_crl needs client_auth = \"optional\" or \"required\"")]
     ClientCrlWithoutAuth,
 
@@ -3835,6 +3860,33 @@ upstream = "app"
             Config::parse(&with_round_robin),
             Err(Error::HashKeyWithoutHashBalance { .. })
         ));
+    }
+
+    #[test]
+    fn ticket_key_is_validated() {
+        let base = r#"
+listen = "127.0.0.1:8443"
+
+[tls]
+cert = "/tmp/cert.pem"
+key = "/tmp/key.pem"
+ticket_key = "/etc/elira/ticket.key"
+
+[[routes]]
+host = "*"
+root = "/srv/www"
+"#;
+        let cfg = Config::parse(base).expect("valid");
+        assert_eq!(
+            cfg.tls.expect("tls").ticket_key.as_deref(),
+            Some(Path::new("/etc/elira/ticket.key"))
+        );
+
+        let empty = base.replace(
+            "ticket_key = \"/etc/elira/ticket.key\"",
+            "ticket_key = \"\"",
+        );
+        assert!(matches!(Config::parse(&empty), Err(Error::EmptyTicketKey)));
     }
 
     #[test]

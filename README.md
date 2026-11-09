@@ -224,6 +224,7 @@ TLS:
 - rustls with ALPN `h2` then `http/1.1`; HTTP/3 uses `h3`
 - SNI-selected certificates on TCP and QUIC, minimum TLS version, and
   explicit cipher-suite/curve policy per listener
+- shared TLS 1.3 ticket keys across workers for cross-process resumption
 - mutual TLS on TCP and QUIC, optional or required, with per-route
   subject/issuer CN checks and client CRLs
 

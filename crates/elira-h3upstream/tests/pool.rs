@@ -125,6 +125,7 @@ upstream = "app"
                     client_auth: elira_tls::ClientAuth::Off,
                     cipher_suites: None,
                     curves: None,
+                    ticket_key: None,
                     certificates: Vec::new(),
                     proxy_protocol: false,
                     idle_timeout_secs: 5,

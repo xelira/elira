@@ -33,6 +33,7 @@ pub struct Config {
     pub client_auth: elira_tls::ClientAuth,
     pub cipher_suites: Option<Vec<String>>,
     pub curves: Option<Vec<String>>,
+    pub ticket_key: Option<PathBuf>,
     pub certificates: Vec<elira_tls::NamedCert>,
     pub proxy_protocol: bool,
     pub idle_timeout_secs: u64,
@@ -57,6 +58,7 @@ pub async fn serve(
         cfg.cipher_suites.as_deref(),
         cfg.curves.as_deref(),
         cfg.client_crl.as_deref(),
+        cfg.ticket_key.as_deref(),
     )?;
     let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls)?;
     let mut transport = quinn::TransportConfig::default();

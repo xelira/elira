@@ -895,6 +895,7 @@ dependencies = [
 name = "elira-tls"
 version = "0.1.0"
 dependencies = [
+ "aws-lc-rs",
  "rustls",
  "rustls-pemfile",
  "thiserror",

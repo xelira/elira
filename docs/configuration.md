@@ -270,6 +270,7 @@ upstream. Нужен `error_root`; задавать их можно только
 | `client_crl` | путь | нет | PEM-списки отзыва клиентских сертификатов |
 | `client_auth` | `off` \| `optional` \| `required` | `off` | запрашивать ли клиентский сертификат |
 | `min_version` | `tls12` \| `tls13` | `tls12` | минимальная версия TLS |
+| `ticket_key` | путь | нет | 32-байтовый ключ для общих TLS-тикетов между воркерами |
 | `cipher_suites` | массив строк | по умолчанию rustls | cipher suites в порядке предпочтения |
 | `curves` | массив строк | по умолчанию rustls | key exchange groups в порядке предпочтения |
 | `ocsp` | путь | нет | DER OCSP-ответ для stapling; перечитывается по SIGHUP |
@@ -277,6 +278,7 @@ upstream. Нужен `error_root`; задавать их можно только
 | `ocsp_refresh_secs` | целое > 0 | `86400` | период вызова `ocsp_hook` |
 | `session_tickets` | целое ≥ 0 | `2` | TLS 1.3 tickets на handshake |
 | `session_cache` | целое ≥ 0 | `256` | записей resumption-кэша; `0` выключает |
+| `ticket_key` | путь | нет | общий 32-байтовый ключ тикетов для всех воркеров |
 | `certificates` | массив таблиц | `[]` | дополнительные сертификаты по SNI |
 
 Элемент `certificates`:
@@ -301,6 +303,12 @@ upstream. Нужен `error_root`; задавать их можно только
 - `ocsp` внутри `certificates` задаёт отдельный OCSP-ответ для этого имени.
   `ocsp_hook` может обновлять и его; reload перечитывает все файлы. Без
   default-`ocsp` hook разрешён, если OCSP задан хотя бы одному SNI-сертификату.
+- `session_tickets`/`session_cache` управляют resumption. `ticket_key` задаёт
+  32-байтовый ключ, которым шифруются stateless TLS 1.3 tickets; один и тот же
+  файл у всех воркеров делает resumption рабочим независимо от того, какой
+  процесс принял соединение. Если файла нет, он создаётся с правами `0600`;
+  файл с более широкими правами или неверной длиной отклоняется. Та же опция
+  есть в `[http3]`.
 - Отсутствующие файлы и битый PEM — ошибка сборки runtime, то есть до accept.
 - `cipher_suites` и `curves` задаются именами из rustls, например
   `TLS13_AES_128_GCM_SHA256`, `TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256`,
@@ -402,6 +410,7 @@ dns_cleanup_hook = "/usr/local/lib/elira/cloudflare-dns.sh"
 | `client_auth` | `off` \| `optional` \| `required` | `off` | клиентские сертификаты на QUIC |
 | `cipher_suites` | массив строк | по умолчанию rustls | TLS 1.3 suites для QUIC |
 | `curves` | массив строк | по умолчанию rustls | key exchange groups для QUIC |
+| `ticket_key` | путь | нет | общий 32-байтовый ключ тикетов |
 | `certificates` | массив таблиц | `[]` | SNI-сертификаты на QUIC, формат как у `[tls]` |
 | `idle_timeout_secs` | целое > 0 | `30` | idle timeout QUIC-соединения |
 | `early_data` | bool | `false` | разрешить 0-RTT на QUIC (проверено session resumption-клиентом) |

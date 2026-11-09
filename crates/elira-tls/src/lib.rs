@@ -6,13 +6,16 @@
 
 use std::fs;
 use std::io;
+use std::io::Write as _;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKeyDer};
 use rustls::server::danger::ClientCertVerifier;
-use rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
+use rustls::server::{ClientHello, ProducesTickets, ResolvesServerCert, WebPkiClientVerifier};
 use rustls::sign::CertifiedKey;
 use rustls::{RootCertStore, ServerConfig};
 use thiserror::Error;
@@ -43,6 +46,8 @@ pub struct ServerOptions<'a> {
     pub cipher_suites: Option<&'a [String]>,
     /// Key exchange groups to offer. `None` keeps the provider defaults.
     pub curves: Option<&'a [String]>,
+    /// 32-byte key file for stateless TLS tickets shared between workers.
+    pub ticket_key: Option<&'a Path>,
     /// TLS 1.3 tickets per handshake.
     pub session_tickets: usize,
     /// In-memory session cache entries; zero disables resumption.
@@ -100,6 +105,9 @@ pub enum Error {
 
     #[error("no CRLs in {path}")]
     NoCrls { path: PathBuf },
+
+    #[error("ticket key: {0}")]
+    TicketKey(String),
 
     #[error("no certificates in {path}")]
     NoCertificates { path: PathBuf },
@@ -166,6 +174,7 @@ pub fn server_config(cert: &Path, key: &Path) -> Result<ServerConfig, Error> {
         ocsp: None,
         cipher_suites: None,
         curves: None,
+        ticket_key: None,
         session_tickets: 2,
         session_cache: 256,
         early_data: 0,
@@ -200,6 +209,7 @@ pub fn server_config_with_client_auth(
         ocsp: None,
         cipher_suites: None,
         curves: None,
+        ticket_key: None,
         session_tickets: 2,
         session_cache: 256,
         early_data: 0,
@@ -219,7 +229,7 @@ pub fn quic_server_config_with_client_auth(
     client_ca: Option<&Path>,
     mode: ClientAuth,
 ) -> Result<ServerConfig, Error> {
-    quic_server_config_full(cert, key, &[], client_ca, mode, 0, None, None, None)
+    quic_server_config_full(cert, key, &[], client_ca, mode, 0, None, None, None, None)
 }
 
 /// QUIC listener with SNI-selected certificates as well as client auth.
@@ -234,6 +244,7 @@ pub fn quic_server_config_full(
     cipher_suites: Option<&[String]>,
     curves: Option<&[String]>,
     client_crl: Option<&Path>,
+    ticket_key: Option<&Path>,
 ) -> Result<ServerConfig, Error> {
     build(
         &ServerOptions {
@@ -246,6 +257,7 @@ pub fn quic_server_config_full(
             ocsp: None,
             cipher_suites,
             curves,
+            ticket_key,
             session_tickets: 2,
             session_cache: 256,
             early_data,
@@ -315,6 +327,142 @@ fn crypto_provider(
     })
 }
 
+struct KeyTicketer {
+    key: LessSafeKey,
+    name: [u8; 16],
+    lifetime: u32,
+}
+
+impl std::fmt::Debug for KeyTicketer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("KeyTicketer")
+            .field("lifetime", &self.lifetime)
+            .finish_non_exhaustive()
+    }
+}
+
+impl KeyTicketer {
+    fn new(bytes: [u8; 32]) -> Result<Self, Error> {
+        let key = LessSafeKey::new(
+            UnboundKey::new(&AES_256_GCM, &bytes)
+                .map_err(|_| Error::TicketKey("invalid AES-256-GCM key".to_owned()))?,
+        );
+        let mut name = [0u8; 16];
+        name.copy_from_slice(&bytes[..16]);
+        Ok(Self {
+            key,
+            name,
+            lifetime: 12 * 60 * 60,
+        })
+    }
+}
+
+impl ProducesTickets for KeyTicketer {
+    fn enabled(&self) -> bool {
+        true
+    }
+
+    fn lifetime(&self) -> u32 {
+        self.lifetime
+    }
+
+    fn encrypt(&self, plain: &[u8]) -> Option<Vec<u8>> {
+        let mut nonce_bytes = [0u8; 12];
+        aws_lc_rs::rand::fill(&mut nonce_bytes).ok()?;
+        let mut ciphertext = plain.to_vec();
+        self.key
+            .seal_in_place_append_tag(
+                Nonce::assume_unique_for_key(nonce_bytes),
+                Aad::from(&self.name[..]),
+                &mut ciphertext,
+            )
+            .ok()?;
+        let mut ticket = Vec::with_capacity(16 + 12 + ciphertext.len());
+        ticket.extend_from_slice(&self.name);
+        ticket.extend_from_slice(&nonce_bytes);
+        ticket.extend_from_slice(&ciphertext);
+        Some(ticket)
+    }
+
+    fn decrypt(&self, cipher: &[u8]) -> Option<Vec<u8>> {
+        if cipher.len() < 16 + 12 + 16 || cipher[..16] != self.name {
+            return None;
+        }
+        let nonce = Nonce::assume_unique_for_key(cipher[16..28].try_into().ok()?);
+        let mut plain = cipher[28..].to_vec();
+        self.key
+            .open_in_place(nonce, Aad::from(&self.name[..]), &mut plain)
+            .ok()
+            .map(|value| value.to_vec())
+    }
+}
+
+fn load_ticket_key(path: &Path) -> Result<[u8; 32], Error> {
+    match fs::read(path) {
+        Ok(bytes) => decode_ticket_key(path, &bytes),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => create_ticket_key(path),
+        Err(source) => Err(Error::Read {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn decode_ticket_key(path: &Path, bytes: &[u8]) -> Result<[u8; 32], Error> {
+    if bytes.len() != 32 {
+        return Err(Error::TicketKey(format!(
+            "{} must contain exactly 32 bytes",
+            path.display()
+        )));
+    }
+    let mode = fs::metadata(path)
+        .map_err(|source| Error::Read {
+            path: path.to_path_buf(),
+            source,
+        })?
+        .permissions()
+        .mode()
+        & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(Error::TicketKey(format!(
+            "{} is mode {mode:o}; expected 0600",
+            path.display()
+        )));
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(bytes);
+    Ok(key)
+}
+
+fn create_ticket_key(path: &Path) -> Result<[u8; 32], Error> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true).mode(0o600);
+    match options.open(path) {
+        Ok(mut file) => {
+            let mut key = [0u8; 32];
+            aws_lc_rs::rand::fill(&mut key)
+                .map_err(|_| Error::TicketKey("cannot generate a ticket key".to_owned()))?;
+            file.write_all(&key).map_err(|source| Error::Read {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            Ok(key)
+        }
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            let bytes = fs::read(path).map_err(|source| Error::Read {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            decode_ticket_key(path, &bytes)
+        }
+        Err(source) => Err(Error::Read {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
 fn build(options: &ServerOptions<'_>, alpn: &[&[u8]]) -> Result<ServerConfig, Error> {
     // Pick the provider explicitly. Relying on the process default breaks as
     // soon as another crate enables a second backend, which quinn does.
@@ -366,6 +514,9 @@ fn build(options: &ServerOptions<'_>, alpn: &[&[u8]]) -> Result<ServerConfig, Er
 
     let resolver = NamedResolver { named, default };
     let mut config = builder.with_cert_resolver(Arc::new(resolver));
+    if let Some(path) = options.ticket_key {
+        config.ticketer = Arc::new(KeyTicketer::new(load_ticket_key(path)?)?);
+    }
     config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
     config.send_tls13_tickets = options.session_tickets;
     config.session_storage = if options.session_cache == 0 {
@@ -899,6 +1050,47 @@ mod tests {
     }
 
     #[test]
+    fn shared_ticket_key_round_trips_between_configs() {
+        let fixtures = fixtures();
+        let dir = TempDir::new("ticket");
+        let key_path = dir.path().join("ticket.key");
+
+        let build = |key_path: &Path| {
+            server_config_with_options(&ServerOptions {
+                default: Some((&fixtures.join("cert.pem"), &fixtures.join("key.pem"))),
+                named: &[],
+                client_ca: None,
+                client_crl: None,
+                client_auth: ClientAuth::Off,
+                tls13_only: false,
+                ocsp: None,
+                cipher_suites: None,
+                curves: None,
+                ticket_key: Some(key_path),
+                session_tickets: 2,
+                session_cache: 256,
+                early_data: 0,
+            })
+            .expect("ticket config")
+        };
+
+        let first = build(&key_path);
+        let mode = fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        let ticket = first.ticketer.encrypt(b"session state").expect("encrypt");
+        let second = build(&key_path);
+        assert_eq!(
+            second.ticketer.decrypt(&ticket).as_deref(),
+            Some(b"session state".as_slice())
+        );
+
+        let other_dir = TempDir::new("ticket-other");
+        let other = build(&other_dir.path().join("ticket.key"));
+        assert!(other.ticketer.decrypt(&ticket).is_none());
+    }
+
+    #[test]
     fn sni_certificates_carry_their_own_ocsp() {
         let fixtures = fixtures();
         let dir = TempDir::new("sni-ocsp");
@@ -947,6 +1139,7 @@ mod tests {
             ocsp: None,
             cipher_suites: Some(&suites),
             curves: Some(&curves),
+            ticket_key: None,
             session_tickets: 2,
             session_cache: 256,
             early_data: 0,
@@ -977,6 +1170,7 @@ mod tests {
             ocsp: None,
             cipher_suites: Some(&suites),
             curves: None,
+            ticket_key: None,
             session_tickets: 2,
             session_cache: 256,
             early_data: 0,
@@ -995,6 +1189,7 @@ mod tests {
             ocsp: None,
             cipher_suites: None,
             curves: Some(&curves),
+            ticket_key: None,
             session_tickets: 2,
             session_cache: 256,
             early_data: 0,
@@ -1015,6 +1210,7 @@ mod tests {
             ClientAuth::Off,
             0,
             Some(&suites),
+            None,
             None,
             None,
         )

@@ -74,6 +74,7 @@ impl Runtime {
                     ocsp: tls.ocsp.as_deref(),
                     cipher_suites: tls.cipher_suites.as_deref(),
                     curves: tls.curves.as_deref(),
+                    ticket_key: tls.ticket_key.as_deref(),
                     session_tickets: tls.session_tickets,
                     session_cache: tls.session_cache,
                     early_data: 0,

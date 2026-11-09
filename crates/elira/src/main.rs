@@ -593,6 +593,7 @@ fn spawn_h3(
             client_auth,
             cipher_suites: http3.cipher_suites,
             curves: http3.curves,
+            ticket_key: http3.ticket_key,
             certificates: http3
                 .certificates
                 .iter()
