@@ -8,6 +8,10 @@ repository.workspace = true
 [dependencies]
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
+openssl = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+tokio-openssl = { workspace = true }
 thiserror = { workspace = true }
 x509-parser = "0.18"
 aws-lc-rs = "1"

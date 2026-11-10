@@ -15,7 +15,6 @@ use arc_swap::ArcSwap;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{watch, Mutex, Semaphore};
-use tokio_rustls::TlsAcceptor;
 
 use elira_metrics::Metrics;
 
@@ -412,21 +411,20 @@ async fn accept_tls(
     stream: TcpStream,
     runtime: &ArcSwap<Runtime>,
     metrics: &Metrics,
-) -> io::Result<tokio_rustls::server::TlsStream<TcpStream>> {
+) -> io::Result<elira_tls::TlsStream<TcpStream>> {
     let Some(config) = runtime.load().tls().cloned() else {
         return Err(io::Error::other(
             "stream TLS requested but no TLS config is loaded",
         ));
     };
-    let acceptor = TlsAcceptor::from(config);
-    match tokio::time::timeout(Duration::from_secs(10), acceptor.accept(stream)).await {
+    match tokio::time::timeout(Duration::from_secs(10), elira_tls::accept(&config, stream)).await {
         Ok(Ok(stream)) => {
             metrics.tls_handshake(true);
             Ok(stream)
         }
         Ok(Err(err)) => {
             metrics.tls_handshake(false);
-            Err(err)
+            Err(io::Error::other(err.to_string()))
         }
         Err(_) => {
             metrics.tls_handshake(false);

@@ -45,6 +45,7 @@ bytes = { workspace = true }
 futures-util = { workspace = true }
 h3 = { workspace = true }
 h3-quinn = { workspace = true }
+openssl = { workspace = true }
 quinn = { workspace = true }
 elira-upstream = { path = "../elira-upstream" }
 elira-wasm = { path = "../elira-wasm" }

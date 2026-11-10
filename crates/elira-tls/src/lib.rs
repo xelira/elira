@@ -17,8 +17,14 @@ use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKey
 use rustls::server::danger::ClientCertVerifier;
 use rustls::server::{ClientHello, ProducesTickets, ResolvesServerCert, WebPkiClientVerifier};
 use rustls::sign::CertifiedKey;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
 use rustls::{RootCertStore, ServerConfig};
 use thiserror::Error;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+mod openssl_backend;
 
 /// A certificate that answers for a set of Server Name Indication values.
 #[derive(Debug, Clone)]
@@ -80,6 +86,145 @@ pub enum ClientAuth {
     Required,
 }
 
+/// TLS implementation for inbound TCP listeners.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    Rustls,
+    Openssl,
+}
+
+/// Lowest TLS protocol version offered by the OpenSSL backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsVersion {
+    Tls10,
+    Tls11,
+    Tls12,
+    Tls13,
+}
+
+/// A built server configuration for either TLS backend.
+#[derive(Clone)]
+pub enum TlsServerConfig {
+    Rustls(Arc<rustls::ServerConfig>),
+    Openssl(Arc<openssl::ssl::SslAcceptor>),
+}
+
+/// An accepted TLS stream, regardless of backend.
+pub enum TlsStream<S> {
+    Rustls(Box<tokio_rustls::server::TlsStream<S>>),
+    Openssl(tokio_openssl::SslStream<S>),
+}
+
+impl<S> TlsStream<S> {
+    /// Negotiated ALPN protocol, if the client offered one.
+    pub fn alpn_protocol(&self) -> Option<&[u8]> {
+        match self {
+            Self::Rustls(stream) => stream.get_ref().1.alpn_protocol(),
+            Self::Openssl(stream) => stream.ssl().selected_alpn_protocol(),
+        }
+    }
+
+    /// DER bytes of the verified client certificate.
+    pub fn peer_certificate_der(&self) -> Option<Vec<u8>> {
+        match self {
+            Self::Rustls(stream) => stream
+                .get_ref()
+                .1
+                .peer_certificates()
+                .and_then(|chain| chain.first())
+                .map(|leaf| leaf.as_ref().to_vec()),
+            Self::Openssl(stream) => stream
+                .ssl()
+                .peer_certificate()
+                .and_then(|certificate| certificate.to_der().ok()),
+        }
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for TlsStream<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Rustls(stream) => Pin::new(stream).poll_read(context, buffer),
+            Self::Openssl(stream) => Pin::new(stream).poll_read(context, buffer),
+        }
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for TlsStream<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Rustls(stream) => Pin::new(stream).poll_write(context, buffer),
+            Self::Openssl(stream) => Pin::new(stream).poll_write(context, buffer),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Rustls(stream) => Pin::new(stream).poll_flush(context),
+            Self::Openssl(stream) => Pin::new(stream).poll_flush(context),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Rustls(stream) => Pin::new(stream).poll_shutdown(context),
+            Self::Openssl(stream) => Pin::new(stream).poll_shutdown(context),
+        }
+    }
+}
+
+/// Build the configured backend.
+pub fn server_config_for(
+    options: &ServerOptions<'_>,
+    backend: Backend,
+    min_version: TlsVersion,
+) -> Result<TlsServerConfig, Error> {
+    match backend {
+        Backend::Rustls => Ok(TlsServerConfig::Rustls(Arc::new(
+            server_config_with_options(options)?,
+        ))),
+        Backend::Openssl => Ok(TlsServerConfig::Openssl(Arc::new(
+            openssl_backend::acceptor(options, min_version)?,
+        ))),
+    }
+}
+
+/// Complete the TLS handshake on an accepted socket.
+pub async fn accept<S>(config: &TlsServerConfig, stream: S) -> Result<TlsStream<S>, Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    match config {
+        TlsServerConfig::Rustls(config) => {
+            let acceptor = tokio_rustls::TlsAcceptor::from(config.clone());
+            let stream = acceptor
+                .accept(stream)
+                .await
+                .map_err(|error| Error::Handshake(error.to_string()))?;
+            Ok(TlsStream::Rustls(Box::new(stream)))
+        }
+        TlsServerConfig::Openssl(config) => {
+            let ssl = openssl::ssl::Ssl::new(config.context())
+                .map_err(|error| Error::Handshake(error.to_string()))?;
+            let mut stream = tokio_openssl::SslStream::new(ssl, stream)
+                .map_err(|error| Error::Handshake(error.to_string()))?;
+            Pin::new(&mut stream)
+                .accept()
+                .await
+                .map_err(|error| Error::Handshake(error.to_string()))?;
+            Ok(TlsStream::Openssl(stream))
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("read {path}: {source}")]
@@ -108,6 +253,12 @@ pub enum Error {
 
     #[error("ticket key: {0}")]
     TicketKey(String),
+
+    #[error("TLS handshake failed: {0}")]
+    Handshake(String),
+
+    #[error("unsupported TLS option: {option}")]
+    UnsupportedOption { option: String },
 
     #[error("no certificates in {path}")]
     NoCertificates { path: PathBuf },

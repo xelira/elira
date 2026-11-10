@@ -17,19 +17,18 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream, UnixListener};
 use tokio::sync::{watch, Semaphore};
-use tokio_rustls::TlsAcceptor;
 
 use elira_accesslog::{request_id, Entry};
 use elira_metrics::{CacheResult, Metrics};
 
-use crate::config::{ClientAuthMode, Config, Health, Http3, LogFormat, TlsVersion};
+use crate::config::{ClientAuthMode, Config, Health, Http3, LogFormat, TlsBackend, TlsVersion};
 use crate::proxy::{BoxError, Proxy};
 
 /// Everything that can change on SIGHUP. A connection keeps the runtime it
 /// loaded for its current request; the next request sees the new one.
 pub struct Runtime {
     proxy: Proxy,
-    tls: Option<Arc<rustls::ServerConfig>>,
+    tls: Option<Arc<elira_tls::TlsServerConfig>>,
     config: Config,
     log: LogFormat,
     health: Health,
@@ -64,21 +63,35 @@ impl Runtime {
                 } else {
                     Some((tls.cert.as_path(), tls.key.as_path()))
                 };
-                let config = elira_tls::server_config_with_options(&elira_tls::ServerOptions {
-                    default,
-                    named: &named,
-                    client_ca: tls.client_ca.as_deref(),
-                    client_crl: tls.client_crl.as_deref(),
-                    client_auth: mode,
-                    tls13_only: tls.min_version == TlsVersion::Tls13,
-                    ocsp: tls.ocsp.as_deref(),
-                    cipher_suites: tls.cipher_suites.as_deref(),
-                    curves: tls.curves.as_deref(),
-                    ticket_key: tls.ticket_key.as_deref(),
-                    session_tickets: tls.session_tickets,
-                    session_cache: tls.session_cache,
-                    early_data: 0,
-                })?;
+                let backend = match tls.backend {
+                    TlsBackend::Rustls => elira_tls::Backend::Rustls,
+                    TlsBackend::Openssl => elira_tls::Backend::Openssl,
+                };
+                let min_version = match tls.min_version {
+                    TlsVersion::Tls10 => elira_tls::TlsVersion::Tls10,
+                    TlsVersion::Tls11 => elira_tls::TlsVersion::Tls11,
+                    TlsVersion::Tls12 => elira_tls::TlsVersion::Tls12,
+                    TlsVersion::Tls13 => elira_tls::TlsVersion::Tls13,
+                };
+                let config = elira_tls::server_config_for(
+                    &elira_tls::ServerOptions {
+                        default,
+                        named: &named,
+                        client_ca: tls.client_ca.as_deref(),
+                        client_crl: tls.client_crl.as_deref(),
+                        client_auth: mode,
+                        tls13_only: tls.min_version == TlsVersion::Tls13,
+                        ocsp: tls.ocsp.as_deref(),
+                        cipher_suites: tls.cipher_suites.as_deref(),
+                        curves: tls.curves.as_deref(),
+                        ticket_key: tls.ticket_key.as_deref(),
+                        session_tickets: tls.session_tickets,
+                        session_cache: tls.session_cache,
+                        early_data: 0,
+                    },
+                    backend,
+                    min_version,
+                )?;
                 Some(Arc::new(config))
             }
             None => None,
@@ -137,7 +150,7 @@ impl Runtime {
         self.http3.as_ref()
     }
 
-    pub fn tls(&self) -> Option<&Arc<rustls::ServerConfig>> {
+    pub fn tls(&self) -> Option<&Arc<elira_tls::TlsServerConfig>> {
         self.tls.as_ref()
     }
 
@@ -402,19 +415,18 @@ pub async fn serve_unix(
                     let Some(config) = runtime.load().tls().cloned() else {
                         return;
                     };
-                    let acceptor = TlsAcceptor::from(config);
-                    match tokio::time::timeout(Duration::from_secs(10), acceptor.accept(stream))
-                        .await
+                    match tokio::time::timeout(
+                        Duration::from_secs(10),
+                        elira_tls::accept(&config, stream),
+                    )
+                    .await
                     {
                         Ok(Ok(stream)) => {
                             metrics.tls_handshake(true);
-                            let h2 = stream.get_ref().1.alpn_protocol() == Some(b"h2".as_slice());
+                            let h2 = stream.alpn_protocol() == Some(b"h2".as_slice());
                             let identity = stream
-                                .get_ref()
-                                .1
-                                .peer_certificates()
-                                .and_then(|chain| chain.first())
-                                .and_then(|leaf| elira_tls::ClientIdentity::parse(leaf.as_ref()));
+                                .peer_certificate_der()
+                                .and_then(|leaf| elira_tls::ClientIdentity::parse(&leaf));
                             let conn = ConnOptions {
                                 h2,
                                 secure: true,
@@ -647,19 +659,17 @@ async fn serve_stream(
 
     match tls {
         Some(config) => {
-            let acceptor = TlsAcceptor::from(config);
             // A client that never sends ClientHello must not hold a permit,
             // and with it the accept loop, forever.
-            match tokio::time::timeout(Duration::from_secs(10), acceptor.accept(stream)).await {
+            match tokio::time::timeout(Duration::from_secs(10), elira_tls::accept(&config, stream))
+                .await
+            {
                 Ok(Ok(stream)) => {
                     metrics.tls_handshake(true);
-                    let h2 = stream.get_ref().1.alpn_protocol() == Some(b"h2".as_slice());
+                    let h2 = stream.alpn_protocol() == Some(b"h2".as_slice());
                     let identity = stream
-                        .get_ref()
-                        .1
-                        .peer_certificates()
-                        .and_then(|chain| chain.first())
-                        .and_then(|leaf| elira_tls::ClientIdentity::parse(leaf.as_ref()));
+                        .peer_certificate_der()
+                        .and_then(|leaf| elira_tls::ClientIdentity::parse(&leaf));
                     let conn = ConnOptions { h2, ..conn };
                     serve_conn(
                         stream,

@@ -8,6 +8,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Tls {
+    /// TLS implementation for TCP and unix listeners. HTTP/3 always uses
+    /// rustls because QUIC requires TLS 1.3.
+    #[serde(default)]
+    pub backend: TlsBackend,
+
     /// Empty when omitted; `validate` names the missing field instead of
     /// letting serde report a bare "missing field" with no section context.
     #[serde(default)]
@@ -100,9 +105,19 @@ pub enum ClientAuthMode {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TlsVersion {
+    Tls10,
+    Tls11,
     #[default]
     Tls12,
     Tls13,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TlsBackend {
+    #[default]
+    Rustls,
+    Openssl,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

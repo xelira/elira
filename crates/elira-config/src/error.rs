@@ -510,4 +510,10 @@ pub enum Error {
 
     #[error("route {index}: fastcgi_multiplex needs fastcgi_pass")]
     MultiplexWithoutFastCgi { index: usize },
+
+    #[error("tls.min_version tls10/tls11 needs tls.backend = \"openssl\"")]
+    LegacyTlsNeedsOpenssl,
+
+    #[error("tls.backend = \"openssl\" does not support ticket_key yet")]
+    OpensslTicketKeyUnsupported,
 }

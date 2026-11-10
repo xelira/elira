@@ -1704,6 +1704,43 @@ return = { status = 200, body = "x" }
 }
 
 #[test]
+fn openssl_tls_backend_is_validated() {
+    let base = r#"
+listen = "127.0.0.1:8443"
+
+[tls]
+cert = "/tmp/cert.pem"
+key = "/tmp/key.pem"
+backend = "openssl"
+min_version = "tls10"
+
+[[routes]]
+host = "*"
+return = { status = 200, body = "ok" }
+"#;
+    let cfg = Config::parse(base).expect("valid");
+    assert_eq!(
+        cfg.tls.as_ref().map(|tls| tls.backend),
+        Some(TlsBackend::Openssl)
+    );
+
+    let rustls_legacy = base.replace("backend = \"openssl\"\n", "");
+    assert!(matches!(
+        Config::parse(&rustls_legacy),
+        Err(Error::LegacyTlsNeedsOpenssl)
+    ));
+
+    let ticket = base.replace(
+        "min_version = \"tls10\"",
+        "min_version = \"tls10\"\nticket_key = \"/tmp/ticket\"",
+    );
+    assert!(matches!(
+        Config::parse(&ticket),
+        Err(Error::OpensslTicketKeyUnsupported)
+    ));
+}
+
+#[test]
 fn named_locations_are_validated() {
     let base = r#"
 listen = "127.0.0.1:8080"

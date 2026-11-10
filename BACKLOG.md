@@ -29,6 +29,7 @@ Living list for the self-improvement loop. One item per session.
 - [x] Error pages for local errors and a global fallback.
 - [x] Access-log sampling globally and per route.
 - [x] Per-route mTLS with subject and issuer CN filters.
+- [x] OpenSSL TLS backend for legacy TLS 1.0/1.1 with SNI, mTLS, CRL and OCSP.
 - [x] Per-route rate-limit keys: header, cookie or Authorization.
 - [x] OCSP stapling for SNI certificates on TCP and QUIC.
 - [x] TLS cipher suite and curve policy for TCP and HTTP/3.

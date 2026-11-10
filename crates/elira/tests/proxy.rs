@@ -736,6 +736,118 @@ return = {{ status = 404, body = "no route" }}
     assert_eq!(&echoed, b"ping");
 }
 
+#[tokio::test]
+async fn openssl_backend_serves_tls() {
+    use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
+
+    let fixtures =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../elira-tls/tests/fixtures");
+    let root = temp_root("openssl-tls");
+    std::fs::write(root.join("index.html"), "openssl-ok").unwrap();
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[tls]
+cert = "{}"
+key = "{}"
+backend = "openssl"
+min_version = "tls12"
+
+[[routes]]
+host = "*"
+root = "{}"
+"#,
+        fixtures.join("cert.pem").display(),
+        fixtures.join("key.pem").display(),
+        root.display()
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let response = tokio::task::spawn_blocking(move || {
+        let mut builder = SslConnector::builder(SslMethod::tls_client()).expect("client");
+        builder.set_verify(SslVerifyMode::NONE);
+        let connector = builder.build();
+        let tcp = std::net::TcpStream::connect(addr).expect("connect");
+        let mut stream = connector.connect("localhost", tcp).expect("handshake");
+        std::io::Write::write_all(
+            &mut stream,
+            b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+        )
+        .expect("write");
+        let mut response = Vec::new();
+        std::io::Read::read_to_end(&mut stream, &mut response).expect("read");
+        String::from_utf8_lossy(&response).to_string()
+    })
+    .await
+    .expect("client task");
+
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.contains("openssl-ok"), "{response}");
+}
+
+#[tokio::test]
+async fn openssl_backend_accepts_tls10() {
+    use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode, SslVersion};
+
+    let fixtures =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../elira-tls/tests/fixtures");
+    let root = temp_root("openssl-tls10");
+    std::fs::write(root.join("index.html"), "legacy-ok").unwrap();
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[tls]
+cert = "{}"
+key = "{}"
+backend = "openssl"
+min_version = "tls10"
+
+[[routes]]
+host = "*"
+root = "{}"
+"#,
+        fixtures.join("cert.pem").display(),
+        fixtures.join("key.pem").display(),
+        root.display()
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let response = tokio::task::spawn_blocking(move || {
+        let mut builder = SslConnector::builder(SslMethod::tls_client()).expect("client");
+        builder.set_verify(SslVerifyMode::NONE);
+        builder.set_security_level(0);
+        builder
+            .set_min_proto_version(Some(SslVersion::TLS1))
+            .expect("min");
+        builder
+            .set_max_proto_version(Some(SslVersion::TLS1))
+            .expect("max");
+        builder
+            .set_cipher_list("DEFAULT:@SECLEVEL=0")
+            .expect("ciphers");
+        let connector = builder.build();
+        let tcp = std::net::TcpStream::connect(addr).expect("connect");
+        let mut stream = connector.connect("localhost", tcp).expect("handshake");
+        let version = stream.ssl().version_str().to_owned();
+        std::io::Write::write_all(
+            &mut stream,
+            b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+        )
+        .expect("write");
+        let mut response = Vec::new();
+        std::io::Read::read_to_end(&mut stream, &mut response).expect("read");
+        (version, String::from_utf8_lossy(&response).to_string())
+    })
+    .await
+    .expect("client task");
+
+    assert!(response.0.contains("TLSv1"), "{response:?}");
+    assert!(response.1.starts_with("HTTP/1.1 200"), "{response:?}");
+    assert!(response.1.contains("legacy-ok"), "{response:?}");
+}
+
 fn temp_root(label: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static NEXT: AtomicUsize = AtomicUsize::new(0);
