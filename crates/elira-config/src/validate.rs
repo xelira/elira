@@ -765,6 +765,7 @@ impl Config {
             + usize::from(route.cgi_pass.is_some())
             + usize::from(route.scgi_pass.is_some())
             + usize::from(route.uwsgi_pass.is_some())
+            + usize::from(route.ajp_pass.is_some())
             + usize::from(route.module.is_some())
             + usize::from(route.wasm.is_some());
         if targets == 0 {
@@ -868,6 +869,11 @@ impl Config {
         if let Some(target) = &route.uwsgi_pass {
             if target.trim().is_empty() {
                 return Err(Error::EmptyUwsgiTarget { index });
+            }
+        }
+        if let Some(target) = &route.ajp_pass {
+            if target.trim().is_empty() {
+                return Err(Error::EmptyAjpTarget { index });
             }
         }
         if let Some(module) = &route.module {

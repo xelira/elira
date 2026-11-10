@@ -4731,6 +4731,258 @@ uwsgi_param = ["APP_ENV: test"]
     );
 }
 
+/// A tiny AJP13 responder: parses the ForwardRequest and answers with one
+/// headers packet, one body chunk and END_RESPONSE.
+async fn ajp_upstream() -> SocketAddr {
+    struct Reader<'a> {
+        data: &'a [u8],
+        position: usize,
+    }
+    impl<'a> Reader<'a> {
+        fn u8(&mut self) -> u8 {
+            let value = self.data[self.position];
+            self.position += 1;
+            value
+        }
+        fn u16(&mut self) -> u16 {
+            let value =
+                u16::from_be_bytes([self.data[self.position], self.data[self.position + 1]]);
+            self.position += 2;
+            value
+        }
+        fn bytes(&mut self, length: usize) -> &'a [u8] {
+            let start = self.position;
+            self.position += length;
+            &self.data[start..start + length]
+        }
+        fn string(&mut self) -> String {
+            let length = self.u16() as usize;
+            let value = String::from_utf8_lossy(self.bytes(length)).to_string();
+            self.position += 1;
+            value
+        }
+    }
+
+    fn put_string(buffer: &mut Vec<u8>, value: &str) {
+        buffer.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        buffer.extend_from_slice(value.as_bytes());
+        buffer.push(0);
+    }
+
+    async fn write_packet(stream: &mut TcpStream, payload: &[u8]) {
+        let mut header = vec![b'A', b'B'];
+        header.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        let _ = stream.write_all(&header).await;
+        let _ = stream.write_all(payload).await;
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind ajp");
+    let addr = listener.local_addr().expect("ajp addr");
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut header = [0u8; 4];
+                if stream.read_exact(&mut header).await.is_err() {
+                    return;
+                }
+                if header[0] != 0x12 || header[1] != 0x34 {
+                    return;
+                }
+                let length = u16::from_be_bytes([header[2], header[3]]) as usize;
+                let mut payload = vec![0u8; length];
+                if stream.read_exact(&mut payload).await.is_err() {
+                    return;
+                }
+                let mut reader = Reader {
+                    data: &payload,
+                    position: 0,
+                };
+                if reader.u8() != 2 {
+                    return;
+                }
+                let method = match reader.u8() {
+                    2 => "GET",
+                    4 => "POST",
+                    _ => "OTHER",
+                };
+                let _protocol = reader.string();
+                let uri = reader.string();
+                let _remote_addr = reader.string();
+                let _remote_host = reader.string();
+                let _server_name = reader.string();
+                let _port = reader.u16();
+                let _secure = reader.u8();
+                let header_count = reader.u16();
+
+                let mut content_length = 0usize;
+                for _ in 0..header_count {
+                    let marker = reader.u16();
+                    let name = if marker & 0xFF00 == 0xA000 {
+                        if marker & 0xFF == 0x08 {
+                            "content-length".to_owned()
+                        } else {
+                            "other".to_owned()
+                        }
+                    } else {
+                        let length = marker as usize;
+                        let name = String::from_utf8_lossy(reader.bytes(length)).to_string();
+                        reader.position += 1;
+                        name
+                    };
+                    let value = reader.string();
+                    if name.eq_ignore_ascii_case("content-length") {
+                        content_length = value.parse().unwrap_or(0);
+                    }
+                }
+
+                let mut query = String::new();
+                let mut secret = String::new();
+                loop {
+                    match reader.u8() {
+                        0xFF => break,
+                        0x05 => query = reader.string(),
+                        0x0C => secret = reader.string(),
+                        0x0A => {
+                            let _name = reader.string();
+                            let _value = reader.string();
+                        }
+                        0x01..=0x04 | 0x06..=0x09 | 0x0B | 0x0D => {
+                            let _ = reader.string();
+                        }
+                        _ => return,
+                    }
+                }
+
+                let mut body = Vec::new();
+                if content_length > 0 {
+                    let mut data_header = [0u8; 4];
+                    if stream.read_exact(&mut data_header).await.is_err() {
+                        return;
+                    }
+                    if data_header[0] != 0x12 || data_header[1] != 0x34 {
+                        return;
+                    }
+                    let length = u16::from_be_bytes([data_header[2], data_header[3]]) as usize;
+                    body = vec![0u8; length];
+                    if stream.read_exact(&mut body).await.is_err() {
+                        return;
+                    }
+                }
+                while body.len() < content_length {
+                    let requested = (content_length - body.len()).min(4096) as u16;
+                    let mut pull = vec![6];
+                    pull.extend_from_slice(&requested.to_be_bytes());
+                    write_packet(&mut stream, &pull).await;
+                    let mut data_header = [0u8; 4];
+                    if stream.read_exact(&mut data_header).await.is_err() {
+                        return;
+                    }
+                    if data_header[0] != 0x12 || data_header[1] != 0x34 {
+                        return;
+                    }
+                    let length = u16::from_be_bytes([data_header[2], data_header[3]]) as usize;
+                    if length == 0 {
+                        return;
+                    }
+                    let mut chunk = vec![0u8; length];
+                    if stream.read_exact(&mut chunk).await.is_err() {
+                        return;
+                    }
+                    body.extend_from_slice(&chunk);
+                }
+
+                let text = format!(
+                    "ajp:{method}:{uri}:{query}:{secret}:{}:{}",
+                    body.len(),
+                    String::from_utf8_lossy(&body)
+                );
+                let mut headers_packet = vec![4];
+                headers_packet.extend_from_slice(&200u16.to_be_bytes());
+                put_string(&mut headers_packet, "OK");
+                headers_packet.extend_from_slice(&1u16.to_be_bytes());
+                headers_packet.extend_from_slice(&0xA001u16.to_be_bytes());
+                put_string(&mut headers_packet, "text/plain");
+                write_packet(&mut stream, &headers_packet).await;
+
+                for part in text.as_bytes().chunks(4096) {
+                    let mut chunk = vec![3];
+                    chunk.extend_from_slice(&(part.len() as u16).to_be_bytes());
+                    chunk.extend_from_slice(part);
+                    write_packet(&mut stream, &chunk).await;
+                }
+                write_packet(&mut stream, &[5, 0]).await;
+            });
+        }
+    });
+
+    addr
+}
+
+#[tokio::test]
+async fn ajp_route_talks_the_protocol() {
+    let upstream = ajp_upstream().await;
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[routes]]
+host = "*"
+ajp_pass = "{upstream}"
+ajp_secret = "s3cret"
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let response = roundtrip(
+        addr,
+        "GET /ajp?name=elira HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&response), "HTTP/1.1 200 OK");
+    assert!(
+        response.contains("ajp:GET:/ajp:name=elira:s3cret:0:"),
+        "{response}"
+    );
+
+    let posted = roundtrip(
+        addr,
+        "POST /submit HTTP/1.1\r\nHost: example.com\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndata",
+    )
+    .await;
+    assert!(
+        posted.contains("ajp:POST:/submit::s3cret:4:data"),
+        "{posted}"
+    );
+}
+
+#[tokio::test]
+async fn ajp_pulls_large_request_bodies() {
+    let upstream = ajp_upstream().await;
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[routes]]
+host = "*"
+ajp_pass = "{upstream}"
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let body = "x".repeat(9000);
+    let request = format!(
+        "POST /big HTTP/1.1\r\nHost: example.com\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let response = roundtrip(addr, &request).await;
+    assert!(response.contains("ajp:POST:/big:::9000:"), "{response}");
+    assert!(response.contains(&body), "large body was not forwarded");
+}
+
 #[tokio::test]
 async fn cleartext_http2_is_available_with_prior_knowledge() {
     use http_body_util::Empty;

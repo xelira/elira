@@ -170,6 +170,7 @@
   extended `CONNECT` в HTTP/1.1 `Upgrade` для upstream.
 - SCGI upstream через `scgi_pass`, `scgi_root` и `scgi_param`.
 - uWSGI upstream через `uwsgi_pass`, `uwsgi_modifier1/2` и `uwsgi_param`.
+- AJP13 upstream через `ajp_pass` и `ajp_secret`.
 - `Cache-Control: must-revalidate` запрещает stale-выдачу; `Expires`/`Date`
   задают TTL, если `max-age` нет. Запросы с `no-cache`/`no-store` обходят кэш.
 - Заголовки `Forwarded` и `X-Forwarded-Port` к upstream.

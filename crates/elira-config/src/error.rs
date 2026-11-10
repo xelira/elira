@@ -504,4 +504,7 @@ pub enum Error {
 
     #[error("route {index}: uwsgi_pass is empty")]
     EmptyUwsgiTarget { index: usize },
+
+    #[error("route {index}: ajp_pass is empty")]
+    EmptyAjpTarget { index: usize },
 }

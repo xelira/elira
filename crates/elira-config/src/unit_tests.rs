@@ -1646,6 +1646,36 @@ uwsgi_param = ["APP_ENV: test"]
 }
 
 #[test]
+fn ajp_routes_are_validated() {
+    let base = r#"
+listen = "127.0.0.1:8080"
+
+[[routes]]
+host = "*"
+ajp_pass = "127.0.0.1:8009"
+ajp_secret = "s3cret"
+"#;
+    let cfg = Config::parse(base).expect("valid");
+    assert_eq!(cfg.routes[0].ajp_pass.as_deref(), Some("127.0.0.1:8009"));
+    assert_eq!(cfg.routes[0].ajp_secret.as_deref(), Some("s3cret"));
+
+    let empty = base.replace("127.0.0.1:8009", "");
+    assert!(matches!(
+        Config::parse(&empty),
+        Err(Error::EmptyAjpTarget { .. })
+    ));
+
+    let two = base.replace(
+        "ajp_pass = \"127.0.0.1:8009\"",
+        "ajp_pass = \"127.0.0.1:8009\"\nroot = \"/srv\"",
+    );
+    assert!(matches!(
+        Config::parse(&two),
+        Err(Error::RouteHasTwoTargets { .. })
+    ));
+}
+
+#[test]
 fn named_locations_are_validated() {
     let base = r#"
 listen = "127.0.0.1:8080"

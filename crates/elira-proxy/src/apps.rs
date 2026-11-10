@@ -52,7 +52,7 @@ impl Proxy {
             ("REQUEST_METHOD".to_owned(), method.to_owned()),
             ("REQUEST_URI".to_owned(), parts.uri.to_string()),
             ("QUERY_STRING".to_owned(), query.to_owned()),
-            ("SERVER_NAME".to_owned(), server_name),
+            ("SERVER_NAME".to_owned(), server_name.clone()),
             ("SERVER_PORT".to_owned(), port.to_string()),
             ("REMOTE_ADDR".to_owned(), peer.ip().to_string()),
             ("REMOTE_PORT".to_owned(), peer.port().to_string()),
@@ -191,7 +191,7 @@ impl Proxy {
             ("REQUEST_METHOD".to_owned(), method.to_owned()),
             ("REQUEST_URI".to_owned(), parts.uri.to_string()),
             ("QUERY_STRING".to_owned(), query.to_owned()),
-            ("SERVER_NAME".to_owned(), server_name),
+            ("SERVER_NAME".to_owned(), server_name.clone()),
             ("SERVER_PORT".to_owned(), port.to_string()),
             ("REMOTE_ADDR".to_owned(), peer.ip().to_string()),
             ("REMOTE_PORT".to_owned(), peer.port().to_string()),
@@ -339,7 +339,7 @@ impl Proxy {
             ("REQUEST_METHOD".to_owned(), method.to_owned()),
             ("REQUEST_URI".to_owned(), parts.uri.to_string()),
             ("QUERY_STRING".to_owned(), query.to_owned()),
-            ("SERVER_NAME".to_owned(), server_name),
+            ("SERVER_NAME".to_owned(), server_name.clone()),
             ("SERVER_PORT".to_owned(), port.to_string()),
             ("REMOTE_ADDR".to_owned(), peer.ip().to_string()),
             ("REMOTE_PORT".to_owned(), peer.port().to_string()),
@@ -465,6 +465,46 @@ impl Proxy {
                     Ok(response) => app_result(response.status, response.headers, response.body),
                     Err(err) => {
                         tracing::warn!(error = %err, "uWSGI request failed");
+                        Err(StatusCode::BAD_GATEWAY)
+                    }
+                }
+            }
+            Target::Ajp { target, secret } => {
+                let headers: Vec<(String, String)> = parts
+                    .headers
+                    .iter()
+                    .filter(|(name, _)| !is_hop_by_hop(name))
+                    .filter_map(|(name, value)| {
+                        value
+                            .to_str()
+                            .ok()
+                            .map(|value| (name.as_str().to_owned(), value.to_owned()))
+                    })
+                    .collect();
+                let request = crate::ajp::Request {
+                    method,
+                    protocol: format!("{:?}", parts.version),
+                    uri: path,
+                    query,
+                    remote_addr: peer.ip().to_string(),
+                    server_name: &server_name,
+                    server_port: port,
+                    secure: scheme == "https",
+                    headers: &headers,
+                    secret: secret.as_deref(),
+                    body: &body,
+                };
+                match crate::ajp::execute(
+                    target,
+                    &request,
+                    timeout,
+                    entry.max_response.unwrap_or(self.inner.max_app_response),
+                )
+                .await
+                {
+                    Ok(response) => app_result(response.status, response.headers, response.body),
+                    Err(err) => {
+                        tracing::warn!(error = %err, "AJP request failed");
                         Err(StatusCode::BAD_GATEWAY)
                     }
                 }

@@ -141,7 +141,7 @@ Living list for the self-improvement loop. One item per session.
 - [ ] h2c via `Upgrade: h2c` (hyper cannot inject the upgraded stream 1).
 - [x] SCGI upstreams.
 - [x] uWSGI upstreams.
-- [ ] AJP upstreams.
+- [x] AJP upstreams.
 - [ ] FastCGI multiplexing.
 
 - [ ] `auth_request` subrequests.

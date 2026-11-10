@@ -336,6 +336,15 @@ fn build_target(route: &elira_config::Route, cfg: &Config, pools: &Pools) -> Res
             modifier1: route.uwsgi_modifier1.unwrap_or(0),
             modifier2: route.uwsgi_modifier2.unwrap_or(0),
         }
+    } else if let Some(pass) = &route.ajp_pass {
+        let target = crate::app_target::Target::parse(pass).ok_or_else(|| Error::RouteConfig {
+            host: route.host.clone(),
+            reason: format!("ajp_pass {pass:?} is not host:port or unix:/path"),
+        })?;
+        Target::Ajp {
+            target,
+            secret: route.ajp_secret.clone(),
+        }
     } else if let Some(path) = &route.wasm {
         let module = elira_wasm::WasmModule::load(path).map_err(|err| Error::RouteConfig {
             host: route.host.clone(),

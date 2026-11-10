@@ -202,6 +202,14 @@ pub struct Route {
     #[serde(default)]
     pub uwsgi_param: Vec<String>,
 
+    /// AJP target: `host:port` or `unix:/path`.
+    #[serde(default)]
+    pub ajp_pass: Option<String>,
+
+    /// AJP shared secret sent as the `secret` request attribute.
+    #[serde(default)]
+    pub ajp_secret: Option<String>,
+
     /// CGI script to execute for this route.
     #[serde(default)]
     pub cgi_pass: Option<PathBuf>,

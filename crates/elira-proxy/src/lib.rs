@@ -30,6 +30,7 @@ use elira_tls::ClientIdentity;
 pub mod files;
 
 mod admin;
+mod ajp;
 mod app_target;
 mod apps;
 mod body;
@@ -166,6 +167,10 @@ enum Target {
         target: crate::app_target::Target,
         modifier1: u8,
         modifier2: u8,
+    },
+    Ajp {
+        target: crate::app_target::Target,
+        secret: Option<String>,
     },
     Module(ModuleTarget),
     Wasm(Arc<elira_wasm::WasmModule>),

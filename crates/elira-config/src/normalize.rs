@@ -90,6 +90,8 @@ fn inherit(parent: &Route, child: &mut Route) -> Result<(), Error> {
         child.uwsgi_pass = parent.uwsgi_pass.clone();
         child.uwsgi_modifier1 = parent.uwsgi_modifier1;
         child.uwsgi_modifier2 = parent.uwsgi_modifier2;
+        child.ajp_pass = parent.ajp_pass.clone();
+        child.ajp_secret = parent.ajp_secret.clone();
         child.module = parent.module.clone();
         child.wasm = parent.wasm.clone();
     }
@@ -174,6 +176,7 @@ fn has_target(route: &Route) -> bool {
         || route.cgi_pass.is_some()
         || route.scgi_pass.is_some()
         || route.uwsgi_pass.is_some()
+        || route.ajp_pass.is_some()
         || route.module.is_some()
         || route.wasm.is_some()
 }
@@ -247,6 +250,8 @@ mod tests {
             uwsgi_modifier1: None,
             uwsgi_modifier2: None,
             uwsgi_param: Vec::new(),
+            ajp_pass: None,
+            ajp_secret: None,
             cgi_pass: None,
             module: None,
             module_sandbox: false,

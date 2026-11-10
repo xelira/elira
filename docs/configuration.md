@@ -813,6 +813,8 @@ buckets = [{ percent = 10, value = "a" }, { percent = 90, value = "b" }]
 | `uwsgi_modifier1` | целое 0..255 | `0` | modifier1 в заголовке uWSGI |
 | `uwsgi_modifier2` | целое 0..255 | `0` | modifier2 в заголовке uWSGI |
 | `uwsgi_param` | массив строк | `[]` | дополнительные параметры uWSGI `NAME: value` |
+| `ajp_pass` | строка | нет | AJP13 target: `host:port` или `unix:/path` |
+| `ajp_secret` | строка | нет | общий секрет в атрибуте `secret` |
 | `module` | путь | нет | абсолютный путь к `.so`-модулю |
 | `module_sandbox` | bool | `false` | запускать модуль в дочернем процессе |
 | `wasm` | путь | нет | WebAssembly-модуль как цель маршрута (fuel-бюджет на вызов) |
@@ -972,6 +974,10 @@ buckets = [{ percent = 10, value = "a" }, { percent = 90, value = "b" }]
   Параметры те же, что у SCGI, плюс `uwsgi_param`. Ответ читается как
   CGI-заголовки с телом; поддерживаются `Content-Length`, chunked и закрытие
   соединения. `uwsgi_modifier1` и `uwsgi_modifier2` задают байты заголовка.
+- `ajp_pass` отправляет запрос в Tomcat по AJP13: ForwardRequest, первая
+  порция тела сразу, остальное — по GET_BODY_CHUNK. Ответ собирается из
+  Send Headers / Send Body Chunk / End Response. `ajp_secret` передаётся
+  атрибутом `secret`, если он задан. Соединение не переиспользуется.
 - `alias` работает как `root`, но сначала отрезает литеральный `path` маршрута:
   `path = "/static"` и `alias = "/srv/assets"` отдают
   `/static/app.js` из `/srv/assets/app.js`. `alias` требует `path` и не
