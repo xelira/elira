@@ -22,6 +22,49 @@ impl Proxy {
         vars: &RequestVars,
         peer: SocketAddr,
     ) -> Option<Response<Body>> {
+        if let Some(response) = self.check_always(req, entry, vars, peer).await {
+            return Some(response);
+        }
+
+        if let Some(acl) = &entry.acl {
+            if !acl.allows(peer.ip()) {
+                let mut response = text(StatusCode::FORBIDDEN, "forbidden");
+                self.apply_error_page(&mut response, entry, vars, peer)
+                    .await;
+                return Some(response);
+            }
+        }
+
+        if let Some(auth) = &entry.auth {
+            let header = req
+                .headers()
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok());
+
+            if !auth.check(header) {
+                let mut response = text(StatusCode::UNAUTHORIZED, "authentication required");
+                response.headers_mut().insert(
+                    WWW_AUTHENTICATE,
+                    HeaderValue::from_static("Basic realm=\"elira\""),
+                );
+                self.apply_error_page(&mut response, entry, vars, peer)
+                    .await;
+                return Some(response);
+            }
+        }
+
+        None
+    }
+
+    /// Client certificate, body cap and rate limit are always enforced; they
+    /// are not part of `satisfy`.
+    async fn check_always(
+        &self,
+        req: &Request<Body>,
+        entry: &RouteEntry,
+        vars: &RequestVars,
+        peer: SocketAddr,
+    ) -> Option<Response<Body>> {
         if let Some(rule) = &entry.client_auth {
             if !rule.allows(req.extensions().get::<ClientIdentity>()) {
                 let mut response = text(StatusCode::FORBIDDEN, "client certificate required");
@@ -69,34 +112,78 @@ impl Proxy {
             }
         }
 
+        None
+    }
+
+    /// `satisfy any`: one configured access module must allow the request.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn check_any_access(
+        &self,
+        req: &Request<Body>,
+        entry: &RouteEntry,
+        vars: &RequestVars,
+        peer: SocketAddr,
+        scheme: &'static str,
+        listener: &str,
+    ) -> Result<(), Response<Body>> {
+        if let Some(response) = self.check_always(req, entry, vars, peer).await {
+            return Err(response);
+        }
+
+        let mut configured = false;
+        let mut denials = Vec::new();
+
         if let Some(acl) = &entry.acl {
-            if !acl.allows(peer.ip()) {
-                let mut response = text(StatusCode::FORBIDDEN, "forbidden");
-                self.apply_error_page(&mut response, entry, vars, peer)
-                    .await;
-                return Some(response);
+            configured = true;
+            if acl.allows(peer.ip()) {
+                return Ok(());
             }
+            let mut response = text(StatusCode::FORBIDDEN, "forbidden");
+            self.apply_error_page(&mut response, entry, vars, peer)
+                .await;
+            denials.push(response);
         }
 
         if let Some(auth) = &entry.auth {
+            configured = true;
             let header = req
                 .headers()
                 .get(AUTHORIZATION)
                 .and_then(|value| value.to_str().ok());
+            if auth.check(header) {
+                return Ok(());
+            }
+            let mut response = text(StatusCode::UNAUTHORIZED, "authentication required");
+            response.headers_mut().insert(
+                WWW_AUTHENTICATE,
+                HeaderValue::from_static("Basic realm=\"elira\""),
+            );
+            self.apply_error_page(&mut response, entry, vars, peer)
+                .await;
+            denials.push(response);
+        }
 
-            if !auth.check(header) {
-                let mut response = text(StatusCode::UNAUTHORIZED, "authentication required");
-                response.headers_mut().insert(
-                    WWW_AUTHENTICATE,
-                    HeaderValue::from_static("Basic realm=\"elira\""),
-                );
-                self.apply_error_page(&mut response, entry, vars, peer)
-                    .await;
-                return Some(response);
+        if entry.auth_request.is_some() {
+            configured = true;
+            match self
+                .authorize(req, entry, vars, peer, scheme, listener)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(response) => denials.push(response),
             }
         }
 
-        None
+        if !configured {
+            return Ok(());
+        }
+
+        denials.sort_by_key(|response| match response.status() {
+            StatusCode::UNAUTHORIZED => 0,
+            StatusCode::FORBIDDEN => 1,
+            _ => 2,
+        });
+        Err(denials.remove(0))
     }
 
     /// Serve every target that does not need the upstream pool. `forward`

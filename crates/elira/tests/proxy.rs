@@ -1071,6 +1071,92 @@ return = {{ status = 503, body = "broken" }}
     );
 }
 
+#[tokio::test]
+async fn satisfy_any_accepts_one_access_check() {
+    let upstream = upstream().await;
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "*"
+path = "/any-acl"
+upstream = "app"
+satisfy = "any"
+ip_allow = ["127.0.0.1/32"]
+auth_request = "/deny"
+
+[[routes]]
+host = "*"
+path = "/all-acl"
+upstream = "app"
+ip_allow = ["127.0.0.1/32"]
+auth_request = "/deny"
+
+[[routes]]
+host = "*"
+path = "/any-auth"
+upstream = "app"
+satisfy = "any"
+ip_deny = ["127.0.0.1/32"]
+auth_request = "/allow"
+
+[[routes]]
+host = "*"
+path = "/any-both"
+upstream = "app"
+satisfy = "any"
+ip_deny = ["127.0.0.1/32"]
+auth_request = "/deny"
+
+[[routes]]
+host = "*"
+path = "/allow"
+internal = true
+return = {{ status = 200, body = "ok" }}
+
+[[routes]]
+host = "*"
+path = "/deny"
+internal = true
+return = {{ status = 403, body = "no" }}
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let any_acl = roundtrip(
+        addr,
+        "GET /any-acl HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&any_acl), "HTTP/1.1 200 OK", "{any_acl}");
+
+    let all_acl = roundtrip(
+        addr,
+        "GET /all-acl HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&all_acl), "HTTP/1.1 403 Forbidden", "{all_acl}");
+
+    let any_auth = roundtrip(
+        addr,
+        "GET /any-auth HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&any_auth), "HTTP/1.1 200 OK", "{any_auth}");
+
+    let both = roundtrip(
+        addr,
+        "GET /any-both HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&both), "HTTP/1.1 403 Forbidden", "{both}");
+}
+
 fn temp_root(label: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static NEXT: AtomicUsize = AtomicUsize::new(0);

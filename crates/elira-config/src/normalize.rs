@@ -156,6 +156,7 @@ fn inherit(parent: &Route, child: &mut Route) -> Result<(), Error> {
         .auth_request
         .clone()
         .or_else(|| parent.auth_request.clone());
+    child.satisfy = child.satisfy.or(parent.satisfy);
     inherit_vec(&mut child.fastcgi_param, &parent.fastcgi_param);
     inherit_vec(&mut child.cgi_param, &parent.cgi_param);
     inherit_vec(&mut child.scgi_param, &parent.scgi_param);
@@ -293,6 +294,7 @@ mod tests {
             request_headers: Vec::new(),
             request_remove_headers: Vec::new(),
             auth_request: None,
+            satisfy: None,
         }
     }
 

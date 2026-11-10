@@ -149,7 +149,7 @@ Living list for the self-improvement loop. One item per session.
 - [x] FastCGI multiplexing.
 
 - [x] `auth_request` subrequests.
-- [ ] `satisfy any/all` for auth plus ACL combinations.
+- [x] `satisfy any/all` for auth plus ACL combinations.
 - [ ] `secure_link`.
 - [ ] `X-Accel-Redirect` and `X-Sendfile` from upstream responses.
 - [ ] `error_page` status overrides (`=200`) and named locations.

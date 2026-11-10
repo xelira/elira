@@ -71,6 +71,14 @@ pub enum RouteMatch {
     Exact,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Satisfy {
+    #[default]
+    All,
+    Any,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Route {
@@ -358,6 +366,10 @@ pub struct Route {
     /// Internal URI whose 2xx response authorises this route.
     #[serde(default)]
     pub auth_request: Option<String>,
+
+    /// `all` requires every access check, `any` accepts one.
+    #[serde(default)]
+    pub satisfy: Option<Satisfy>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

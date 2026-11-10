@@ -852,6 +852,7 @@ buckets = [{ percent = 10, value = "a" }, { percent = 90, value = "b" }]
 | `autoindex` | bool | `false` | генерировать листинг каталога |
 | `auth_file` | путь | нет | htpasswd с bcrypt-хешами |
 | `auth_request` | путь | нет | внутренний URI, 2xx которого разрешает запрос |
+| `satisfy` | `all` \| `any` | `all` | все проверки доступа или хотя бы одна |
 | `client_auth` | bool | `false` | требовать проверенный клиентский сертификат |
 | `client_cn` | строка | нет | требуемый CN субъекта сертификата |
 | `client_issuer_cn` | строка | нет | требуемый CN издателя сертификата |
@@ -1001,6 +1002,10 @@ buckets = [{ percent = 10, value = "a" }, { percent = 90, value = "b" }]
   вместе с `WWW-Authenticate`, остальные статусы превращаются в `500`.
   Целевой маршрут обычно помечают `internal = true`; подзапросы не кэшируются
   и не пишутся в access log отдельно.
+- `satisfy = "any"` разрешает запрос, если прошла хотя бы одна проверка
+  доступа: `ip_allow`/`ip_deny`, `auth_file` или `auth_request`. По умолчанию
+  `all` требует все настроенные проверки. `client_auth`, лимит тела и
+  rate-limit выполняются всегда и в `satisfy` не входят.
 - `alias` работает как `root`, но сначала отрезает литеральный `path` маршрута:
   `path = "/static"` и `alias = "/srv/assets"` отдают
   `/static/app.js` из `/srv/assets/app.js`. `alias` требует `path` и не

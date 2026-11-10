@@ -1765,6 +1765,27 @@ auth_request = "/auth"
 }
 
 #[test]
+fn satisfy_is_parsed() {
+    let base = r#"
+listen = "127.0.0.1:8080"
+
+[[routes]]
+host = "*"
+root = "/srv"
+satisfy = "any"
+"#;
+    let cfg = Config::parse(base).expect("valid");
+    assert_eq!(cfg.routes[0].satisfy, Some(Satisfy::Any));
+
+    let default = base.replace("satisfy = \"any\"\n", "");
+    let cfg = Config::parse(&default).expect("valid");
+    assert_eq!(cfg.routes[0].satisfy, None);
+
+    let invalid = base.replace("satisfy = \"any\"", "satisfy = \"some\"");
+    assert!(Config::parse(&invalid).is_err());
+}
+
+#[test]
 fn named_locations_are_validated() {
     let base = r#"
 listen = "127.0.0.1:8080"

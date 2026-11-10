@@ -202,7 +202,8 @@ Routing:
   SPA fallback, directory listings
 - per-route `add_headers`/`remove_headers` for responses and
   `request_headers`/`request_remove_headers` for upstream requests
-- `auth_request` subrequests with `internal` authorisation routes, with
+- `auth_request` subrequests with `internal` authorisation routes
+- `satisfy any` / `satisfy all` for ACL, basic auth and `auth_request`, with
   `$variable` expansion, plus `timeout_secs`, token bucket, concurrency limit,
   body cap and error pages
 - HTTP Basic auth from htpasswd (bcrypt) and IPv4/IPv6 allow/deny lists

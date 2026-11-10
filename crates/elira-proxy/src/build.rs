@@ -209,6 +209,7 @@ pub(crate) fn build_route(
             .filter_map(|name| HeaderName::from_bytes(name.as_bytes()).ok())
             .collect(),
         auth_request: route.auth_request.clone(),
+        satisfy: route.satisfy.unwrap_or_default(),
         if_conditions,
         auth,
         acl,

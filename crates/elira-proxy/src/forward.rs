@@ -12,7 +12,7 @@ use http::header::{
 use http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
 use http_body_util::{BodyExt, Full};
 
-use elira_config::Balance;
+use elira_config::{Balance, Satisfy};
 
 use crate::*;
 
@@ -246,11 +246,19 @@ impl Proxy {
             return Ok(response);
         }
 
-        if let Some(response) = self.check_access(&req, entry, &vars, peer).await {
-            return Err(response);
+        match entry.satisfy {
+            Satisfy::All => {
+                if let Some(response) = self.check_access(&req, entry, &vars, peer).await {
+                    return Err(response);
+                }
+                self.authorize(&req, entry, &vars, peer, scheme, listener)
+                    .await?;
+            }
+            Satisfy::Any => {
+                self.check_any_access(&req, entry, &vars, peer, scheme, listener)
+                    .await?;
+            }
         }
-        self.authorize(&req, entry, &vars, peer, scheme, listener)
-            .await?;
 
         let (buffered, body_limit_hit) = self.prepare_body(&mut req, entry, &vars, peer).await?;
 
