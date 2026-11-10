@@ -412,3 +412,26 @@ fn upgrade_needs_both_headers() {
         Some(HeaderValue::from_static("websocket"))
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn rate_limit_body_spaces_chunks() {
+    let payload = Bytes::from(vec![0u8; 32 * 1024]);
+    let body = http_body_util::Full::new(payload)
+        .map_err(|never| -> BoxError { match never {} })
+        .boxed();
+    let mut body = rate_limit_body(body, 1024, 0);
+    let started = tokio::time::Instant::now();
+    let mut total = 0;
+    while let Some(frame) = body.frame().await {
+        let frame = frame.expect("frame");
+        if let Ok(data) = frame.into_data() {
+            total += data.len();
+        }
+    }
+    let elapsed = started.elapsed();
+    assert_eq!(total, 32 * 1024);
+    assert!(
+        elapsed >= Duration::from_secs(30),
+        "32 KiB at 1 KiB/s took {elapsed:?}"
+    );
+}

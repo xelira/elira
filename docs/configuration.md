@@ -185,6 +185,8 @@ upstream. Нужен `error_root`; задавать их можно только
 | `idle_timeout_secs` | целое, секунды | `60` | закрытие простаивающего keep-alive соединения |
 | `keepalive_requests` | целое ≥ 0 | `1000` | закрыть соединение после стольких запросов; `0` — без предела |
 | `max_body_bytes` | целое ≥ 0 | `0` | `413`, если `Content-Length` больше; `0` — без лимита |
+| `limit_rate` | целое ≥ 0 | `0` | байт/сек на ответ; `0` выключает |
+| `limit_rate_after` | целое ≥ 0 | `0` | сколько байт отдать без ограничения |
 | `requests_per_second` | целое ≥ 0 | `0` | токенов в секунду на IP; `0` — лимит выключен |
 | `burst` | целое ≥ 0 | `0` | запас токенов; `0` — равен `requests_per_second` |
 | `trusted_proxies` | список CIDR | `[]` | кому разрешено дополнять `X-Forwarded-For` |
@@ -234,6 +236,10 @@ upstream. Нужен `error_root`; задавать их можно только
   фактические байты и обрывает запрос с `413`, когда предел превышен. Это
   работает и для проксирования, и для FastCGI/CGI/module: лимит применяется
   до того, как тело уйдёт дальше.
+- `limit_rate` ограничивает скорость отдачи ответа в байтах в секунду для
+  проксирования, статики и приложений. `limit_rate_after` освобождает первые
+  байты от ограничения. Маршрут может переопределить оба значения
+  (`limit_rate = 0` отключает лимит для маршрута).
 - `max_upstream_response_bytes` защищает от «тяжёлого» бэкенда. Если
   `Content-Length` уже больше лимита, клиент сразу получает `502 upstream
   response too large`; иначе поток обрывается на том же пределе. `0` выключает
@@ -960,6 +966,8 @@ buckets = [{ percent = 10, value = "a" }, { percent = 90, value = "b" }]
 | `burst` | целое ≥ 0 | равен rate | глубина bucket'а маршрута |
 | `rate_key` | строка | `"ip"` | ключ лимита: `ip`, `authorization`, `header:NAME`, `cookie:NAME`, `uri` |
 | `max_body_bytes` | целое ≥ 0 | глобальный лимит | свой предел `Content-Length` |
+| `limit_rate` | целое ≥ 0 | `limits.limit_rate` | свой байт/сек на ответ; `0` выключает |
+| `limit_rate_after` | целое ≥ 0 | `limits.limit_rate_after` | свой бесплатный префикс |
 | `max_response_bytes` | целое > 0 | `limits.max_response_bytes` | свой предел потокового ответа |
 | `max_upstream_response_bytes` | целое > 0 | `limits.max_upstream_response_bytes` | свой предел ответа upstream'а |
 | `cache_enabled` | bool | глобальный | использовать ли общий кэш для маршрута |

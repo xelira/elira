@@ -115,6 +115,8 @@ fn inherit(parent: &Route, child: &mut Route) -> Result<(), Error> {
     child.max_upstream_response_bytes = child
         .max_upstream_response_bytes
         .or(parent.max_upstream_response_bytes);
+    child.limit_rate = child.limit_rate.or(parent.limit_rate);
+    child.limit_rate_after = child.limit_rate_after.or(parent.limit_rate_after);
     child.fastcgi_pool_idle = child.fastcgi_pool_idle.or(parent.fastcgi_pool_idle);
     child.fastcgi_multiplex |= parent.fastcgi_multiplex;
     child.cache_enabled = child.cache_enabled.or(parent.cache_enabled);
@@ -304,6 +306,8 @@ mod tests {
             max_body_bytes: None,
             max_response_bytes: None,
             max_upstream_response_bytes: None,
+            limit_rate: None,
+            limit_rate_after: None,
             fastcgi_pool_idle: None,
             fastcgi_multiplex: false,
             cache_enabled: None,

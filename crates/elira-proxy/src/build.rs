@@ -361,6 +361,13 @@ pub(crate) fn build_route(
         timeout: route.timeout_secs.map(Duration::from_secs),
         connect_timeout: route.connect_timeout_secs.map(Duration::from_secs),
         send_timeout: route.send_timeout_secs.map(Duration::from_secs),
+        rate: route
+            .limit_rate
+            .or(Some(cfg.limits.limit_rate))
+            .filter(|rate| *rate > 0),
+        rate_after: route
+            .limit_rate_after
+            .unwrap_or(cfg.limits.limit_rate_after),
         limiter,
         rate_key: parse_request_key(route.rate_key.as_deref()),
         body_limit: route.max_body_bytes,

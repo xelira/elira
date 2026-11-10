@@ -234,6 +234,8 @@ Upstreams:
 - separate upstream connect, send-idle and response-header deadlines, with
   per-route overrides
 - client keep-alive request caps via `limits.keepalive_requests`
+- response bandwidth throttling (`limit_rate`/`limit_rate_after`) and per-IP
+  connection limits
 - upstream keepalive pool sizing and idle lifetime (`keepalive`,
   `keepalive_secs`)
 - a shared DNS cache with positive/negative TTLs and static host overrides for

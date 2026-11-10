@@ -183,6 +183,97 @@ pub fn timeout_body(body: Body, idle: Duration) -> Body {
     .boxed()
 }
 
+/// Spread a response body over time at roughly `rate` bytes per second. The
+/// first `after` bytes are sent without delay, matching `limit_rate_after`.
+pub fn rate_limit_body(body: Body, rate: u64, after: u64) -> Body {
+    if rate == 0 {
+        return body;
+    }
+    RateBody {
+        inner: body,
+        rate,
+        after,
+        sent: 0,
+        pending: None,
+        started: tokio::time::Instant::now(),
+        delay: None,
+    }
+    .boxed()
+}
+
+struct RateBody {
+    inner: Body,
+    rate: u64,
+    after: u64,
+    sent: u64,
+    pending: Option<Bytes>,
+    started: tokio::time::Instant,
+    delay: Option<Pin<Box<Sleep>>>,
+}
+
+impl HttpBody for RateBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        let this = self.get_mut();
+
+        if let Some(delay) = &mut this.delay {
+            match delay.as_mut().poll(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(()) => this.delay = None,
+            }
+        }
+
+        if let Some(data) = this.pending.take() {
+            return this.emit(data);
+        }
+
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(err))),
+            Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                Ok(data) => this.emit(data),
+                Err(frame) => Poll::Ready(Some(Ok(frame))),
+            },
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream() && self.pending.is_none()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl RateBody {
+    fn emit(&mut self, data: Bytes) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        const CHUNK: usize = 16 * 1024;
+        let take = data.len().min(CHUNK);
+        let mut head = data;
+        let tail = head.split_off(take);
+        if !tail.is_empty() {
+            self.pending = Some(tail);
+        }
+        self.sent = self.sent.saturating_add(head.len() as u64);
+        if self.rate > 0 {
+            let billable = self.sent.saturating_sub(self.after);
+            let target = Duration::from_secs_f64(billable as f64 / self.rate as f64);
+            let deadline = self.started + target;
+            if deadline > tokio::time::Instant::now() {
+                self.delay = Some(Box::pin(tokio::time::sleep_until(deadline)));
+            }
+        }
+        Poll::Ready(Some(Ok(Frame::data(head))))
+    }
+}
+
 /// A body that errors after `limit` data bytes.
 /// Write a fully known response body to an unlinked temporary file and return
 /// a body that reads it back. This releases the upstream connection before a

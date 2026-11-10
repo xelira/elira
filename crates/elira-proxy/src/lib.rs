@@ -256,6 +256,8 @@ struct RouteEntry {
     timeout: Option<Duration>,
     connect_timeout: Option<Duration>,
     send_timeout: Option<Duration>,
+    rate: Option<u64>,
+    rate_after: u64,
     limiter: Option<Arc<RateLimiter>>,
     rate_key: RequestKey,
     body_limit: Option<usize>,

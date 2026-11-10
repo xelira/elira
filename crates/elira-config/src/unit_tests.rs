@@ -2250,6 +2250,32 @@ cache_zone = "api"
 }
 
 #[test]
+fn rate_limits_are_validated() {
+    let base = r#"
+listen = "127.0.0.1:8080"
+
+[limits]
+limit_rate = 1000
+limit_rate_after = 100
+
+[[upstreams]]
+name = "app"
+servers = ["127.0.0.1:9000"]
+
+[[routes]]
+host = "*"
+upstream = "app"
+limit_rate = 2000
+limit_rate_after = 0
+"#;
+    let cfg = Config::parse(base).expect("valid config");
+    assert_eq!(cfg.limits.limit_rate, 1000);
+    assert_eq!(cfg.limits.limit_rate_after, 100);
+    assert_eq!(cfg.routes[0].limit_rate, Some(2000));
+    assert_eq!(cfg.routes[0].limit_rate_after, Some(0));
+}
+
+#[test]
 fn named_locations_are_validated() {
     let base = r#"
 listen = "127.0.0.1:8080"

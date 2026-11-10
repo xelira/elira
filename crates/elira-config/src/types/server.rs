@@ -75,6 +75,10 @@ pub struct Limits {
     #[serde(default = "Limits::default_max_connections")]
     pub max_connections: usize,
 
+    /// Concurrent connections allowed per client IP. Zero disables the limit.
+    #[serde(default)]
+    pub limit_conn_per_ip: usize,
+
     /// Close a keep-alive connection after this many requests. Zero disables
     /// the cap.
     #[serde(default = "Limits::default_keepalive_requests")]
@@ -89,6 +93,14 @@ pub struct Limits {
     /// A chunked body is not checked here.
     #[serde(default)]
     pub max_body_bytes: usize,
+
+    /// Throttle every response to this many bytes per second. Zero disables.
+    #[serde(default)]
+    pub limit_rate: u64,
+
+    /// Send this many bytes of a response before `limit_rate` starts.
+    #[serde(default)]
+    pub limit_rate_after: u64,
 
     /// Token bucket per client IP. Zero disables the limiter.
     #[serde(default)]
@@ -222,8 +234,11 @@ impl Default for Limits {
             upstream_send_timeout_secs: 0,
             keepalive_requests: Self::default_keepalive_requests(),
             max_connections: Self::default_max_connections(),
+            limit_conn_per_ip: 0,
             idle_timeout_secs: Self::default_idle_timeout_secs(),
             max_body_bytes: 0,
+            limit_rate: 0,
+            limit_rate_after: 0,
             requests_per_second: 0,
             burst: 0,
             trusted_proxies: Vec::new(),

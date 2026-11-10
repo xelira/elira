@@ -343,6 +343,14 @@ pub struct Route {
     #[serde(default)]
     pub max_upstream_response_bytes: Option<usize>,
 
+    /// Overrides `limits.limit_rate` for this route.
+    #[serde(default)]
+    pub limit_rate: Option<u64>,
+
+    /// Overrides `limits.limit_rate_after` for this route.
+    #[serde(default)]
+    pub limit_rate_after: Option<u64>,
+
     /// Idle FastCGI connections kept for this route's backend.
     #[serde(default)]
     pub fastcgi_pool_idle: Option<usize>,

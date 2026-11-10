@@ -3,9 +3,10 @@
 //! This lives in the library rather than in `main` so tests can bind port 0
 //! and drive the real server instead of a simplified copy of it.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
@@ -184,11 +185,65 @@ impl Runtime {
     }
 }
 
+/// Counts open client connections per IP for `limits.limit_conn_per_ip`.
+pub(crate) struct ConnLimiter {
+    limit: usize,
+    active: Mutex<HashMap<std::net::IpAddr, usize>>,
+}
+
+impl ConnLimiter {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            active: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn acquire(self: &Arc<Self>, ip: std::net::IpAddr) -> Option<ConnGuard> {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let count = active.entry(ip).or_insert(0);
+        if *count >= self.limit {
+            return None;
+        }
+        *count += 1;
+        Some(ConnGuard {
+            limiter: self.clone(),
+            ip,
+        })
+    }
+}
+
+pub(crate) struct ConnGuard {
+    limiter: Arc<ConnLimiter>,
+    ip: std::net::IpAddr,
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        let mut active = self
+            .limiter
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(count) = active.get_mut(&self.ip) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                active.remove(&self.ip);
+            }
+        }
+    }
+}
+
 /// What the accept loop needs. Everything here is captured at startup and a
 /// reload cannot change it.
 #[derive(Clone)]
 pub struct Options {
     pub max_connections: usize,
+    pub limit_conn_per_ip: usize,
+    pub(crate) conn_limiter: Option<Arc<ConnLimiter>>,
     pub max_headers: usize,
     pub max_buf_size: usize,
     pub idle_timeout: Duration,
@@ -211,6 +266,9 @@ impl Options {
     pub fn from_config(cfg: &Config) -> Self {
         Self {
             max_connections: cfg.limits.max_connections,
+            limit_conn_per_ip: cfg.limits.limit_conn_per_ip,
+            conn_limiter: (cfg.limits.limit_conn_per_ip > 0)
+                .then(|| Arc::new(ConnLimiter::new(cfg.limits.limit_conn_per_ip))),
             max_headers: cfg.limits.max_headers,
             max_buf_size: cfg.limits.max_header_bytes,
             idle_timeout: Duration::from_secs(cfg.limits.idle_timeout_secs),
@@ -550,6 +608,17 @@ async fn serve_stream(
             }
         }
     }
+
+    let _conn_guard = match &options.conn_limiter {
+        Some(limiter) => match limiter.acquire(peer.ip()) {
+            Some(guard) => Some(guard),
+            None => {
+                tracing::debug!(%peer, "per-IP connection limit reached");
+                return;
+            }
+        },
+        None => None,
+    };
 
     let conn = ConnOptions {
         max_headers: options.max_headers,

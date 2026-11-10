@@ -668,6 +668,51 @@ upstream = "app"
 }
 
 #[tokio::test]
+async fn limit_conn_per_ip_rejects_extra_connections() {
+    let upstream = fixed_upstream("ok").await;
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[limits]
+limit_conn_per_ip = 1
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "*"
+upstream = "app"
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+    let request = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+
+    let mut first = TcpStream::connect(addr).await.expect("first connection");
+    first
+        .write_all(request.as_bytes())
+        .await
+        .expect("write first");
+    let response = read_http_response(&mut first).await;
+    assert_eq!(status(&response), "HTTP/1.1 200 OK", "{response}");
+
+    let mut second = TcpStream::connect(addr).await.expect("second connection");
+    second
+        .write_all(request.as_bytes())
+        .await
+        .expect("write second");
+    let mut buf = [0u8; 1];
+    let result = tokio::time::timeout(Duration::from_secs(1), second.read(&mut buf)).await;
+    assert!(
+        matches!(result, Ok(Ok(0)) | Ok(Err(_))),
+        "the second connection should be closed, got {result:?}"
+    );
+
+    drop(first);
+}
+
+#[tokio::test]
 async fn websocket_upgrade_is_tunnelled() {
     let upstream = upstream().await;
     let config = NO_DEFAULT.replace("{upstream}", &upstream.to_string());

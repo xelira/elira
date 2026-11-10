@@ -270,7 +270,7 @@ impl Proxy {
         let pool = match &entry.target {
             Target::Proxy(pool) => pool,
             _ => {
-                return self
+                let response = self
                     .serve_non_proxy(
                         req,
                         entry,
@@ -282,6 +282,10 @@ impl Proxy {
                         &body_limit_hit,
                     )
                     .await;
+                return response.map(|mut response| {
+                    self.throttle(&mut response, entry);
+                    response
+                });
             }
         };
         let path = req
@@ -440,26 +444,44 @@ impl Proxy {
             )
             .await?;
 
-        self.finalize_response(
-            response,
-            pool,
-            entry,
-            &vars,
-            &request_id,
-            peer,
-            is_head,
-            is_get,
-            requested_upgrade.as_ref(),
-            encoding,
-            cache_allowed,
-            &cache_key,
-            &request_headers,
-            proxy_permit,
-            scheme,
-            listener,
-            internal_count,
-        )
-        .await
+        let result = self
+            .finalize_response(
+                response,
+                pool,
+                entry,
+                &vars,
+                &request_id,
+                peer,
+                is_head,
+                is_get,
+                requested_upgrade.as_ref(),
+                encoding,
+                cache_allowed,
+                &cache_key,
+                &request_headers,
+                proxy_permit,
+                scheme,
+                listener,
+                internal_count,
+            )
+            .await;
+        result.map(|mut response| {
+            self.throttle(&mut response, entry);
+            response
+        })
+    }
+
+    /// Apply `limit_rate` to a completed response. The wrapper pauses between
+    /// chunks, so it does not need to know the body length up front.
+    fn throttle(&self, response: &mut Response<Body>, entry: &RouteEntry) {
+        let Some(rate) = entry.rate else {
+            return;
+        };
+        if response.status().is_informational() {
+            return;
+        }
+        let body = std::mem::replace(response.body_mut(), empty());
+        *response.body_mut() = rate_limit_body(body, rate, entry.rate_after);
     }
 
     fn request_vars(
