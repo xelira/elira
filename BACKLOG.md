@@ -153,7 +153,8 @@ Living list for the self-improvement loop. One item per session.
 - [x] `secure_link`.
 - [x] `X-Accel-Redirect` and `X-Sendfile` from upstream responses.
 - [x] `error_page` status overrides (`=200`).
-- [ ] `error_page` named locations (`@name`).
+- [x] `error_page` named locations (`@name`) for static, `return` and
+  `redirect` targets.
 - [x] `if_modified_since off` (response headers are already applied to every
   status, matching `add_header ... always`).
 

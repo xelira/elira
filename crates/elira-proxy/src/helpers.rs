@@ -403,27 +403,29 @@ pub(crate) fn headers_within_limits(
 }
 
 pub(crate) fn error_page_set(
-    root: std::path::PathBuf,
+    root: Option<std::path::PathBuf>,
     index: Vec<String>,
     pages: &[String],
 ) -> Vec<ErrorPage> {
     if pages.is_empty() {
         return Vec::new();
     }
-    let files = Arc::new(Files::new(
-        root,
-        None,
-        index,
-        false,
-        Vec::new(),
-        false,
-        false,
-        0,
-        None,
-        true,
-        true,
-        None,
-    ));
+    let files = root.map(|root| {
+        Arc::new(Files::new(
+            root,
+            None,
+            index,
+            false,
+            Vec::new(),
+            false,
+            false,
+            0,
+            None,
+            true,
+            true,
+            None,
+        ))
+    });
     let mut out = Vec::new();
     for page in pages {
         let mut parts = page.split_whitespace();
@@ -447,6 +449,7 @@ pub(crate) fn error_page_set(
             status,
             path: path.to_owned(),
             files: files.clone(),
+            named: None,
             override_status,
         });
     }

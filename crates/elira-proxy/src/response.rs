@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use http::header::{ALT_SVC, CONTENT_LENGTH, CONTENT_TYPE, SERVER, WWW_AUTHENTICATE};
+use http::header::{ALT_SVC, CONTENT_LENGTH, CONTENT_TYPE, LOCATION, SERVER, WWW_AUTHENTICATE};
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
 
@@ -48,6 +48,56 @@ impl Proxy {
         response
     }
 
+    /// Serve a route-level `error_page ... @name` target. Only static,
+    /// `return` and `redirect` named locations are supported; a named proxy
+    /// location needs the full request pipeline and is left to the default
+    /// error page.
+    async fn named_error_page(
+        &self,
+        target: &Target,
+        vars: &RequestVars,
+        peer: SocketAddr,
+    ) -> Option<Response<Body>> {
+        match target {
+            Target::Files(files) => {
+                let request = Request::builder()
+                    .method(Method::GET)
+                    .uri(vars.path.clone())
+                    .body(empty())
+                    .ok()?;
+                Some(files.serve(&request, peer).await)
+            }
+            Target::Return {
+                status,
+                body,
+                content_type,
+            } => {
+                let rendered = vars.render(body);
+                let body = if rendered.is_empty() {
+                    empty()
+                } else {
+                    Full::new(Bytes::from(rendered))
+                        .map_err(|never| -> BoxError { match never {} })
+                        .boxed()
+                };
+                let mut response = Response::builder().status(*status).body(body).ok()?;
+                if let Some(content_type) = content_type {
+                    if let Ok(value) = HeaderValue::from_str(&vars.render(content_type)) {
+                        response.headers_mut().insert(CONTENT_TYPE, value);
+                    }
+                }
+                Some(response)
+            }
+            Target::Redirect { status, location } => {
+                let location = HeaderValue::from_str(&vars.render(location)).ok()?;
+                let mut response = Response::builder().status(*status).body(empty()).ok()?;
+                response.headers_mut().insert(LOCATION, location);
+                Some(response)
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) async fn apply_page(
         &self,
         response: &mut Response<Body>,
@@ -70,20 +120,31 @@ impl Proxy {
         let Some(page) = page else {
             return;
         };
-        let path = match vars {
-            Some(vars) => vars.render(&page.path),
-            None => page.path.clone(),
+        let mut page_response = if let Some(target) = &page.named {
+            let Some(vars) = vars else {
+                return;
+            };
+            let Some(response) = self.named_error_page(target, vars, peer).await else {
+                return;
+            };
+            response
+        } else {
+            let path = match vars {
+                Some(vars) => vars.render(&page.path),
+                None => page.path.clone(),
+            };
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri(path)
+                .body(empty());
+            let Ok(request) = request else {
+                return;
+            };
+            let Some(files) = &page.files else {
+                return;
+            };
+            files.serve(&request, peer).await
         };
-
-        let request = Request::builder()
-            .method(Method::GET)
-            .uri(path)
-            .body(empty());
-        let Ok(request) = request else {
-            return;
-        };
-
-        let mut page_response = page.files.serve(&request, peer).await;
         if let Some(override_status) = page.override_status {
             *page_response.status_mut() = override_status;
         } else if page_response.status().is_success() {

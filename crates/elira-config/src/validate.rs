@@ -1156,9 +1156,10 @@ impl Config {
                 }
                 path = parts.next().unwrap_or_default();
             }
+            let named = path.starts_with('@') && path.len() > 1;
             if status.parse::<u16>().is_err()
                 || !(100..=599).contains(&status.parse::<u16>().unwrap_or(0))
-                || !path.starts_with('/')
+                || !(path.starts_with('/') || named)
                 || path.contains("..")
             {
                 return Err(Error::BadErrorPage {

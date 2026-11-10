@@ -250,10 +250,24 @@ pub(crate) fn build_route(
     let limiter = build_limiter(route);
 
     let error_root = route.error_root.clone().or_else(|| route.root.clone());
-    let error_pages = match error_root {
-        Some(root) => error_page_set(root, route.index.clone(), &route.error_pages),
-        None => Vec::new(),
-    };
+    let mut error_pages = error_page_set(error_root, route.index.clone(), &route.error_pages);
+    for page in &mut error_pages {
+        let Some(name) = page.path.strip_prefix('@') else {
+            continue;
+        };
+        let Some(named_route) = cfg.routes.iter().find(|route| {
+            route
+                .name
+                .as_deref()
+                .map(|name| name.trim_start_matches('@'))
+                == Some(name)
+        }) else {
+            continue;
+        };
+        if let Ok(target) = build_target(named_route, cfg, pools, file_cache) {
+            page.named = Some(Arc::new(target));
+        }
+    }
 
     let app_permits = match &target {
         Target::FastCgi { .. } | Target::Cgi { .. } | Target::Scgi { .. } | Target::Module(_) => {

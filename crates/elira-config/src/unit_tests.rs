@@ -2442,6 +2442,30 @@ root = "/srv"
 }
 
 #[test]
+fn named_error_pages_are_validated() {
+    let base = r#"
+listen = "127.0.0.1:8080"
+
+[[routes]]
+host = "*"
+root = "/srv"
+error_pages = ["404 @fallback"]
+
+[[routes]]
+host = "*"
+name = "@fallback"
+return = { status = 200, body = "fallback" }
+"#;
+    Config::parse(base).expect("named error page");
+
+    let empty = base.replace("@fallback\"]", "@\"]");
+    assert!(matches!(
+        Config::parse(&empty),
+        Err(Error::BadErrorPage { .. })
+    ));
+}
+
+#[test]
 fn named_locations_are_validated() {
     let base = r#"
 listen = "127.0.0.1:8080"

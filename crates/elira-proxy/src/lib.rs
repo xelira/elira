@@ -180,7 +180,9 @@ pub struct Proxy {
 pub(crate) struct ErrorPage {
     pub(crate) status: StatusCode,
     pub(crate) path: String,
-    pub(crate) files: Arc<Files>,
+    pub(crate) files: Option<Arc<Files>>,
+    /// Target of a named location referenced as `@name`.
+    pub(crate) named: Option<Arc<Target>>,
     pub(crate) override_status: Option<StatusCode>,
 }
 
@@ -582,7 +584,7 @@ impl Proxy {
                 max_upstream_response: cfg.limits.max_upstream_response_bytes,
                 error_pages: match &cfg.error_root {
                     Some(root) => error_page_set(
-                        root.clone(),
+                        Some(root.clone()),
                         vec!["index.html".to_owned()],
                         &cfg.error_pages,
                     ),
