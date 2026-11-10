@@ -2296,6 +2296,24 @@ root = "/srv"
 }
 
 #[test]
+fn workers_accept_auto() {
+    let base = r#"
+listen = "127.0.0.1:8080"
+workers = "auto"
+reuse_port = true
+
+[[routes]]
+host = "*"
+root = "/srv"
+"#;
+    let cfg = Config::parse(base).expect("auto workers");
+    assert!((1..=64).contains(&cfg.workers));
+
+    let bad = base.replace("workers = \"auto\"", "workers = \"many\"");
+    assert!(matches!(Config::parse(&bad), Err(Error::Toml(_))));
+}
+
+#[test]
 fn named_locations_are_validated() {
     let base = r#"
 listen = "127.0.0.1:8080"

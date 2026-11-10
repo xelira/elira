@@ -184,7 +184,7 @@ Living list for the self-improvement loop. One item per session.
 - [ ] `lingering_close` and `reset_timedout_connection`.
 - [x] Log reopen on SIGUSR1 for external rotation.
 - [x] `open_file_cache` for static metadata.
-- [ ] `worker_rlimit_nofile` propagation tuning and `worker_processes auto`.
+- [x] `worker_rlimit_nofile` before worker spawn and `workers = "auto"`.
 
 ### Section 5 — HTTP details
 

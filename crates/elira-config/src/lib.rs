@@ -17,6 +17,31 @@ use load::load_value;
 use normalize::expand_locations;
 pub use types::*;
 
+fn deserialize_workers<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Value {
+        Count(usize),
+        Word(String),
+    }
+
+    match Value::deserialize(deserializer)? {
+        Value::Count(count) => Ok(count),
+        Value::Word(word) if word.eq_ignore_ascii_case("auto") => {
+            Ok(std::thread::available_parallelism()
+                .map(|count| count.get())
+                .unwrap_or(1)
+                .min(64))
+        }
+        Value::Word(word) => Err(serde::de::Error::custom(format!(
+            "workers must be a number or \"auto\", got {word:?}"
+        ))),
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -67,8 +92,12 @@ pub struct Config {
     pub h2c: bool,
 
     /// Worker processes sharing the listener via SO_REUSEPORT. One process is
-    /// the default; more needs `reuse_port = true`.
-    #[serde(default = "Config::default_workers")]
+    /// the default; more needs `reuse_port = true`. The string `"auto"` uses
+    /// the available CPU count, capped at 64.
+    #[serde(
+        default = "Config::default_workers",
+        deserialize_with = "deserialize_workers"
+    )]
     pub workers: usize,
 
     /// Drop to this user after binding sockets. A name or `uid:gid`.

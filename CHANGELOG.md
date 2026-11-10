@@ -145,6 +145,7 @@
 - `limits.client_header_timeout_secs`.
 - `open_file_cache`/`open_file_cache_ttl_secs` для метаданных статики.
 - `rate_delay` для задержки запросов сверх `requests_per_second`.
+- `workers = "auto"` для числа воркеров по доступным CPU.
 - `GET /config` на админском листенере: эффективный конфиг в JSON.
 - Тесты FastCGI/CGI на обрезанные заголовки, длину записи, padding и хвост
   после `END_REQUEST`.

@@ -127,7 +127,7 @@ tls = true   # использует общий [tls] или [acme]
 | `worker_cpu_affinity` | массив CPU | нет | привязать воркеры к CPU по кругу |
 | `chroot` | путь | нет | войти в jail до загрузки runtime-файлов |
 | `pid_file` | путь | нет | записать PID супервизора или single-process |
-| `workers` | 1..64 | `1` | процессы-воркеры с SO_REUSEPORT; нужен `reuse_port = true` |
+| `workers` | `1..64` или `"auto"` | `1` | процессы-воркеры с SO_REUSEPORT; нужен `reuse_port = true` |
 | `proxy_protocol` | bool | `false` | ждать PROXY protocol (v1/v2) на каждом соединении |
 | `reuse_port` | bool | `false` | SO_REUSEPORT; нужен для hot restart по SIGUSR2 |
 | `sendfile` | bool | `true` | zero-copy статика на Linux через `sendfile(2)` |
