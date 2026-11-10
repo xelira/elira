@@ -132,6 +132,12 @@ pub enum Error {
     #[error("resolver: host \"{name}\" is defined twice")]
     DuplicateResolverHost { name: String },
 
+    #[error("cache zone name must not be empty or contain whitespace")]
+    BadCacheZone { name: String },
+
+    #[error("route {index}: cache_zone \"{zone}\" is not defined")]
+    UnknownCacheZone { index: usize, zone: String },
+
     #[error("workers must be between 1 and 64")]
     BadWorkers,
 

@@ -10,10 +10,20 @@ use crate::*;
 impl Config {
     pub(crate) fn validate(&self) -> Result<(), Error> {
         let listener_names = self.validate_server()?;
+        self.validate_cache()?;
         self.validate_resolver()?;
         self.validate_tls()?;
         let upstream_names = self.validate_upstreams()?;
         self.validate_routes(&listener_names, &upstream_names)?;
+        Ok(())
+    }
+
+    fn validate_cache(&self) -> Result<(), Error> {
+        for name in self.cache.zones.keys() {
+            if name.trim().is_empty() || name.chars().any(char::is_whitespace) {
+                return Err(Error::BadCacheZone { name: name.clone() });
+            }
+        }
         Ok(())
     }
 
@@ -976,6 +986,14 @@ impl Config {
         }
         if route.cache_ttl_secs == Some(0) {
             return Err(Error::BadRouteCacheTtl { index });
+        }
+        if let Some(zone) = &route.cache_zone {
+            if !self.cache.zones.contains_key(zone) {
+                return Err(Error::UnknownCacheZone {
+                    index,
+                    zone: zone.clone(),
+                });
+            }
         }
         if route
             .cache_key

@@ -213,6 +213,7 @@ Routing:
 - per-status cache TTLs with `cache_valid`
 - `cache_key` templates and `cache_bypass` variables
 - response caching for FastCGI, CGI and module targets
+- named cache zones with independent budgets, directories and stale windows
 - upstream response header hiding/passing, `Location`/`Refresh` redirects and
   `Set-Cookie` domain/path rewrites, with
   `$variable` expansion, plus `timeout_secs`, token bucket, concurrency limit,

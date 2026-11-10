@@ -357,6 +357,11 @@ pub struct Route {
     #[serde(default)]
     pub cache_enabled: Option<bool>,
 
+    /// Named cache zone from `[cache.zones.NAME]`. Empty uses the default
+    /// `[cache]` zone.
+    #[serde(default)]
+    pub cache_zone: Option<String>,
+
     /// Overrides the cache TTL for this route.
     #[serde(default)]
     pub cache_ttl_secs: Option<u64>,

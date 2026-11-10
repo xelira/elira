@@ -647,6 +647,12 @@ loopback или под `auth_file`.
 | `shared` | bool | `false` | читать записи других процессов из `dir` |
 | `stale_secs` | целое ≥ 0 | `0` | отдавать протухшее тело, пока идёт обновление |
 
+`[cache.zones.NAME]` задаёт отдельную зону с независимыми `max_bytes`,
+`max_item_bytes`, `ttl_secs`, `dir`, `stale_secs` и `shared`. Маршрут выбирает
+зону через `cache_zone`; без него используется обычный `[cache]`. `cache_enabled
+= false` на маршруте отключает кэш независимо от зоны. У каждой зоны свои
+бюджет, вытеснение и загрузка дискового каталога при старте.
+
 Кэшируются только `200 OK` на `GET` с известным `Content-Length` не больше
 `max_item_bytes`, без `Set-Cookie` и без `Cache-Control: no-store/private`.
 Ответы с неизвестной длиной не кэшируются: тело не буферизуется.
@@ -957,6 +963,7 @@ buckets = [{ percent = 10, value = "a" }, { percent = 90, value = "b" }]
 | `max_response_bytes` | целое > 0 | `limits.max_response_bytes` | свой предел потокового ответа |
 | `max_upstream_response_bytes` | целое > 0 | `limits.max_upstream_response_bytes` | свой предел ответа upstream'а |
 | `cache_enabled` | bool | глобальный | использовать ли общий кэш для маршрута |
+| `cache_zone` | строка | обычный `[cache]` | именованная зона `[cache.zones.NAME]` |
 | `cache_ttl_secs` | целое > 0 | глобальный | свой TTL записей маршрута |
 | `cache_key` | строка | `$host$uri` | шаблон ключа кэша |
 | `cache_bypass` | массив строк | `[]` | переменные, обходящие кэш при непустом/`0` значении |

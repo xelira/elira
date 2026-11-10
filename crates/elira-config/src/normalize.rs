@@ -118,6 +118,10 @@ fn inherit(parent: &Route, child: &mut Route) -> Result<(), Error> {
     child.fastcgi_pool_idle = child.fastcgi_pool_idle.or(parent.fastcgi_pool_idle);
     child.fastcgi_multiplex |= parent.fastcgi_multiplex;
     child.cache_enabled = child.cache_enabled.or(parent.cache_enabled);
+    child.cache_zone = child
+        .cache_zone
+        .clone()
+        .or_else(|| parent.cache_zone.clone());
     child.cache_ttl_secs = child.cache_ttl_secs.or(parent.cache_ttl_secs);
     child.cache_key = child.cache_key.clone().or_else(|| parent.cache_key.clone());
     inherit_vec(&mut child.cache_bypass, &parent.cache_bypass);
@@ -303,6 +307,7 @@ mod tests {
             fastcgi_pool_idle: None,
             fastcgi_multiplex: false,
             cache_enabled: None,
+            cache_zone: None,
             cache_ttl_secs: None,
             cache_key: None,
             cache_bypass: Vec::new(),

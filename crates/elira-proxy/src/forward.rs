@@ -348,7 +348,7 @@ impl Proxy {
         let mut body = Some(body);
 
         let cache_allowed =
-            entry.cache != Some(false) && !auth_subrequest && !accel_redirect && !cache_bypass;
+            entry.cache.is_some() && !auth_subrequest && !accel_redirect && !cache_bypass;
         let mut _cache_flight: Option<CacheFlightGuard> = None;
         if is_get && requested_upgrade.is_none() && cache_allowed {
             let (hit, flight) = self
@@ -693,7 +693,7 @@ impl Proxy {
         peer: SocketAddr,
     ) -> (Option<Response<Body>>, Option<CacheFlightGuard>) {
         let mut flight = None;
-        if let Some(cache) = &self.inner.cache {
+        if let Some(cache) = &entry.cache {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
             loop {
                 let now = Instant::now();
@@ -760,6 +760,7 @@ impl Proxy {
                             connect_timeout,
                             peer,
                             entry.cache_ttl_for(cached_status),
+                            entry.cache_max_item,
                         );
                     }
                     self.apply_route(&mut response, entry, vars, request_id);
@@ -1076,15 +1077,14 @@ impl Proxy {
             .iter()
             .any(|valid| valid.statuses.contains(&status_code));
         let store_ttl = entry.cache_ttl_for(status_code);
-        let cacheable = self.inner.cache.is_some()
+        let cacheable = entry.cache.is_some()
             && cache_allowed
             && is_get
             && requested_upgrade.is_none()
             && (status_code == StatusCode::OK.as_u16() || explicitly_valid)
             && upstream_len
                 .map(|length| {
-                    length <= self.inner.cache_max_item
-                        && (response_cap == 0 || length <= response_cap)
+                    length <= entry.cache_max_item && (response_cap == 0 || length <= response_cap)
                 })
                 .unwrap_or(false)
             && cacheable_response(&parts.headers);
@@ -1098,7 +1098,7 @@ impl Proxy {
                 }
             };
 
-            if let Some(cache) = &self.inner.cache {
+            if let Some(cache) = &entry.cache {
                 cache.insert_with_ttl(
                     cache_key,
                     request_headers,
@@ -1187,7 +1187,7 @@ impl Proxy {
             .body(body)
             .map_err(|_| text(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"))?;
 
-        if self.inner.cache.is_some() && cache_allowed && is_get && requested_upgrade.is_none() {
+        if entry.cache.is_some() && cache_allowed && is_get && requested_upgrade.is_none() {
             response
                 .headers_mut()
                 .insert("x-cache", HeaderValue::from_static("MISS"));

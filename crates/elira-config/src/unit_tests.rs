@@ -2211,6 +2211,45 @@ upstream = "app"
 }
 
 #[test]
+fn cache_zones_are_validated() {
+    let base = r#"
+listen = "127.0.0.1:8080"
+
+[cache]
+enabled = true
+
+[cache.zones.api]
+max_bytes = 4096
+max_item_bytes = 1024
+ttl_secs = 10
+
+[[upstreams]]
+name = "app"
+servers = ["127.0.0.1:9000"]
+
+[[routes]]
+host = "*"
+upstream = "app"
+cache_zone = "api"
+"#;
+    let cfg = Config::parse(base).expect("valid config");
+    assert_eq!(cfg.cache.zones["api"].max_bytes, 4096);
+    assert_eq!(cfg.routes[0].cache_zone.as_deref(), Some("api"));
+
+    let unknown = base.replace("cache_zone = \"api\"", "cache_zone = \"missing\"");
+    assert!(matches!(
+        Config::parse(&unknown),
+        Err(Error::UnknownCacheZone { .. })
+    ));
+
+    let bad_name = base.replace("[cache.zones.api]", "[cache.zones.\"bad name\"]");
+    assert!(matches!(
+        Config::parse(&bad_name),
+        Err(Error::BadCacheZone { .. })
+    ));
+}
+
+#[test]
 fn named_locations_are_validated() {
     let base = r#"
 listen = "127.0.0.1:8080"

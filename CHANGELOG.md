@@ -139,6 +139,7 @@
   `max_item_bytes`.
 - `limits.keepalive_requests` для ограничения запросов на клиентском
   keep-alive соединении.
+- Именованные зоны кэша `[cache.zones.NAME]` и маршрутный `cache_zone`.
 - `GET /config` на админском листенере: эффективный конфиг в JSON.
 - Тесты FastCGI/CGI на обрезанные заголовки, длину записи, padding и хвост
   после `END_REQUEST`.

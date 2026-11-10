@@ -137,9 +137,8 @@ struct Inner {
     max_body_bytes: usize,
     max_headers: usize,
     max_header_bytes: usize,
-    cache: Option<Arc<Cache>>,
+    caches: Vec<Arc<Cache>>,
     cache_flights: Arc<CacheFlights>,
-    cache_max_item: usize,
     limiter: Option<Arc<RateLimiter>>,
     trusted_proxies: Vec<ipnet::IpNet>,
     timeout: Duration,
@@ -266,7 +265,8 @@ struct RouteEntry {
     max_response: Option<usize>,
     fastcgi_pool: Option<Arc<elira_fastcgi::Pool>>,
     fastcgi_mux: Option<Arc<elira_fastcgi::MultiplexPool>>,
-    cache: Option<bool>,
+    cache: Option<Arc<Cache>>,
+    cache_max_item: usize,
     cache_ttl: Option<Duration>,
     cache_key: Option<String>,
     cache_bypass: Vec<String>,
@@ -425,10 +425,14 @@ impl Proxy {
     pub fn new(cfg: &Config) -> Result<Self, Error> {
         let resolver = build_resolver(cfg);
         let (pools, all_pools) = build_pools(cfg, resolver.clone())?;
+        let caches = build_caches(cfg);
 
         let mut entries: Vec<(RouteEntry, Vec<String>)> = Vec::new();
         for route in &cfg.routes {
-            entries.push((build_route(route, cfg, &pools)?, route.listeners.clone()));
+            entries.push((
+                build_route(route, cfg, &pools, &caches)?,
+                route.listeners.clone(),
+            ));
         }
 
         let routers = build_routers(cfg, entries);
@@ -436,19 +440,6 @@ impl Proxy {
         let geos = build_geos(cfg);
         let splits = build_splits(cfg);
         let connect = build_connect(cfg)?;
-
-        let cache = if cfg.cache.enabled {
-            Some(Arc::new(Cache::with_shared_disk(
-                cfg.cache.max_bytes,
-                Duration::from_secs(cfg.cache.ttl_secs),
-                cfg.cache.dir.clone(),
-                Duration::from_secs(cfg.cache.stale_secs),
-                cfg.cache.shared,
-            )))
-        } else {
-            None
-        };
-        let cache_max_item = cfg.cache.max_item_bytes;
 
         let mut connector = HttpConnector::new();
         connector.set_connect_timeout(Some(Duration::from_secs(5)));
@@ -490,9 +481,8 @@ impl Proxy {
                 max_body_bytes: cfg.limits.max_body_bytes,
                 max_headers: cfg.limits.max_headers,
                 max_header_bytes: cfg.limits.max_header_bytes,
-                cache,
+                caches: caches.all,
                 cache_flights: Arc::new(CacheFlights::new()),
-                cache_max_item,
                 limiter,
                 trusted_proxies,
                 timeout: Duration::from_secs(cfg.limits.upstream_timeout_secs),

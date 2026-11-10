@@ -19,6 +19,52 @@ use crate::*;
 
 type Pools = HashMap<String, Arc<Pool>>;
 
+#[derive(Clone)]
+pub(crate) struct Caches {
+    pub(crate) default: Option<Arc<Cache>>,
+    pub(crate) zones: HashMap<String, Arc<Cache>>,
+    pub(crate) all: Vec<Arc<Cache>>,
+}
+
+pub(crate) fn build_caches(cfg: &Config) -> Caches {
+    let default = cfg.cache.enabled.then(|| {
+        Arc::new(Cache::with_shared_disk(
+            cfg.cache.max_bytes,
+            Duration::from_secs(cfg.cache.ttl_secs),
+            cfg.cache.dir.clone(),
+            Duration::from_secs(cfg.cache.stale_secs),
+            cfg.cache.shared,
+        ))
+    });
+    let zones: HashMap<String, Arc<Cache>> = cfg
+        .cache
+        .zones
+        .iter()
+        .map(|(name, zone)| {
+            (
+                name.clone(),
+                Arc::new(Cache::with_shared_disk(
+                    zone.max_bytes,
+                    Duration::from_secs(zone.ttl_secs),
+                    zone.dir.clone(),
+                    Duration::from_secs(zone.stale_secs),
+                    zone.shared,
+                )),
+            )
+        })
+        .collect();
+    let mut all = Vec::with_capacity(zones.len() + 1);
+    if let Some(cache) = &default {
+        all.push(cache.clone());
+    }
+    all.extend(zones.values().cloned());
+    Caches {
+        default,
+        zones,
+        all,
+    }
+}
+
 pub(crate) fn build_resolver(cfg: &Config) -> elira_upstream::Resolver {
     elira_upstream::Resolver::new(elira_upstream::ResolverOptions {
         ttl: Duration::from_secs(cfg.resolver.ttl_secs),
@@ -178,8 +224,19 @@ pub(crate) fn build_route(
     route: &elira_config::Route,
     cfg: &Config,
     pools: &Pools,
+    caches: &Caches,
 ) -> Result<RouteEntry, Error> {
     let target = build_target(route, cfg, pools)?;
+    let (cache, cache_max_item) = if route.cache_enabled == Some(false) {
+        (None, 0)
+    } else if let Some(name) = &route.cache_zone {
+        match (caches.zones.get(name), cfg.cache.zones.get(name)) {
+            (Some(cache), Some(zone)) => (Some(cache.clone()), zone.max_item_bytes),
+            _ => (None, 0),
+        }
+    } else {
+        (caches.default.clone(), cfg.cache.max_item_bytes)
+    };
 
     let auth = build_auth(route)?;
 
@@ -311,7 +368,8 @@ pub(crate) fn build_route(
         app_permits,
         proxy_permits,
         max_response: route.max_response_bytes,
-        cache: route.cache_enabled,
+        cache,
+        cache_max_item,
         cache_ttl: route.cache_ttl_secs.map(Duration::from_secs),
         cache_key: route.cache_key.clone(),
         cache_bypass: route.cache_bypass.clone(),

@@ -191,6 +191,7 @@ impl Proxy {
         connect_timeout: Duration,
         peer: SocketAddr,
         cache_ttl: Option<Duration>,
+        max_item: usize,
     ) {
         {
             let mut refreshing = self
@@ -204,7 +205,6 @@ impl Proxy {
         }
 
         let inflight = self.inner.refreshing.clone();
-        let max_item = self.inner.cache_max_item;
         tokio::spawn(async move {
             let Some(index) = pool.pick() else {
                 inflight

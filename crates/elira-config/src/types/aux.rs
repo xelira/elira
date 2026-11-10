@@ -1,5 +1,6 @@
 //! Cache and access-log settings.
 
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
 
@@ -74,6 +75,27 @@ pub struct Cache {
     /// eviction remains per process.
     #[serde(default)]
     pub shared: bool,
+
+    /// Named cache zones referenced by `cache_zone` on a route.
+    #[serde(default)]
+    pub zones: HashMap<String, CacheZone>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CacheZone {
+    #[serde(default = "Cache::default_ttl_secs")]
+    pub ttl_secs: u64,
+    #[serde(default = "Cache::default_max_bytes")]
+    pub max_bytes: usize,
+    #[serde(default = "Cache::default_max_item_bytes")]
+    pub max_item_bytes: usize,
+    #[serde(default)]
+    pub dir: Option<PathBuf>,
+    #[serde(default)]
+    pub stale_secs: u64,
+    #[serde(default)]
+    pub shared: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -125,6 +147,7 @@ impl Default for Cache {
             dir: None,
             stale_secs: 0,
             shared: false,
+            zones: HashMap::new(),
         }
     }
 }

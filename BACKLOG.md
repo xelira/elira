@@ -161,7 +161,7 @@ Living list for the self-improvement loop. One item per session.
 
 - [x] Per-status cache TTL (`proxy_cache_valid`).
 - [x] Cache key and bypass directives.
-- [ ] Cache zones, manager/loader.
+- [x] Cache zones with independent budgets, eviction and disk loading.
 - [x] FastCGI/CGI response caching.
 - [x] Upstream client certificates, upstream CRL and upstream cipher policy.
 - [x] Separate connect/send/read timeouts.

@@ -9,25 +9,35 @@ use crate::*;
 impl Proxy {
     /// Drop every cached response. Returns false when caching is disabled.
     pub fn purge_cache(&self) -> bool {
-        match &self.inner.cache {
-            Some(cache) => {
-                cache.purge();
-                true
-            }
-            None => false,
+        if self.inner.caches.is_empty() {
+            return false;
         }
+        for cache in &self.inner.caches {
+            cache.purge();
+        }
+        true
     }
 
     /// Drop cached responses whose host+path starts with `prefix`.
     pub fn purge_cache_prefix(&self, prefix: &str) -> usize {
-        match &self.inner.cache {
-            Some(cache) => cache.purge_prefix(prefix),
-            None => 0,
-        }
+        self.inner
+            .caches
+            .iter()
+            .map(|cache| cache.purge_prefix(prefix))
+            .sum()
     }
 
     pub fn cache_stats(&self) -> Option<(usize, usize)> {
-        self.inner.cache.as_ref().map(|cache| cache.stats())
+        if self.inner.caches.is_empty() {
+            return None;
+        }
+        let (mut bytes, mut entries) = (0, 0);
+        for cache in &self.inner.caches {
+            let (cache_bytes, cache_entries) = cache.stats();
+            bytes += cache_bytes;
+            entries += cache_entries;
+        }
+        Some((bytes, entries))
     }
 
     /// The current pools and their servers, for the admin status endpoint.

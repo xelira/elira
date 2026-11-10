@@ -4507,6 +4507,68 @@ upstream = "app"
     assert!(response.ends_with("resolved"), "{response}");
 }
 
+#[tokio::test]
+async fn cache_zones_keep_their_own_item_limits() {
+    let upstream = fixed_upstream("payload").await;
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[cache]
+enabled = true
+max_bytes = 1048576
+max_item_bytes = 8192
+ttl_secs = 60
+
+[cache.zones.tiny]
+max_bytes = 1048576
+max_item_bytes = 1
+ttl_secs = 60
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "*"
+path = "/default"
+upstream = "app"
+
+[[routes]]
+host = "*"
+path = "/tiny"
+upstream = "app"
+cache_zone = "tiny"
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let request = |path: &str| {
+        format!("GET {path} HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
+    };
+    let first = roundtrip(addr, &request("/default")).await;
+    assert!(
+        first.to_ascii_lowercase().contains("x-cache: miss"),
+        "{first}"
+    );
+    let second = roundtrip(addr, &request("/default")).await;
+    assert!(
+        second.to_ascii_lowercase().contains("x-cache: hit"),
+        "{second}"
+    );
+
+    let first = roundtrip(addr, &request("/tiny")).await;
+    assert!(
+        !first.to_ascii_lowercase().contains("x-cache: hit"),
+        "{first}"
+    );
+    let second = roundtrip(addr, &request("/tiny")).await;
+    assert!(
+        !second.to_ascii_lowercase().contains("x-cache: hit"),
+        "{second}"
+    );
+}
+
 /// An upstream that varies its answer by Accept-Language and says so.
 async fn vary_upstream() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0")

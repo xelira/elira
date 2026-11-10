@@ -373,13 +373,11 @@ impl Proxy {
             .path_and_query()
             .map(|value| value.as_str().to_owned())
             .unwrap_or_else(|| "/".to_owned());
-        let cache_key = (entry.cache != Some(false)
-            && req.method() == Method::GET
-            && self.inner.cache.is_some()
-            && !cache_bypass(entry, vars))
-        .then(|| cache_key_for(entry, vars, &vars.host, &path));
+        let cache_key =
+            (entry.cache.is_some() && req.method() == Method::GET && !cache_bypass(entry, vars))
+                .then(|| cache_key_for(entry, vars, &vars.host, &path));
 
-        if let (Some(cache), Some(key)) = (&self.inner.cache, &cache_key) {
+        if let (Some(cache), Some(key)) = (&entry.cache, &cache_key) {
             if let Some(hit) = cache.get(key, &request_headers, Instant::now()) {
                 let mut response = cache_response(hit);
                 response
@@ -413,7 +411,7 @@ impl Proxy {
         self.apply_error_page(&mut response, entry, vars, peer)
             .await;
 
-        if let (Some(cache), Some(key)) = (&self.inner.cache, &cache_key) {
+        if let (Some(cache), Some(key)) = (&entry.cache, &cache_key) {
             let status = response.status().as_u16();
             let explicitly_valid = entry
                 .cache_valid
@@ -425,7 +423,7 @@ impl Proxy {
             {
                 let ttl = entry.cache_ttl_for(status);
                 let (parts, mut body) = response.into_parts();
-                let limit = self.inner.cache_max_item;
+                let limit = entry.cache_max_item;
                 let mut chunks: Vec<Bytes> = Vec::new();
                 let mut total = 0usize;
                 let mut overflow = None;
