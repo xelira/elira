@@ -333,8 +333,9 @@ upstream. Нужен `error_root`; задавать их можно только
   для `min_version = "tls10"` или `"tls11"`; rustls такие версии не умеет и
   загрузка с ними падает. OpenSSL-бэкенд поддерживает SNI-сертификаты, mTLS,
   CRL, OCSP, ALPN, `cipher_suites`, `curves`, `session_tickets` и
-  `session_cache`. `ticket_key` пока не поддерживается и отклоняется при
-  загрузке. HTTP/3 всегда остаётся на rustls, потому что QUIC требует TLS 1.3.
+  `session_cache`. Общий `ticket_key` тоже поддерживается: файл из 32 байт
+  детерминированно раскладывается в ключи OpenSSL. HTTP/3 всегда остаётся на
+  rustls, потому что QUIC требует TLS 1.3.
 - `cipher_suites` и `curves` задаются именами из rustls, например
   `TLS13_AES_128_GCM_SHA256`, `TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256`,
   `X25519`, `secp256r1`. Списки задают и порядок предпочтения. Пустой список

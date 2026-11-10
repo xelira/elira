@@ -849,6 +849,60 @@ root = "{}"
 }
 
 #[tokio::test]
+async fn openssl_ticket_key_builds_and_serves() {
+    use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
+
+    let fixtures =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../elira-tls/tests/fixtures");
+    let root = temp_root("openssl-ticket");
+    std::fs::write(root.join("index.html"), "ticket-ok").unwrap();
+    let ticket_key = root.join("ticket.key");
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[tls]
+cert = "{}"
+key = "{}"
+backend = "openssl"
+min_version = "tls12"
+ticket_key = "{}"
+
+[[routes]]
+host = "*"
+root = "{}"
+"#,
+        fixtures.join("cert.pem").display(),
+        fixtures.join("key.pem").display(),
+        ticket_key.display(),
+        root.display()
+    );
+    let (first_addr, _first_stop, _first_metrics) = start(&config).await;
+
+    let response = tokio::task::spawn_blocking(move || {
+        let mut builder = SslConnector::builder(SslMethod::tls_client()).expect("client");
+        builder.set_verify(SslVerifyMode::NONE);
+        let connector = builder.build();
+
+        let tcp = std::net::TcpStream::connect(first_addr).expect("connect");
+        let mut stream = connector.connect("localhost", tcp).expect("handshake");
+        std::io::Write::write_all(
+            &mut stream,
+            b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+        )
+        .expect("write");
+        let mut response = Vec::new();
+        std::io::Read::read_to_end(&mut stream, &mut response).expect("read");
+        String::from_utf8_lossy(&response).to_string()
+    })
+    .await
+    .expect("client task");
+
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.contains("ticket-ok"), "{response}");
+}
+
+#[tokio::test]
 async fn openssl_backend_selects_sni_certificates() {
     use openssl::nid::Nid;
     use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};

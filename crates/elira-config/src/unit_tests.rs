@@ -1734,10 +1734,7 @@ return = { status = 200, body = "ok" }
         "min_version = \"tls10\"",
         "min_version = \"tls10\"\nticket_key = \"/tmp/ticket\"",
     );
-    assert!(matches!(
-        Config::parse(&ticket),
-        Err(Error::OpensslTicketKeyUnsupported)
-    ));
+    assert!(Config::parse(&ticket).is_ok());
 }
 
 #[test]

@@ -174,7 +174,7 @@
 - `CONNECT` поверх HTTP/3 с прямым туннелем QUIC-потока.
 - FastCGI multiplexing через `fastcgi_multiplex`.
 - OpenSSL TLS backend (`tls.backend = "openssl"`) с TLS 1.0/1.1/1.2/1.3,
-  SNI, mTLS, CRL и OCSP.
+  SNI, mTLS, CRL, OCSP и общим `ticket_key`.
 - `Cache-Control: must-revalidate` запрещает stale-выдачу; `Expires`/`Date`
   задают TTL, если `max-age` нет. Запросы с `no-cache`/`no-store` обходят кэш.
 - Заголовки `Forwarded` и `X-Forwarded-Port` к upstream.

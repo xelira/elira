@@ -17,6 +17,7 @@ use openssl::x509::store::X509StoreBuilder;
 use openssl::x509::verify::X509VerifyFlags;
 use openssl::x509::X509;
 
+use crate::ticket;
 use crate::{ClientAuth, Error, ServerOptions, TlsVersion};
 
 const ALPN: &[u8] = b"\x02h2\x08http/1.1";
@@ -25,6 +26,8 @@ pub fn acceptor(
     options: &ServerOptions<'_>,
     min_version: TlsVersion,
 ) -> Result<SslAcceptor, Error> {
+    let ticket_key = options.ticket_key.map(crate::load_ticket_key).transpose()?;
+
     let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls_server())
         .map_err(|error| handshake(error.to_string()))?;
     configure(
@@ -46,7 +49,11 @@ pub fn acceptor(
             cert.ocsp.as_deref(),
             min_version,
         )?;
-        named.push((cert.names.clone(), Arc::new(context.build())));
+        let context = context.build();
+        if let Some(key) = &ticket_key {
+            ticket::install(&context, key)?;
+        }
+        named.push((cert.names.clone(), Arc::new(context)));
     }
     let named = Arc::new(named);
 
@@ -70,7 +77,11 @@ pub fn acceptor(
         Ok(())
     });
 
-    Ok(builder.build())
+    let acceptor = builder.build();
+    if let Some(key) = &ticket_key {
+        ticket::install(acceptor.context(), key)?;
+    }
+    Ok(acceptor)
 }
 
 fn configure(

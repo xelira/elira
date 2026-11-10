@@ -900,7 +900,9 @@ name = "elira-tls"
 version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
+ "foreign-types-shared",
  "openssl",
+ "openssl-sys",
  "rustls",
  "rustls-pemfile",
  "thiserror",

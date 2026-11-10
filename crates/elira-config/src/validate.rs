@@ -463,9 +463,6 @@ impl Config {
             {
                 return Err(Error::LegacyTlsNeedsOpenssl);
             }
-            if tls.backend == TlsBackend::Openssl && tls.ticket_key.is_some() {
-                return Err(Error::OpensslTicketKeyUnsupported);
-            }
             let has_cert = !tls.cert.as_os_str().is_empty();
             let has_key = !tls.key.as_os_str().is_empty();
             if has_cert != has_key {

@@ -25,6 +25,7 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 mod openssl_backend;
+mod ticket;
 
 /// A certificate that answers for a set of Server Name Indication values.
 #[derive(Debug, Clone)]
