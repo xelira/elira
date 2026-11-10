@@ -1786,6 +1786,38 @@ satisfy = "any"
 }
 
 #[test]
+fn secure_link_is_validated() {
+    let base = r#"
+listen = "127.0.0.1:8080"
+
+[[routes]]
+host = "*"
+root = "/srv"
+secure_link = { secret = "s3cret", md5 = "$arg_md5", expires = "$arg_expires" }
+"#;
+    let cfg = Config::parse(base).expect("valid");
+    assert!(cfg.routes[0].secure_link.is_some());
+
+    let no_secret = base.replace("secret = \"s3cret\"", "secret = \"\"");
+    assert!(matches!(
+        Config::parse(&no_secret),
+        Err(Error::BadSecureLink { .. })
+    ));
+
+    let no_expires = base.replace(", expires = \"$arg_expires\"", "");
+    assert!(matches!(
+        Config::parse(&no_expires),
+        Err(Error::BadSecureLink { .. })
+    ));
+
+    let path_form = base.replace(
+        "secure_link = { secret = \"s3cret\", md5 = \"$arg_md5\", expires = \"$arg_expires\" }",
+        "secure_link = { secret = \"s3cret\" }",
+    );
+    assert!(Config::parse(&path_form).is_ok());
+}
+
+#[test]
 fn named_locations_are_validated() {
     let base = r#"
 listen = "127.0.0.1:8080"

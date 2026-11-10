@@ -1053,6 +1053,12 @@ impl Config {
             }
         }
 
+        if let Some(link) = &route.secure_link {
+            if link.secret.is_empty() || link.md5.is_some() != link.expires.is_some() {
+                return Err(Error::BadSecureLink { index });
+            }
+        }
+
         for value in route.ip_allow.iter().chain(route.ip_deny.iter()) {
             value.parse::<ipnet::IpNet>().map_err(|_| Error::BadAcl {
                 index,

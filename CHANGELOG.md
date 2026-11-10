@@ -173,6 +173,7 @@
 - AJP13 upstream через `ajp_pass` и `ajp_secret`.
 - `auth_request` с внутренними маршрутами авторизации.
 - `satisfy any/all` для ACL, `auth_file` и `auth_request`.
+- `secure_link` с query- и path-формой, base64url/hex и сроком действия.
 - `CONNECT` поверх HTTP/3 с прямым туннелем QUIC-потока.
 - FastCGI multiplexing через `fastcgi_multiplex`.
 - OpenSSL TLS backend (`tls.backend = "openssl"`) с TLS 1.0/1.1/1.2/1.3,

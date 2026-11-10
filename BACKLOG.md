@@ -150,7 +150,7 @@ Living list for the self-improvement loop. One item per session.
 
 - [x] `auth_request` subrequests.
 - [x] `satisfy any/all` for auth plus ACL combinations.
-- [ ] `secure_link`.
+- [x] `secure_link`.
 - [ ] `X-Accel-Redirect` and `X-Sendfile` from upstream responses.
 - [ ] `error_page` status overrides (`=200`) and named locations.
 - [ ] `if_modified_since off` (response headers are already applied to every

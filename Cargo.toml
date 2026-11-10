@@ -65,6 +65,8 @@ ipnet = "2"
 socket2 = { version = "0.5", features = ["all"] }
 libc = "0.2"
 async-compression = { version = "0.4", features = ["tokio", "gzip", "brotli"] }
+md-5 = "0.10"
+base64 = "0.22"
 
 [profile.dev]
 # Build artifacts are not shipped; debug info and incremental state are the

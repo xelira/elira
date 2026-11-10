@@ -48,6 +48,9 @@ impl RequestVars {
             "server_port" => Some(Cow::Owned(self.port.to_string())),
             "request_id" => Some(Cow::Borrowed(&self.request_id)),
             _ => {
+                if let Some(name) = name.strip_prefix("arg_") {
+                    return self.arg(name).map(Cow::Borrowed);
+                }
                 if let Some(value) = self.mapped.get(name) {
                     return Some(Cow::Borrowed(value));
                 }
@@ -77,6 +80,13 @@ impl RequestVars {
                 None
             }
         }
+    }
+
+    fn arg(&self, name: &str) -> Option<&str> {
+        self.query.split('&').find_map(|pair| {
+            let (key, value) = pair.split_once('=')?;
+            (key == name).then_some(value)
+        })
     }
 
     pub(crate) fn apply_derived(

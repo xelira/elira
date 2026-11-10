@@ -23,7 +23,7 @@ use tokio::sync::Semaphore;
 
 use elira_auth::{BasicAuth, IpAcl};
 use elira_cache::Cache;
-use elira_config::{Compression, Config, Health, Map, RewriteFlag, Satisfy};
+use elira_config::{Compression, Config, Health, Map, RewriteFlag, Satisfy, SecureLink};
 use elira_limit::RateLimiter;
 use elira_tls::ClientIdentity;
 
@@ -226,6 +226,7 @@ struct RouteEntry {
     request_remove_headers: Vec<HeaderName>,
     auth_request: Option<String>,
     satisfy: Satisfy,
+    secure_link: Option<SecureLink>,
     if_conditions: Vec<CompiledIf>,
     auth: Option<Arc<BasicAuth>>,
     acl: Option<Arc<IpAcl>>,

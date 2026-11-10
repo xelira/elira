@@ -1157,6 +1157,74 @@ return = {{ status = 403, body = "no" }}
     assert_eq!(status(&both), "HTTP/1.1 403 Forbidden", "{both}");
 }
 
+#[tokio::test]
+async fn secure_link_checks_query_and_path_forms() {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use md5::{Digest, Md5};
+
+    fn token(value: &str) -> String {
+        let mut hasher = Md5::new();
+        hasher.update(value.as_bytes());
+        URL_SAFE_NO_PAD.encode(hasher.finalize())
+    }
+
+    let config = r#"
+listen = "127.0.0.1:0"
+
+[[routes]]
+host = "*"
+path = "/secure"
+return = { status = 200, body = "secure" }
+secure_link = { secret = "s3cret", md5 = "$arg_md5", expires = "$arg_expires" }
+
+[[routes]]
+host = "*"
+path = "/"
+return = { status = 200, body = "path" }
+secure_link = { secret = "s3cret" }
+"#;
+    let (addr, _stop, _metrics) = start(config).await;
+    let expires = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 60;
+
+    let valid = token(&format!("{expires}/secures3cret"));
+    let request = format!(
+        "GET /secure?md5={valid}&expires={expires} HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n"
+    );
+    let response = roundtrip(addr, &request).await;
+    assert_eq!(status(&response), "HTTP/1.1 200 OK", "{response}");
+
+    let invalid = token(&format!("{expires}/secures3cret-wrong"));
+    let request = format!(
+        "GET /secure?md5={invalid}&expires={expires} HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n"
+    );
+    let response = roundtrip(addr, &request).await;
+    assert_eq!(status(&response), "HTTP/1.1 403 Forbidden", "{response}");
+
+    let expired = expires - 120;
+    let stale = token(&format!("{expired}/secures3cret"));
+    let request = format!(
+        "GET /secure?md5={stale}&expires={expired} HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n"
+    );
+    let response = roundtrip(addr, &request).await;
+    assert_eq!(status(&response), "HTTP/1.1 410 Gone", "{response}");
+
+    let path_token = token("s3cret/file.txt");
+    let request = format!(
+        "GET /{path_token}/file.txt HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n"
+    );
+    let response = roundtrip(addr, &request).await;
+    assert_eq!(status(&response), "HTTP/1.1 200 OK", "{response}");
+
+    let request = "GET /wrong/file.txt HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
+    let response = roundtrip(addr, request).await;
+    assert_eq!(status(&response), "HTTP/1.1 403 Forbidden", "{response}");
+}
+
 fn temp_root(label: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static NEXT: AtomicUsize = AtomicUsize::new(0);

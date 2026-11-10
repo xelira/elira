@@ -514,6 +514,9 @@ pub enum Error {
     #[error("route {index}: auth_request must be an internal path starting with /")]
     BadAuthRequest { index: usize },
 
+    #[error("route {index}: secure_link needs a non-empty secret and md5/expires together")]
+    BadSecureLink { index: usize },
+
     #[error("tls.min_version tls10/tls11 needs tls.backend = \"openssl\"")]
     LegacyTlsNeedsOpenssl,
 }

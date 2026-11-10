@@ -81,6 +81,20 @@ pub enum Satisfy {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct SecureLink {
+    /// Shared secret used by the MD5 calculation.
+    pub secret: String,
+    /// Template for the `md5` query argument. When omitted, the hash is the
+    /// first path segment.
+    #[serde(default)]
+    pub md5: Option<String>,
+    /// Template for the expiry Unix timestamp. Required together with `md5`.
+    #[serde(default)]
+    pub expires: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Route {
     /// Host to match, case-insensitive. `*` catches everything else, and
     /// `*.example.com` matches any subdomain. Nested locations inherit the
@@ -370,6 +384,10 @@ pub struct Route {
     /// `all` requires every access check, `any` accepts one.
     #[serde(default)]
     pub satisfy: Option<Satisfy>,
+
+    /// MD5-signed link check.
+    #[serde(default)]
+    pub secure_link: Option<SecureLink>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

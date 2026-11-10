@@ -853,6 +853,7 @@ buckets = [{ percent = 10, value = "a" }, { percent = 90, value = "b" }]
 | `auth_file` | путь | нет | htpasswd с bcrypt-хешами |
 | `auth_request` | путь | нет | внутренний URI, 2xx которого разрешает запрос |
 | `satisfy` | `all` \| `any` | `all` | все проверки доступа или хотя бы одна |
+| `secure_link` | таблица | нет | проверка MD5-подписи и срока действия ссылки |
 | `client_auth` | bool | `false` | требовать проверенный клиентский сертификат |
 | `client_cn` | строка | нет | требуемый CN субъекта сертификата |
 | `client_issuer_cn` | строка | нет | требуемый CN издателя сертификата |
@@ -1006,6 +1007,12 @@ buckets = [{ percent = 10, value = "a" }, { percent = 90, value = "b" }]
   доступа: `ip_allow`/`ip_deny`, `auth_file` или `auth_request`. По умолчанию
   `all` требует все настроенные проверки. `client_auth`, лимит тела и
   rate-limit выполняются всегда и в `satisfy` не входят.
+- `secure_link = { secret, md5, expires }` проверяет подпись ссылки. В
+  query-форме `md5` и `expires` — шаблоны (`$arg_md5`, `$arg_expires`),
+  ожидаемая подпись — `md5(expires + uri + secret)` в base64url без padding
+  или hex. Просроченная ссылка даёт `410`, неверная — `403`. Без `md5` и
+  `expires` работает path-форма: первый сегмент пути содержит
+  `md5(secret + остаток пути)`.
 - `alias` работает как `root`, но сначала отрезает литеральный `path` маршрута:
   `path = "/static"` и `alias = "/srv/assets"` отдают
   `/static/app.js` из `/srv/assets/app.js`. `alias` требует `path` и не

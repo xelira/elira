@@ -246,6 +246,8 @@ impl Proxy {
             return Ok(response);
         }
 
+        self.check_secure_link(&req, entry, &vars, peer).await?;
+
         match entry.satisfy {
             Satisfy::All => {
                 if let Some(response) = self.check_access(&req, entry, &vars, peer).await {

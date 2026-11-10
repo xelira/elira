@@ -4,14 +4,78 @@ use std::net::SocketAddr;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use http::header::{AUTHORIZATION, CONTENT_LENGTH, LOCATION, WWW_AUTHENTICATE};
 use http::{HeaderValue, Method, Request, Response, StatusCode};
+use md5::{Digest, Md5};
 
 use elira_tls::ClientIdentity;
 
 use crate::*;
 
 impl Proxy {
+    /// Validate an nginx-style `secure_link`. Query form uses
+    /// `md5(expires + uri + secret)`; path form uses `md5(secret + rest)`.
+    pub(crate) async fn check_secure_link(
+        &self,
+        req: &Request<Body>,
+        entry: &RouteEntry,
+        vars: &RequestVars,
+        peer: SocketAddr,
+    ) -> Result<(), Response<Body>> {
+        let Some(link) = &entry.secure_link else {
+            return Ok(());
+        };
+
+        let path = req.uri().path();
+        let valid = if let (Some(md5), Some(expires)) = (&link.md5, &link.expires) {
+            let provided = vars.render(md5);
+            let expires = vars.render(expires);
+            let Ok(timestamp) = expires.parse::<u64>() else {
+                return Err(self
+                    .secure_deny(StatusCode::FORBIDDEN, entry, vars, peer)
+                    .await);
+            };
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .unwrap_or(0);
+            if now > timestamp {
+                return Err(self.secure_deny(StatusCode::GONE, entry, vars, peer).await);
+            }
+            let expected = digest(&format!("{expires}{path}{}", link.secret));
+            matches_hash(&provided, &expected)
+        } else {
+            let trimmed = path.trim_start_matches('/');
+            let (provided, rest) = trimmed.split_once('/').unwrap_or((trimmed, ""));
+            let rest = format!("/{rest}");
+            let expected = digest(&format!("{}{rest}", link.secret));
+            matches_hash(provided, &expected)
+        };
+
+        if valid {
+            Ok(())
+        } else {
+            Err(self
+                .secure_deny(StatusCode::FORBIDDEN, entry, vars, peer)
+                .await)
+        }
+    }
+
+    async fn secure_deny(
+        &self,
+        status: StatusCode,
+        entry: &RouteEntry,
+        vars: &RequestVars,
+        peer: SocketAddr,
+    ) -> Response<Body> {
+        let mut response = text(status, "invalid secure link");
+        self.apply_error_page(&mut response, entry, vars, peer)
+            .await;
+        response
+    }
+
     /// Reject the request when a route-level rule says so. The caller turns
     /// the returned response into the error path, so the global error page
     /// still applies.
@@ -377,4 +441,18 @@ impl Proxy {
         self.apply_error_page(&mut denied, entry, vars, peer).await;
         Err(denied)
     }
+}
+
+fn digest(value: &str) -> (String, String) {
+    let mut hasher = Md5::new();
+    hasher.update(value.as_bytes());
+    let bytes = hasher.finalize();
+    let base64 = URL_SAFE_NO_PAD.encode(bytes);
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    (base64, hex)
+}
+
+fn matches_hash(provided: &str, expected: &(String, String)) -> bool {
+    let provided = provided.trim();
+    provided == expected.0 || provided.eq_ignore_ascii_case(&expected.1)
 }
