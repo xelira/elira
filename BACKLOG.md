@@ -139,7 +139,8 @@ Living list for the self-improvement loop. One item per session.
 - [ ] `CONNECT` over HTTP/3.
 - [ ] WebTransport and application HTTP/3 datagrams.
 - [ ] h2c via `Upgrade: h2c` (hyper cannot inject the upgraded stream 1).
-- [ ] SCGI, uWSGI and AJP upstreams.
+- [x] SCGI upstreams.
+- [ ] uWSGI and AJP upstreams.
 - [ ] FastCGI multiplexing.
 
 - [ ] `auth_request` subrequests.

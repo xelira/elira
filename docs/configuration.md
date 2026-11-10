@@ -806,6 +806,9 @@ buckets = [{ percent = 10, value = "a" }, { percent = 90, value = "b" }]
 | `fastcgi_param` | массив строк | `[]` | дополнительные параметры `NAME: value` |
 | `cgi_param` | массив строк | `[]` | дополнительные переменные CGI `NAME: value` |
 | `cgi_pass` | путь | нет | абсолютный путь к CGI-скрипту |
+| `scgi_pass` | строка | нет | SCGI target: `host:port` или `unix:/path` |
+| `scgi_root` | путь | нет | `DOCUMENT_ROOT` для SCGI |
+| `scgi_param` | массив строк | `[]` | дополнительные параметры SCGI `NAME: value` |
 | `module` | путь | нет | абсолютный путь к `.so`-модулю |
 | `module_sandbox` | bool | `false` | запускать модуль в дочернем процессе |
 | `wasm` | путь | нет | WebAssembly-модуль как цель маршрута (fuel-бюджет на вызов) |
@@ -954,6 +957,12 @@ buckets = [{ percent = 10, value = "a" }, { percent = 90, value = "b" }]
 - `internal = true` скрывает обычный маршрут от прямых запросов: снаружи он
   отвечает `404`, а после внутреннего перехода доступен. Именованные location
   всегда внутренние. Цепочка переходов ограничена 10 шагами.
+- `scgi_pass` отправляет запрос SCGI-приложению. Параметры собираются как для
+  CGI (`REQUEST_METHOD`, `REQUEST_URI`, `QUERY_STRING`, `CONTENT_LENGTH`,
+  `HTTP_*`), плюс `scgi_param`; при заданном `scgi_root` добавляется
+  `DOCUMENT_ROOT`. Ответ читается как CGI: заголовки `Status`/`Content-Type`
+  и тело. Соединение одно на запрос, тело ответа ограничено
+  `max_response_bytes`.
 - `alias` работает как `root`, но сначала отрезает литеральный `path` маршрута:
   `path = "/static"` и `alias = "/srv/assets"` отдают
   `/static/app.js` из `/srv/assets/app.js`. `alias` требует `path` и не

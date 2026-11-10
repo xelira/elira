@@ -424,6 +424,27 @@ impl Proxy {
                     }
                 }
             }
+            Target::Scgi { target, root } => {
+                if let Some(root) = root {
+                    params.push(("DOCUMENT_ROOT".to_owned(), root.display().to_string()));
+                }
+                params.extend(entry.scgi_param.iter().cloned());
+                match crate::scgi::execute(
+                    target,
+                    &params,
+                    &body,
+                    timeout,
+                    entry.max_response.unwrap_or(self.inner.max_app_response),
+                )
+                .await
+                {
+                    Ok(response) => app_result(response.status, response.headers, response.body),
+                    Err(err) => {
+                        tracing::warn!(error = %err, "SCGI request failed");
+                        Err(StatusCode::BAD_GATEWAY)
+                    }
+                }
+            }
             _ => Err(StatusCode::INTERNAL_SERVER_ERROR),
         };
 

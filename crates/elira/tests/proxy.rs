@@ -4511,6 +4511,113 @@ fastcgi_root = "{root}"
     assert!(response.contains("fastcgi"), "{response}");
 }
 
+/// A tiny SCGI responder: validates the length-prefixed header block and
+/// answers with the request method, URI, a custom param and the body.
+async fn scgi_upstream() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind scgi");
+    let addr = listener.local_addr().expect("scgi addr");
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut length = Vec::new();
+                let mut byte = [0u8; 1];
+                loop {
+                    if stream.read_exact(&mut byte).await.is_err() {
+                        return;
+                    }
+                    if byte[0] == 0 {
+                        break;
+                    }
+                    length.push(byte[0]);
+                }
+                let Some(length) = String::from_utf8(length)
+                    .ok()
+                    .and_then(|value| value.parse::<usize>().ok())
+                else {
+                    return;
+                };
+                let mut header = vec![0u8; length];
+                if stream.read_exact(&mut header).await.is_err() {
+                    return;
+                }
+                let mut parts = header.split(|byte| *byte == 0);
+                if parts.next() != Some(b"SCGI".as_slice()) {
+                    return;
+                }
+                let mut params = std::collections::HashMap::new();
+                while let (Some(name), Some(value)) = (parts.next(), parts.next()) {
+                    if name.is_empty() {
+                        break;
+                    }
+                    params.insert(
+                        String::from_utf8_lossy(name).to_string(),
+                        String::from_utf8_lossy(value).to_string(),
+                    );
+                }
+                let body_len = params
+                    .get("CONTENT_LENGTH")
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let mut body = vec![0u8; body_len];
+                if stream.read_exact(&mut body).await.is_err() {
+                    return;
+                }
+                let response = format!(
+                    "Status: 200 OK\r\nContent-Type: text/plain\r\n\r\nscgi:{}:{}:{}:{}",
+                    params
+                        .get("REQUEST_METHOD")
+                        .map(String::as_str)
+                        .unwrap_or(""),
+                    params.get("REQUEST_URI").map(String::as_str).unwrap_or(""),
+                    params.get("APP_ENV").map(String::as_str).unwrap_or(""),
+                    String::from_utf8_lossy(&body),
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+
+    addr
+}
+
+#[tokio::test]
+async fn scgi_route_talks_the_protocol() {
+    let upstream = scgi_upstream().await;
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[routes]]
+host = "*"
+scgi_pass = "{upstream}"
+scgi_param = ["APP_ENV: test"]
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let response = roundtrip(
+        addr,
+        "GET /scgi?name=elira HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&response), "HTTP/1.1 200 OK");
+    assert!(
+        response.contains("scgi:GET:/scgi?name=elira:test:"),
+        "{response}"
+    );
+
+    let posted = roundtrip(
+        addr,
+        "POST /submit HTTP/1.1\r\nHost: example.com\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndata",
+    )
+    .await;
+    assert!(posted.contains("scgi:POST:/submit:test:data"), "{posted}");
+}
+
 #[tokio::test]
 async fn cleartext_http2_is_available_with_prior_knowledge() {
     use http_body_util::Empty;

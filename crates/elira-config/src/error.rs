@@ -495,4 +495,10 @@ pub enum Error {
 
     #[error("route {index}: try_files refers to unknown named location {name:?}")]
     UnknownNamedLocation { index: usize, name: String },
+
+    #[error("route {index}: scgi_pass is empty")]
+    EmptyScgiTarget { index: usize },
+
+    #[error("route {index}: scgi_root is empty")]
+    BadScgiRoot { index: usize },
 }

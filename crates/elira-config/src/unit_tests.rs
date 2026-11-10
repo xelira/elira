@@ -1576,6 +1576,45 @@ return = { status = 200, body = "child" }
 }
 
 #[test]
+fn scgi_routes_are_validated() {
+    let base = r#"
+listen = "127.0.0.1:8080"
+
+[[routes]]
+host = "*"
+scgi_pass = "127.0.0.1:9000"
+scgi_param = ["APP_ENV: test"]
+"#;
+    let cfg = Config::parse(base).expect("valid");
+    assert_eq!(cfg.routes[0].scgi_pass.as_deref(), Some("127.0.0.1:9000"));
+    assert_eq!(cfg.routes[0].scgi_param.len(), 1);
+
+    let empty = base.replace("127.0.0.1:9000", "");
+    assert!(matches!(
+        Config::parse(&empty),
+        Err(Error::EmptyScgiTarget { .. })
+    ));
+
+    let bad_root = base.replace(
+        "scgi_param = [\"APP_ENV: test\"]",
+        "scgi_root = \"\"\nscgi_param = [\"APP_ENV: test\"]",
+    );
+    assert!(matches!(
+        Config::parse(&bad_root),
+        Err(Error::BadScgiRoot { .. })
+    ));
+
+    let two = base.replace(
+        "scgi_pass = \"127.0.0.1:9000\"",
+        "scgi_pass = \"127.0.0.1:9000\"\nroot = \"/srv\"",
+    );
+    assert!(matches!(
+        Config::parse(&two),
+        Err(Error::RouteHasTwoTargets { .. })
+    ));
+}
+
+#[test]
 fn named_locations_are_validated() {
     let base = r#"
 listen = "127.0.0.1:8080"

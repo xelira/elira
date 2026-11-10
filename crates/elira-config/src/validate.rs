@@ -763,6 +763,7 @@ impl Config {
             + usize::from(route.return_response.is_some())
             + usize::from(route.fastcgi_pass.is_some())
             + usize::from(route.cgi_pass.is_some())
+            + usize::from(route.scgi_pass.is_some())
             + usize::from(route.module.is_some())
             + usize::from(route.wasm.is_some());
         if targets == 0 {
@@ -832,7 +833,12 @@ impl Config {
         if route.fastcgi_index.contains('/') || route.fastcgi_index.contains("..") {
             return Err(Error::BadFastCgiIndex { index });
         }
-        for param in route.fastcgi_param.iter().chain(route.cgi_param.iter()) {
+        for param in route
+            .fastcgi_param
+            .iter()
+            .chain(route.cgi_param.iter())
+            .chain(route.scgi_param.iter())
+        {
             if parse_param(param).is_none() {
                 return Err(Error::BadAppParam {
                     index,
@@ -843,6 +849,18 @@ impl Config {
         if let Some(script) = &route.cgi_pass {
             if script.as_os_str().is_empty() || !script.is_absolute() {
                 return Err(Error::BadCgiScript { index });
+            }
+        }
+        if let Some(target) = &route.scgi_pass {
+            if target.trim().is_empty() {
+                return Err(Error::EmptyScgiTarget { index });
+            }
+            if route
+                .scgi_root
+                .as_ref()
+                .is_some_and(|root| root.as_os_str().is_empty())
+            {
+                return Err(Error::BadScgiRoot { index });
             }
         }
         if let Some(module) = &route.module {

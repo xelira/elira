@@ -38,6 +38,7 @@ mod health;
 mod helpers;
 mod pool;
 mod response;
+mod scgi;
 mod serve;
 mod tunnel;
 mod variables;
@@ -154,6 +155,10 @@ enum Target {
     Cgi {
         script: PathBuf,
     },
+    Scgi {
+        target: crate::scgi::Target,
+        root: Option<PathBuf>,
+    },
     Module(ModuleTarget),
     Wasm(Arc<elira_wasm::WasmModule>),
 }
@@ -223,6 +228,7 @@ struct RouteEntry {
     etag: bool,
     fastcgi_param: Vec<(String, String)>,
     cgi_param: Vec<(String, String)>,
+    scgi_param: Vec<(String, String)>,
 }
 
 #[derive(Clone)]

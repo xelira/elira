@@ -174,6 +174,18 @@ pub struct Route {
     #[serde(default)]
     pub cgi_param: Vec<String>,
 
+    /// SCGI target: `host:port` or `unix:/path`.
+    #[serde(default)]
+    pub scgi_pass: Option<String>,
+
+    /// Document root exposed to the SCGI application.
+    #[serde(default)]
+    pub scgi_root: Option<PathBuf>,
+
+    /// Extra SCGI params as `NAME: value`.
+    #[serde(default)]
+    pub scgi_param: Vec<String>,
+
     /// CGI script to execute for this route.
     #[serde(default)]
     pub cgi_pass: Option<PathBuf>,
