@@ -178,6 +178,7 @@
 - `error_page` со сменой статуса (`404 =200 /404.html`).
 - `if_modified_since = false` для статики.
 - `cache_valid` для TTL по статусам ответа.
+- `cache_key` и `cache_bypass` для управления ключом и обходом кэша.
 - Перезапись заголовков upstream: `proxy_hide_header`, `proxy_pass_header`,
   `proxy_redirect`, `proxy_cookie_domain/path`.
 - `CONNECT` поверх HTTP/3 с прямым туннелем QUIC-потока.

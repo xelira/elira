@@ -3324,6 +3324,65 @@ cache_valid = [{{ statuses = [404], ttl_secs = 60 }}]
 }
 
 #[tokio::test]
+async fn cache_key_and_bypass_override_the_defaults() {
+    let upstream = upstream().await;
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[cache]
+enabled = true
+max_bytes = 1048576
+max_item_bytes = 8192
+ttl_secs = 60
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "*"
+upstream = "app"
+cache_key = "$host$uri"
+cache_bypass = ["$http_x_nocache"]
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let first = roundtrip(
+        addr,
+        "GET /same?x=1 HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(
+        first.to_ascii_lowercase().contains("x-cache: miss"),
+        "{first}"
+    );
+    let second = roundtrip(
+        addr,
+        "GET /same?x=2 HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(
+        second.to_ascii_lowercase().contains("x-cache: hit"),
+        "{second}"
+    );
+
+    let bypass =
+        "GET /other HTTP/1.1\r\nHost: example.com\r\nX-Nocache: 1\r\nConnection: close\r\n\r\n";
+    let first = roundtrip(addr, bypass).await;
+    assert!(
+        !first.to_ascii_lowercase().contains("x-cache: hit"),
+        "{first}"
+    );
+    let second = roundtrip(addr, bypass).await;
+    assert!(
+        !second.to_ascii_lowercase().contains("x-cache: hit"),
+        "{second}"
+    );
+}
+
+#[tokio::test]
 async fn cache_reports_miss_then_hit() {
     let upstream = upstream().await;
     let config = format!(

@@ -209,6 +209,7 @@ Routing:
 - `error_page` status overrides such as `"404 =200 /soft-404.html"`
 - optional `if_modified_since = false` for static routes
 - per-status cache TTLs with `cache_valid`
+- `cache_key` templates and `cache_bypass` variables
 - upstream response header hiding/passing, `Location`/`Refresh` redirects and
   `Set-Cookie` domain/path rewrites, with
   `$variable` expansion, plus `timeout_secs`, token bucket, concurrency limit,

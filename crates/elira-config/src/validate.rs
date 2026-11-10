@@ -923,6 +923,17 @@ impl Config {
         if route.cache_ttl_secs == Some(0) {
             return Err(Error::BadRouteCacheTtl { index });
         }
+        if route
+            .cache_key
+            .as_ref()
+            .is_some_and(|key| key.trim().is_empty() || key.chars().any(char::is_control))
+            || route
+                .cache_bypass
+                .iter()
+                .any(|value| value.trim().is_empty() || value.chars().any(char::is_control))
+        {
+            return Err(Error::BadCacheKey { index });
+        }
         if route.cache_valid.iter().any(|valid| {
             valid.statuses.is_empty()
                 || valid.ttl_secs == 0

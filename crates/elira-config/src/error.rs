@@ -526,6 +526,9 @@ pub enum Error {
     #[error("route {index}: proxy header rewrite is invalid")]
     BadProxyRewrite { index: usize },
 
+    #[error("route {index}: cache_key/cache_bypass template is invalid")]
+    BadCacheKey { index: usize },
+
     #[error("tls.min_version tls10/tls11 needs tls.backend = \"openssl\"")]
     LegacyTlsNeedsOpenssl,
 }

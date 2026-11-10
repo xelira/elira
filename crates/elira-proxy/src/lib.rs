@@ -263,6 +263,8 @@ struct RouteEntry {
     fastcgi_mux: Option<Arc<elira_fastcgi::MultiplexPool>>,
     cache: Option<bool>,
     cache_ttl: Option<Duration>,
+    cache_key: Option<String>,
+    cache_bypass: Vec<String>,
     cache_valid: Vec<CacheValid>,
     access_log: bool,
     access_log_sample: f64,

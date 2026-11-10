@@ -250,6 +250,8 @@ pub(crate) fn build_route(
         max_response: route.max_response_bytes,
         cache: route.cache_enabled,
         cache_ttl: route.cache_ttl_secs.map(Duration::from_secs),
+        cache_key: route.cache_key.clone(),
+        cache_bypass: route.cache_bypass.clone(),
         cache_valid: route.cache_valid.clone(),
         access_log: route.access_log,
         access_log_sample: route.access_log_sample.unwrap_or(cfg.log.sample),

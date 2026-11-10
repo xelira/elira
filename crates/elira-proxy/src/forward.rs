@@ -290,7 +290,16 @@ impl Proxy {
             .map(|value| value.as_str().to_owned())
             .unwrap_or_else(|| "/".to_owned());
 
-        let cache_key = format!("{key}{path}");
+        let cache_key = entry
+            .cache_key
+            .as_ref()
+            .map(|template| vars.render(template))
+            .filter(|key| !key.is_empty())
+            .unwrap_or_else(|| format!("{key}{path}"));
+        let cache_bypass = entry.cache_bypass.iter().any(|template| {
+            let value = variable_or_empty(&vars, template);
+            !value.is_empty() && value != "0"
+        });
 
         let upstream_path = if entry.strip_prefix {
             let rest = path
@@ -341,7 +350,8 @@ impl Proxy {
 
         let mut body = Some(body);
 
-        let cache_allowed = entry.cache != Some(false) && !auth_subrequest && !accel_redirect;
+        let cache_allowed =
+            entry.cache != Some(false) && !auth_subrequest && !accel_redirect && !cache_bypass;
         let mut _cache_flight: Option<CacheFlightGuard> = None;
         if is_get && requested_upgrade.is_none() && cache_allowed {
             let (hit, flight) = self
@@ -1162,6 +1172,18 @@ impl Proxy {
         self.apply_route(&mut response, entry, vars, request_id);
         Ok(response)
     }
+}
+
+fn variable_or_empty(vars: &RequestVars, template: &str) -> String {
+    if let Some(name) = template.strip_prefix('$') {
+        if !name.is_empty() && !name.contains('$') && !name.contains('{') {
+            return vars
+                .value(name)
+                .map(|value| value.into_owned())
+                .unwrap_or_default();
+        }
+    }
+    vars.render(template)
 }
 
 fn rewrite_prefix(value: &HeaderValue, rules: &[(String, String)]) -> Option<HeaderValue> {

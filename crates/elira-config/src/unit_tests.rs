@@ -1943,6 +1943,41 @@ proxy_cookie_path = [{ from = "/old", to = "/new" }]
 }
 
 #[test]
+fn cache_key_and_bypass_are_validated() {
+    let base = r#"
+listen = "127.0.0.1:8080"
+
+[[upstreams]]
+name = "app"
+servers = ["127.0.0.1:9000"]
+
+[[routes]]
+host = "*"
+upstream = "app"
+cache_key = "$host$uri"
+cache_bypass = ["$http_x_nocache"]
+"#;
+    let cfg = Config::parse(base).expect("valid");
+    assert_eq!(cfg.routes[0].cache_key.as_deref(), Some("$host$uri"));
+    assert_eq!(cfg.routes[0].cache_bypass.len(), 1);
+
+    let bad_key = base.replace("cache_key = \"$host$uri\"", "cache_key = \"\"");
+    assert!(matches!(
+        Config::parse(&bad_key),
+        Err(Error::BadCacheKey { .. })
+    ));
+
+    let bad_bypass = base.replace(
+        "cache_bypass = [\"$http_x_nocache\"]",
+        "cache_bypass = [\"\"]",
+    );
+    assert!(matches!(
+        Config::parse(&bad_bypass),
+        Err(Error::BadCacheKey { .. })
+    ));
+}
+
+#[test]
 fn named_locations_are_validated() {
     let base = r#"
 listen = "127.0.0.1:8080"

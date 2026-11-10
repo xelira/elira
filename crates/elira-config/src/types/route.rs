@@ -351,6 +351,14 @@ pub struct Route {
     #[serde(default)]
     pub cache_ttl_secs: Option<u64>,
 
+    /// Cache key template. Defaults to host plus path and query.
+    #[serde(default)]
+    pub cache_key: Option<String>,
+
+    /// Variables whose non-empty, non-`0` value bypasses the cache.
+    #[serde(default)]
+    pub cache_bypass: Vec<String>,
+
     /// Per-status cache TTLs. The first matching status wins over
     /// `cache_ttl_secs`.
     #[serde(default)]
