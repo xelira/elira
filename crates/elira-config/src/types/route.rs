@@ -81,6 +81,13 @@ pub enum Satisfy {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct HeaderRewrite {
+    pub from: String,
+    pub to: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CacheValid {
     pub statuses: Vec<u16>,
     pub ttl_secs: u64,
@@ -384,6 +391,26 @@ pub struct Route {
     /// Response headers to drop.
     #[serde(default)]
     pub remove_headers: Vec<String>,
+
+    /// Upstream response headers to drop.
+    #[serde(default)]
+    pub proxy_hide_header: Vec<String>,
+
+    /// Upstream response headers to keep even when hidden.
+    #[serde(default)]
+    pub proxy_pass_header: Vec<String>,
+
+    /// Rewrite `Location` and `Refresh` prefixes from upstream.
+    #[serde(default)]
+    pub proxy_redirect: Vec<HeaderRewrite>,
+
+    /// Rewrite the `Domain` attribute of upstream `Set-Cookie` headers.
+    #[serde(default)]
+    pub proxy_cookie_domain: Vec<HeaderRewrite>,
+
+    /// Rewrite the `Path` attribute of upstream `Set-Cookie` headers.
+    #[serde(default)]
+    pub proxy_cookie_path: Vec<HeaderRewrite>,
 
     /// Request headers to set or replace before forwarding, as `Name: value`.
     #[serde(default)]

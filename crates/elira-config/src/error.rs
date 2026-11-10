@@ -523,6 +523,9 @@ pub enum Error {
     #[error("route {index}: cache_valid needs statuses in 100..599 and a positive TTL")]
     BadCacheValid { index: usize },
 
+    #[error("route {index}: proxy header rewrite is invalid")]
+    BadProxyRewrite { index: usize },
+
     #[error("tls.min_version tls10/tls11 needs tls.backend = \"openssl\"")]
     LegacyTlsNeedsOpenssl,
 }

@@ -850,6 +850,11 @@ buckets = [{ percent = 10, value = "a" }, { percent = 90, value = "b" }]
 | `strip_prefix` | bool | `false` | срезать `path` перед отправкой в upstream |
 | `add_headers` | массив строк | `[]` | заголовки ответа в виде `Name: value` |
 | `remove_headers` | массив строк | `[]` | заголовки ответа, которые надо убрать |
+| `proxy_hide_header` | массив строк | `[]` | скрыть заголовки upstream-ответа |
+| `proxy_pass_header` | массив строк | `[]` | вернуть скрытый заголовок |
+| `proxy_redirect` | массив таблиц | `[]` | `{ from, to }` для `Location`/`Refresh` |
+| `proxy_cookie_domain` | массив таблиц | `[]` | `{ from, to }` для `Domain` в `Set-Cookie` |
+| `proxy_cookie_path` | массив таблиц | `[]` | `{ from, to }` для `Path` в `Set-Cookie` |
 | `request_headers` | массив строк | `[]` | заголовки запроса к upstream в виде `Name: value` |
 | `request_remove_headers` | массив строк | `[]` | заголовки запроса, которые надо убрать |
 | `try_files` | массив строк | `[]` | кандидаты, если путь не найден; `$uri` подставляется |
@@ -933,6 +938,10 @@ buckets = [{ percent = 10, value = "a" }, { percent = 90, value = "b" }]
 - `add_headers` и `remove_headers` применяются к ответу после проксирования
   или статики. Формат `add_headers` — `"Name: value"`; строка без двоеточия
   или с невалидным именем отклоняется.
+- `proxy_hide_header` убирает заголовки upstream-ответа; `proxy_pass_header`
+  возвращает конкретный скрытый заголовок. `proxy_redirect` заменяет префикс
+  в `Location` и `Refresh`, `proxy_cookie_domain`/`proxy_cookie_path` —
+  атрибуты `Domain`/`Path` в `Set-Cookie`.
 - `request_headers` заменяет одноимённые заголовки клиента перед отправкой в
   upstream, `request_remove_headers` удаляет их. Значения могут содержать
   переменные (см. ниже).

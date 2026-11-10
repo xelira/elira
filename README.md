@@ -208,7 +208,9 @@ Routing:
 - `X-Accel-Redirect` and filesystem-scoped `X-Sendfile` from upstream
 - `error_page` status overrides such as `"404 =200 /soft-404.html"`
 - optional `if_modified_since = false` for static routes
-- per-status cache TTLs with `cache_valid`, with
+- per-status cache TTLs with `cache_valid`
+- upstream response header hiding/passing, `Location`/`Refresh` redirects and
+  `Set-Cookie` domain/path rewrites, with
   `$variable` expansion, plus `timeout_secs`, token bucket, concurrency limit,
   body cap and error pages
 - HTTP Basic auth from htpasswd (bcrypt) and IPv4/IPv6 allow/deny lists

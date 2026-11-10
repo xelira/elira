@@ -1175,6 +1175,33 @@ impl Config {
                 header: name.clone(),
             })?;
         }
+        for name in route
+            .proxy_hide_header
+            .iter()
+            .chain(route.proxy_pass_header.iter())
+        {
+            HeaderName::from_bytes(name.as_bytes()).map_err(|_| Error::BadHeader {
+                index,
+                header: name.clone(),
+            })?;
+        }
+        for rewrite in route
+            .proxy_redirect
+            .iter()
+            .chain(route.proxy_cookie_domain.iter())
+            .chain(route.proxy_cookie_path.iter())
+        {
+            if rewrite.from.is_empty()
+                || rewrite.to.is_empty()
+                || rewrite
+                    .from
+                    .chars()
+                    .chain(rewrite.to.chars())
+                    .any(char::is_control)
+            {
+                return Err(Error::BadProxyRewrite { index });
+            }
+        }
         for header in &route.request_headers {
             let (name, _) = parse_header_line(header).ok_or_else(|| Error::BadHeader {
                 index,

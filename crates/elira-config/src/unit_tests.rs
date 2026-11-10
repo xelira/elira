@@ -1908,6 +1908,41 @@ cache_valid = [{ statuses = [200, 404], ttl_secs = 60 }]
 }
 
 #[test]
+fn proxy_header_rewrites_are_validated() {
+    let base = r#"
+listen = "127.0.0.1:8080"
+
+[[upstreams]]
+name = "app"
+servers = ["127.0.0.1:9000"]
+
+[[routes]]
+host = "*"
+upstream = "app"
+proxy_hide_header = ["x-secret"]
+proxy_pass_header = ["x-secret"]
+proxy_redirect = [{ from = "http://backend/", to = "https://public/" }]
+proxy_cookie_domain = [{ from = "backend", to = "public" }]
+proxy_cookie_path = [{ from = "/old", to = "/new" }]
+"#;
+    let cfg = Config::parse(base).expect("valid");
+    assert_eq!(cfg.routes[0].proxy_hide_header.len(), 1);
+    assert_eq!(cfg.routes[0].proxy_redirect.len(), 1);
+
+    let bad_header = base.replace("\"x-secret\"", "\"bad header\"");
+    assert!(matches!(
+        Config::parse(&bad_header),
+        Err(Error::BadHeader { .. })
+    ));
+
+    let bad_rewrite = base.replace("from = \"backend\"", "from = \"\"");
+    assert!(matches!(
+        Config::parse(&bad_rewrite),
+        Err(Error::BadProxyRewrite { .. })
+    ));
+}
+
+#[test]
 fn named_locations_are_validated() {
     let base = r#"
 listen = "127.0.0.1:8080"

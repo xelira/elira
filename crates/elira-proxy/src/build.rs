@@ -192,6 +192,31 @@ pub(crate) fn build_route(
             .iter()
             .filter_map(|name| HeaderName::from_bytes(name.as_bytes()).ok())
             .collect(),
+        hide_headers: route
+            .proxy_hide_header
+            .iter()
+            .filter_map(|name| HeaderName::from_bytes(name.as_bytes()).ok())
+            .collect(),
+        pass_headers: route
+            .proxy_pass_header
+            .iter()
+            .filter_map(|name| HeaderName::from_bytes(name.as_bytes()).ok())
+            .collect(),
+        proxy_redirect: route
+            .proxy_redirect
+            .iter()
+            .map(|rewrite| (rewrite.from.clone(), rewrite.to.clone()))
+            .collect(),
+        cookie_domain: route
+            .proxy_cookie_domain
+            .iter()
+            .map(|rewrite| (rewrite.from.clone(), rewrite.to.clone()))
+            .collect(),
+        cookie_path: route
+            .proxy_cookie_path
+            .iter()
+            .map(|rewrite| (rewrite.from.clone(), rewrite.to.clone()))
+            .collect(),
         request_headers: route
             .request_headers
             .iter()

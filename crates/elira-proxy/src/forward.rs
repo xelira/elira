@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use http::header::{
     HeaderValue, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HOST, LOCATION,
-    SERVER, TRANSFER_ENCODING, UPGRADE, VARY,
+    SERVER, SET_COOKIE, TRANSFER_ENCODING, UPGRADE, VARY,
 };
 use http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
 use http_body_util::{BodyExt, Full};
@@ -987,10 +987,23 @@ impl Proxy {
                 if is_hop_by_hop(name)
                     || drop.contains(name)
                     || name == http::header::CONTENT_LENGTH
+                    || (entry.hide_headers.contains(name) && !entry.pass_headers.contains(name))
                 {
                     continue;
                 }
-                headers.append(name, value.clone());
+                let mut value = value.clone();
+                if name == LOCATION {
+                    if let Some(rewritten) = rewrite_prefix(&value, &entry.proxy_redirect) {
+                        value = rewritten;
+                    }
+                } else if name == http::header::REFRESH {
+                    if let Some(rewritten) = rewrite_refresh(&value, &entry.proxy_redirect) {
+                        value = rewritten;
+                    }
+                } else if name == SET_COOKIE {
+                    value = rewrite_cookie(&value, &entry.cookie_domain, &entry.cookie_path);
+                }
+                headers.append(name, value);
             }
             headers.insert(SERVER, HeaderValue::from_static("elira"));
 
@@ -1149,4 +1162,79 @@ impl Proxy {
         self.apply_route(&mut response, entry, vars, request_id);
         Ok(response)
     }
+}
+
+fn rewrite_prefix(value: &HeaderValue, rules: &[(String, String)]) -> Option<HeaderValue> {
+    let text = value.to_str().ok()?;
+    for (from, to) in rules {
+        if let Some(rest) = text.strip_prefix(from) {
+            return HeaderValue::from_str(&format!("{to}{rest}")).ok();
+        }
+    }
+    None
+}
+
+fn rewrite_refresh(value: &HeaderValue, rules: &[(String, String)]) -> Option<HeaderValue> {
+    let text = value.to_str().ok()?;
+    let (head, url) = text.split_once("url=")?;
+    let rewritten = rewrite_prefix(&HeaderValue::from_str(url).ok()?, rules)?;
+    HeaderValue::from_str(&format!("{head}url={}", rewritten.to_str().ok()?)).ok()
+}
+
+fn rewrite_cookie(
+    value: &HeaderValue,
+    domains: &[(String, String)],
+    paths: &[(String, String)],
+) -> HeaderValue {
+    let Ok(text) = value.to_str() else {
+        return value.clone();
+    };
+    let mut out = String::new();
+    for (index, part) in text.split(';').enumerate() {
+        if index > 0 {
+            out.push(';');
+        }
+        let part = part.trim();
+        if let Some((name, attribute)) = part.split_once('=') {
+            let replacement = if name.eq_ignore_ascii_case("domain") {
+                match_domain(attribute, domains)
+            } else if name.eq_ignore_ascii_case("path") {
+                match_path(attribute, paths)
+            } else {
+                None
+            };
+            if let Some(attribute) = replacement {
+                out.push(' ');
+                out.push_str(name);
+                out.push('=');
+                out.push_str(&attribute);
+                continue;
+            }
+        }
+        out.push(' ');
+        out.push_str(part);
+    }
+    HeaderValue::from_str(out.trim_start()).unwrap_or_else(|_| value.clone())
+}
+
+fn match_domain(value: &str, rules: &[(String, String)]) -> Option<String> {
+    for (from, to) in rules {
+        if value.eq_ignore_ascii_case(from) {
+            return Some(to.clone());
+        }
+        let suffix = format!(".{}", from.to_ascii_lowercase());
+        if value.to_ascii_lowercase().ends_with(&suffix) {
+            return Some(format!("{to}{}", &value[value.len() - suffix.len()..]));
+        }
+    }
+    None
+}
+
+fn match_path(value: &str, rules: &[(String, String)]) -> Option<String> {
+    for (from, to) in rules {
+        if let Some(rest) = value.strip_prefix(from) {
+            return Some(format!("{to}{rest}"));
+        }
+    }
+    None
 }

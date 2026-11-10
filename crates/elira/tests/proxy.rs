@@ -1407,6 +1407,95 @@ if_modified_since = false
     assert!(response.ends_with("home"), "{response}");
 }
 
+#[tokio::test]
+async fn proxy_header_rewrites_apply() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind header upstream");
+    let upstream = listener.local_addr().expect("header addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while let Ok(read) = stream.read(&mut chunk).await {
+                    if read == 0 {
+                        break;
+                    }
+                    head.extend_from_slice(&chunk[..read]);
+                    if head.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-Secret: leak\r\nLocation: http://backend/login\r\nSet-Cookie: session=1; Domain=backend; Path=/old\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await;
+            });
+        }
+    });
+
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "*"
+path = "/app"
+upstream = "app"
+proxy_hide_header = ["x-secret"]
+proxy_redirect = [{{ from = "http://backend/", to = "https://public/" }}]
+proxy_cookie_domain = [{{ from = "backend", to = "public" }}]
+proxy_cookie_path = [{{ from = "/old", to = "/new" }}]
+
+[[routes]]
+host = "*"
+path = "/pass"
+upstream = "app"
+proxy_hide_header = ["x-secret"]
+proxy_pass_header = ["x-secret"]
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let response = roundtrip(
+        addr,
+        "GET /app HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(!response.to_ascii_lowercase().contains("x-secret"));
+    assert!(
+        response
+            .to_ascii_lowercase()
+            .contains("location: https://public/login"),
+        "{response}"
+    );
+    assert!(
+        response
+            .to_ascii_lowercase()
+            .contains("set-cookie: session=1; domain=public; path=/new"),
+        "{response}"
+    );
+
+    let response = roundtrip(
+        addr,
+        "GET /pass HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(
+        response.to_ascii_lowercase().contains("x-secret: leak"),
+        "{response}"
+    );
+}
+
 fn temp_root(label: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static NEXT: AtomicUsize = AtomicUsize::new(0);

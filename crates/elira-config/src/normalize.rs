@@ -149,6 +149,11 @@ fn inherit(parent: &Route, child: &mut Route) -> Result<(), Error> {
     inherit_vec(&mut child.error_pages, &parent.error_pages);
     inherit_vec(&mut child.add_headers, &parent.add_headers);
     inherit_vec(&mut child.remove_headers, &parent.remove_headers);
+    inherit_vec(&mut child.proxy_hide_header, &parent.proxy_hide_header);
+    inherit_vec(&mut child.proxy_pass_header, &parent.proxy_pass_header);
+    inherit_vec(&mut child.proxy_redirect, &parent.proxy_redirect);
+    inherit_vec(&mut child.proxy_cookie_domain, &parent.proxy_cookie_domain);
+    inherit_vec(&mut child.proxy_cookie_path, &parent.proxy_cookie_path);
     inherit_vec(&mut child.request_headers, &parent.request_headers);
     inherit_vec(
         &mut child.request_remove_headers,
@@ -303,6 +308,11 @@ mod tests {
             error_root: None,
             add_headers: Vec::new(),
             remove_headers: Vec::new(),
+            proxy_hide_header: Vec::new(),
+            proxy_pass_header: Vec::new(),
+            proxy_redirect: Vec::new(),
+            proxy_cookie_domain: Vec::new(),
+            proxy_cookie_path: Vec::new(),
             request_headers: Vec::new(),
             request_remove_headers: Vec::new(),
             auth_request: None,
