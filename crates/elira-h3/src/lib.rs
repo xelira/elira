@@ -7,6 +7,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -425,6 +426,8 @@ where
     // Bridge the QUIC receive stream into a body. A channel keeps the body
     // Send + Sync, which the hyper client on the upstream hop requires.
     let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, BoxError>>(4);
+    let request_bytes = Arc::new(AtomicU64::new(0));
+    let request_bytes_for_body = request_bytes.clone();
     tokio::spawn(async move {
         let mut recv = recv;
         loop {
@@ -446,6 +449,7 @@ where
             match frame {
                 Ok(Some(mut buf)) => {
                     let bytes = buf.copy_to_bytes(buf.remaining());
+                    request_bytes_for_body.fetch_add(bytes.len() as u64, Ordering::Relaxed);
                     if tx.send(Ok(Frame::data(bytes))).await.is_err() {
                         return;
                     }
@@ -512,11 +516,13 @@ where
         _ => {}
     }
     let bytes = response.body().size_hint().exact().unwrap_or(0);
+    let req_bytes = request_bytes.load(Ordering::Relaxed);
+    metrics.request_bytes(req_bytes);
     metrics.response_bytes(bytes);
     if let Some(labels) = response.extensions().get::<elira_proxy::Labels>() {
-        metrics.record_route_bytes(&labels.route, 0, bytes);
+        metrics.record_route_bytes(&labels.route, req_bytes, bytes);
         if let Some(name) = &labels.upstream {
-            metrics.record_upstream_bytes(name, 0, bytes);
+            metrics.record_upstream_bytes(name, req_bytes, bytes);
         }
     }
 
