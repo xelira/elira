@@ -135,6 +135,8 @@
   `slow_start_secs`.
 - Общий DNS-резолвер с TTL, negative TTL и статическими записями
   `[[resolver.hosts]]`.
+- Кэширование ответов FastCGI, CGI и модулей с буферизацией до
+  `max_item_bytes`.
 - `GET /config` на админском листенере: эффективный конфиг в JSON.
 - Тесты FastCGI/CGI на обрезанные заголовки, длину записи, padding и хвост
   после `END_REQUEST`.

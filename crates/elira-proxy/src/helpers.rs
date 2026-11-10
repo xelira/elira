@@ -20,7 +20,7 @@ use tokio::io::BufReader;
 use tokio_util::io::{ReaderStream, StreamReader};
 
 use crate::files::Files;
-use crate::{Body, BoxError, ErrorPage, ServerAddr};
+use crate::{Body, BoxError, ErrorPage, RequestVars, RouteEntry, ServerAddr};
 
 pub(crate) fn serialize_head(req: &Request<Body>) -> String {
     let path = req
@@ -136,6 +136,39 @@ pub(crate) fn cacheable_response(headers: &HeaderMap) -> bool {
         }
         None => true,
     }
+}
+
+pub(crate) fn variable_or_empty(vars: &RequestVars, template: &str) -> String {
+    if let Some(name) = template.strip_prefix('$') {
+        if !name.is_empty() && !name.contains('$') && !name.contains('{') {
+            return vars
+                .value(name)
+                .map(|value| value.into_owned())
+                .unwrap_or_default();
+        }
+    }
+    vars.render(template)
+}
+
+pub(crate) fn cache_key_for(
+    entry: &RouteEntry,
+    vars: &RequestVars,
+    host: &str,
+    path: &str,
+) -> String {
+    entry
+        .cache_key
+        .as_ref()
+        .map(|template| vars.render(template))
+        .filter(|key| !key.is_empty())
+        .unwrap_or_else(|| format!("{host}{path}"))
+}
+
+pub(crate) fn cache_bypass(entry: &RouteEntry, vars: &RequestVars) -> bool {
+    entry.cache_bypass.iter().any(|template| {
+        let value = variable_or_empty(vars, template);
+        !value.is_empty() && value != "0"
+    })
 }
 
 pub(crate) fn cache_response(entry: elira_cache::Entry) -> Response<Body> {

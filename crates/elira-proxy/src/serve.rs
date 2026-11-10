@@ -6,8 +6,12 @@ use std::time::Instant;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use bytes::Bytes;
+use futures_util::StreamExt;
 use http::header::{AUTHORIZATION, CONTENT_LENGTH, LOCATION, WWW_AUTHENTICATE};
 use http::{HeaderValue, Method, Request, Response, StatusCode};
+use http_body::Frame;
+use http_body_util::{BodyExt, StreamBody};
 use md5::{Digest, Md5};
 
 use elira_tls::ClientIdentity;
@@ -327,59 +331,164 @@ impl Proxy {
                 entry,
                 request_id,
             )),
-            Target::FastCgi { .. } => {
-                let mut response = self.serve_fastcgi(req, entry, peer, scheme).await;
-                if body_limit_hit.load(Ordering::Relaxed) {
-                    return Err(self.body_too_large(entry, vars, peer).await);
-                }
-                response.extensions_mut().insert(Labels {
-                    route: entry.label.clone(),
-                    upstream: None,
-                    access_log: entry.access_log,
-                    access_log_sample: entry.access_log_sample,
-                });
-                self.apply_error_page(&mut response, entry, vars, peer)
-                    .await;
-                self.apply_route(&mut response, entry, vars, request_id);
-                Ok(response)
-            }
-            Target::Cgi { .. } => {
-                let mut response = self.serve_cgi(req, entry, peer, scheme).await;
-                if body_limit_hit.load(Ordering::Relaxed) {
-                    return Err(self.body_too_large(entry, vars, peer).await);
-                }
-                response.extensions_mut().insert(Labels {
-                    route: entry.label.clone(),
-                    upstream: None,
-                    access_log: entry.access_log,
-                    access_log_sample: entry.access_log_sample,
-                });
-                self.apply_error_page(&mut response, entry, vars, peer)
-                    .await;
-                self.apply_route(&mut response, entry, vars, request_id);
-                Ok(response)
-            }
-            Target::Scgi { .. }
+            Target::FastCgi { .. }
+            | Target::Cgi { .. }
+            | Target::Scgi { .. }
             | Target::Uwsgi { .. }
             | Target::Ajp { .. }
             | Target::Module(_)
             | Target::Wasm(_) => {
-                let mut response = self.serve_app(req, entry, peer, scheme).await;
-                if body_limit_hit.load(Ordering::Relaxed) {
-                    return Err(self.body_too_large(entry, vars, peer).await);
-                }
+                self.serve_dynamic(
+                    &entry.target,
+                    req,
+                    entry,
+                    vars,
+                    peer,
+                    scheme,
+                    request_id,
+                    body_limit_hit,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Serve FastCGI, CGI and the remaining application protocols, reusing
+    /// the response cache when the route asks for it.
+    #[allow(clippy::too_many_arguments)]
+    async fn serve_dynamic(
+        &self,
+        target: &Target,
+        req: Request<Body>,
+        entry: &RouteEntry,
+        vars: &RequestVars,
+        peer: SocketAddr,
+        scheme: &'static str,
+        request_id: &str,
+        body_limit_hit: &AtomicBool,
+    ) -> Result<Response<Body>, Response<Body>> {
+        let request_headers = req.headers().clone();
+        let path = req
+            .uri()
+            .path_and_query()
+            .map(|value| value.as_str().to_owned())
+            .unwrap_or_else(|| "/".to_owned());
+        let cache_key = (entry.cache != Some(false)
+            && req.method() == Method::GET
+            && self.inner.cache.is_some()
+            && !cache_bypass(entry, vars))
+        .then(|| cache_key_for(entry, vars, &vars.host, &path));
+
+        if let (Some(cache), Some(key)) = (&self.inner.cache, &cache_key) {
+            if let Some(hit) = cache.get(key, &request_headers, Instant::now()) {
+                let mut response = cache_response(hit);
+                response
+                    .headers_mut()
+                    .insert("x-cache", HeaderValue::from_static("HIT"));
                 response.extensions_mut().insert(Labels {
                     route: entry.label.clone(),
                     upstream: None,
                     access_log: entry.access_log,
                     access_log_sample: entry.access_log_sample,
                 });
-                self.apply_error_page(&mut response, entry, vars, peer)
-                    .await;
                 self.apply_route(&mut response, entry, vars, request_id);
-                Ok(response)
+                return Ok(response);
             }
         }
+
+        let mut response = match target {
+            Target::FastCgi { .. } => self.serve_fastcgi(req, entry, peer, scheme).await,
+            Target::Cgi { .. } => self.serve_cgi(req, entry, peer, scheme).await,
+            _ => self.serve_app(req, entry, peer, scheme).await,
+        };
+        if body_limit_hit.load(Ordering::Relaxed) {
+            return Err(self.body_too_large(entry, vars, peer).await);
+        }
+        response.extensions_mut().insert(Labels {
+            route: entry.label.clone(),
+            upstream: None,
+            access_log: entry.access_log,
+            access_log_sample: entry.access_log_sample,
+        });
+        self.apply_error_page(&mut response, entry, vars, peer)
+            .await;
+
+        if let (Some(cache), Some(key)) = (&self.inner.cache, &cache_key) {
+            let status = response.status().as_u16();
+            let explicitly_valid = entry
+                .cache_valid
+                .iter()
+                .any(|valid| valid.statuses.contains(&status));
+            if (status == StatusCode::OK.as_u16() || explicitly_valid)
+                && response.extensions().get::<ErrorPageApplied>().is_none()
+                && cacheable_response(response.headers())
+            {
+                let ttl = entry.cache_ttl_for(status);
+                let (parts, mut body) = response.into_parts();
+                let limit = self.inner.cache_max_item;
+                let mut chunks: Vec<Bytes> = Vec::new();
+                let mut total = 0usize;
+                let mut overflow = None;
+                let mut failed = false;
+                while let Some(frame) = body.frame().await {
+                    match frame {
+                        Ok(frame) => {
+                            let Ok(data) = frame.into_data() else {
+                                continue;
+                            };
+                            total = total.saturating_add(data.len());
+                            if total > limit {
+                                overflow = Some(data);
+                                break;
+                            }
+                            chunks.push(data);
+                        }
+                        Err(err) => {
+                            tracing::warn!(error = %err, "failed to buffer an app response");
+                            failed = true;
+                            break;
+                        }
+                    }
+                }
+
+                if failed {
+                    response = text(StatusCode::BAD_GATEWAY, "bad gateway");
+                } else if let Some(data) = overflow {
+                    // Too large to cache: replay what was read and keep
+                    // streaming the rest so the client sees the full body.
+                    let head = futures_util::stream::iter(
+                        chunks
+                            .into_iter()
+                            .map(|chunk| Ok::<_, BoxError>(Frame::data(chunk)))
+                            .chain(std::iter::once(Ok(Frame::data(data)))),
+                    );
+                    let tail = body.into_data_stream().map(|chunk| chunk.map(Frame::data));
+                    let streamed = StreamBody::new(head.chain(tail));
+                    response = Response::from_parts(parts, BodyExt::boxed(streamed));
+                } else {
+                    let bytes = Bytes::from(chunks.concat());
+                    cache.insert_with_ttl(
+                        key,
+                        &request_headers,
+                        &parts.headers,
+                        status,
+                        bytes.to_vec(),
+                        Instant::now(),
+                        ttl,
+                    );
+                    let body = http_body_util::Full::new(bytes)
+                        .map_err(|never| -> BoxError { match never {} })
+                        .boxed();
+                    response = Response::from_parts(parts, body);
+                    response
+                        .headers_mut()
+                        .insert("x-cache", HeaderValue::from_static("MISS"));
+                }
+            }
+        }
+
+        self.apply_route(&mut response, entry, vars, request_id);
+        Ok(response)
     }
 
     /// Run the configured auth_request subrequest. A 2xx allows the request;

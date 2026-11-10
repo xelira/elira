@@ -5803,7 +5803,7 @@ cgi_param = ["APP_ENV: test"]
 
 /// A tiny FastCGI responder: it ignores params and answers every STDIN
 /// terminator with a fixed response.
-async fn fastcgi_upstream() -> SocketAddr {
+async fn fastcgi_upstream(body: String) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind fcgi");
     let addr = listener.local_addr().expect("fcgi addr");
 
@@ -5812,6 +5812,7 @@ async fn fastcgi_upstream() -> SocketAddr {
             let Ok((mut stream, _)) = listener.accept().await else {
                 break;
             };
+            let body = body.clone();
             tokio::spawn(async move {
                 loop {
                     let mut header = [0u8; 8];
@@ -5827,7 +5828,11 @@ async fn fastcgi_upstream() -> SocketAddr {
                     }
                     // STDIN with no content terminates the request.
                     if kind == 5 && len == 0 {
-                        let body = "Content-Type: text/plain\r\n\r\nfastcgi";
+                        let body = format!(
+                            "Content-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
                         let mut record = vec![1, 6, 0, 1];
                         record.extend_from_slice(&(body.len() as u16).to_be_bytes());
                         record.extend_from_slice(&[0, 0]);
@@ -5848,7 +5853,7 @@ async fn fastcgi_upstream() -> SocketAddr {
 
 #[tokio::test]
 async fn fastcgi_route_talks_the_protocol() {
-    let upstream = fastcgi_upstream().await;
+    let upstream = fastcgi_upstream("fastcgi".to_owned()).await;
     let root = temp_root("fastcgi");
     let config = format!(
         r#"
@@ -5870,6 +5875,90 @@ fastcgi_root = "{root}"
     .await;
     assert_eq!(status(&response), "HTTP/1.1 200 OK");
     assert!(response.contains("fastcgi"), "{response}");
+}
+
+#[tokio::test]
+async fn fastcgi_responses_use_the_cache() {
+    let upstream = fastcgi_upstream("fastcgi".to_owned()).await;
+    let root = temp_root("fastcgi-cache");
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[cache]
+enabled = true
+max_bytes = 1048576
+max_item_bytes = 8192
+ttl_secs = 60
+
+[[routes]]
+host = "*"
+fastcgi_pass = "{upstream}"
+fastcgi_root = "{root}"
+cache_ttl_secs = 60
+"#,
+        root = root.display()
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+    let request = "GET /index.php HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
+
+    let first = roundtrip(addr, request).await;
+    assert!(
+        first.to_ascii_lowercase().contains("x-cache: miss"),
+        "{first}"
+    );
+    assert!(first.ends_with("fastcgi"), "{first}");
+
+    let second = roundtrip(addr, request).await;
+    assert!(
+        second.to_ascii_lowercase().contains("x-cache: hit"),
+        "{second}"
+    );
+    assert!(second.ends_with("fastcgi"), "{second}");
+}
+
+#[tokio::test]
+async fn oversized_fastcgi_response_streams_without_caching() {
+    let body = "x".repeat(4000);
+    let upstream = fastcgi_upstream(body.clone()).await;
+    let root = temp_root("fastcgi-large");
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[cache]
+enabled = true
+max_bytes = 1048576
+max_item_bytes = 1024
+ttl_secs = 60
+
+[[routes]]
+host = "*"
+fastcgi_pass = "{upstream}"
+fastcgi_root = "{root}"
+cache_ttl_secs = 60
+"#,
+        root = root.display()
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+    let request = "GET /index.php HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
+
+    let response = roundtrip(addr, request).await;
+    assert_eq!(status(&response), "HTTP/1.1 200 OK", "{response}");
+    let payload = response.split("\r\n\r\n").nth(1).expect("body");
+    // Hyper may use chunked framing, so count only the repeated bytes.
+    let bytes = payload.bytes().filter(|byte| *byte == b'x').count();
+    assert_eq!(bytes, body.len(), "{response}");
+    assert!(
+        !response.to_ascii_lowercase().contains("x-cache: hit"),
+        "{response}"
+    );
+
+    let second = roundtrip(addr, request).await;
+    assert!(
+        !second.to_ascii_lowercase().contains("x-cache: hit"),
+        "{second}"
+    );
 }
 
 /// A tiny SCGI responder: validates the length-prefixed header block and
