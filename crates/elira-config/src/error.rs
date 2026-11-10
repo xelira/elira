@@ -529,6 +529,9 @@ pub enum Error {
     #[error("route {index}: cache_key/cache_bypass template is invalid")]
     BadCacheKey { index: usize },
 
+    #[error("upstream_tls: client_cert/client_key must be paired and non-empty")]
+    BadUpstreamTls,
+
     #[error("tls.min_version tls10/tls11 needs tls.backend = \"openssl\"")]
     LegacyTlsNeedsOpenssl,
 }

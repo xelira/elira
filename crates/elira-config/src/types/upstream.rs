@@ -148,6 +148,26 @@ pub struct UpstreamTls {
     /// Lowest TLS version offered to upstreams.
     #[serde(default)]
     pub min_version: TlsVersion,
+
+    /// Client certificate presented to upstreams.
+    #[serde(default)]
+    pub client_cert: Option<PathBuf>,
+
+    /// Private key for `client_cert`.
+    #[serde(default)]
+    pub client_key: Option<PathBuf>,
+
+    /// PEM CRLs for upstream server certificates.
+    #[serde(default)]
+    pub client_crl: Option<PathBuf>,
+
+    /// Cipher suites offered to upstreams.
+    #[serde(default)]
+    pub cipher_suites: Option<Vec<String>>,
+
+    /// Key exchange groups offered to upstreams.
+    #[serde(default)]
+    pub curves: Option<Vec<String>>,
 }
 
 impl Default for Health {

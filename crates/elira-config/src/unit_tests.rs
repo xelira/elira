@@ -513,6 +513,53 @@ autoindex = true
 }
 
 #[test]
+fn upstream_tls_client_auth_requires_paired_files() {
+    let base = r#"
+listen = "127.0.0.1:8080"
+
+[upstream_tls]
+client_cert = "/tmp/client.pem"
+client_key = "/tmp/client.key"
+client_crl = "/tmp/revoked.pem"
+cipher_suites = ["TLS13_AES_128_GCM_SHA256"]
+curves = ["X25519"]
+
+[[upstreams]]
+name = "app"
+servers = ["127.0.0.1:3000"]
+
+[[routes]]
+host = "*"
+upstream = "app"
+"#;
+    let cfg = Config::parse(base).expect("valid config");
+    assert_eq!(
+        cfg.upstream_tls.client_cert.as_deref(),
+        Some(std::path::Path::new("/tmp/client.pem"))
+    );
+    assert_eq!(cfg.upstream_tls.cipher_suites.as_ref().unwrap().len(), 1);
+    assert_eq!(cfg.upstream_tls.curves.as_ref().unwrap().len(), 1);
+
+    let missing_key = base.replace("client_key = \"/tmp/client.key\"\n", "");
+    assert!(matches!(
+        Config::parse(&missing_key),
+        Err(Error::BadUpstreamTls)
+    ));
+
+    let empty_cert = base.replace("client_cert = \"/tmp/client.pem\"", "client_cert = \"\"");
+    assert!(matches!(
+        Config::parse(&empty_cert),
+        Err(Error::BadUpstreamTls)
+    ));
+
+    let empty_crl = base.replace("client_crl = \"/tmp/revoked.pem\"", "client_crl = \"\"");
+    assert!(matches!(
+        Config::parse(&empty_crl),
+        Err(Error::BadUpstreamTls)
+    ));
+}
+
+#[test]
 fn rejects_autoindex_without_root() {
     let text = r#"
 listen = "127.0.0.1:8080"

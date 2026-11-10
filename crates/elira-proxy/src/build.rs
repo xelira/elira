@@ -55,6 +55,11 @@ pub(crate) fn build_pools(cfg: &Config) -> Result<(Pools, Vec<Arc<Pool>>), Error
             sni: up.sni.clone(),
             http2: up.http2.unwrap_or(cfg.upstream_tls.http2),
             tls13_only: cfg.upstream_tls.min_version == elira_config::TlsVersion::Tls13,
+            client_cert: cfg.upstream_tls.client_cert.clone(),
+            client_key: cfg.upstream_tls.client_key.clone(),
+            client_crl: cfg.upstream_tls.client_crl.clone(),
+            cipher_suites: cfg.upstream_tls.cipher_suites.clone(),
+            curves: cfg.upstream_tls.curves.clone(),
         };
         let connector = https_connector(&tls).map_err(|err| Error::UpstreamTls {
             reason: err.to_string(),

@@ -163,7 +163,7 @@ Living list for the self-improvement loop. One item per session.
 - [x] Cache key and bypass directives.
 - [ ] Cache zones, manager/loader.
 - [ ] FastCGI/CGI response caching.
-- [ ] Upstream client certificates, upstream CRL and upstream cipher policy.
+- [x] Upstream client certificates, upstream CRL and upstream cipher policy.
 - [ ] Separate connect/send/read timeouts.
 - [ ] `proxy_protocol on` toward upstreams and `proxy_bind`.
 - [x] `proxy_redirect`, `proxy_cookie_domain/path`, `proxy_hide_header`.

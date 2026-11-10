@@ -566,6 +566,18 @@ impl Config {
     }
 
     fn validate_upstreams(&self) -> Result<HashSet<&str>, Error> {
+        let tls = &self.upstream_tls;
+        let empty = |path: &Option<std::path::PathBuf>| {
+            path.as_ref()
+                .is_some_and(|path| path.as_os_str().is_empty())
+        };
+        if tls.client_cert.is_some() != tls.client_key.is_some()
+            || empty(&tls.client_cert)
+            || empty(&tls.client_key)
+            || empty(&tls.client_crl)
+        {
+            return Err(Error::BadUpstreamTls);
+        }
         let mut names = HashSet::new();
         for up in &self.upstreams {
             if up.name.trim().is_empty() {

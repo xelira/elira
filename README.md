@@ -229,7 +229,8 @@ Upstreams:
   idle connection pool, streaming CGI scripts, and native `.so` modules
   (in-process or in a child runner) and sandboxed WebAssembly modules
 - TCP and unix sockets in the same pool
-- TLS with a custom CA, explicit `insecure`, per-upstream SNI and HTTP/2
+- TLS with a custom CA, explicit `insecure`, per-upstream SNI and HTTP/2,
+  upstream client certificates, CRL checks and cipher/curve policy
 - WebSocket and other `Upgrade` tunnelling over HTTP/1.1, WebSocket over
   HTTP/2 via RFC 8441 extended `CONNECT`, and `CONNECT` over HTTP/1.1,
   HTTP/2 or HTTP/3 with an explicit allowlist

@@ -3645,6 +3645,209 @@ async fn self_signed_tls_upstream_is_rejected_by_default() {
 }
 
 #[tokio::test]
+async fn upstream_mtls_presents_the_client_certificate() {
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+    let ca_key = KeyPair::generate().expect("ca key");
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca = ca_params.self_signed(&ca_key).expect("ca");
+
+    let server_key = KeyPair::generate().expect("server key");
+    let mut server_params =
+        CertificateParams::new(vec!["localhost".to_owned()]).expect("server params");
+    server_params.serial_number = Some(2u64.into());
+    let server = server_params
+        .signed_by(&server_key, &ca, &ca_key)
+        .expect("server cert");
+
+    let client_key = KeyPair::generate().expect("client key");
+    let mut client_params = CertificateParams::new(Vec::<String>::new()).expect("client params");
+    client_params.serial_number = Some(3u64.into());
+    let client = client_params
+        .signed_by(&client_key, &ca, &ca_key)
+        .expect("client cert");
+
+    let root = temp_root("upstream-mtls");
+    let ca_path = root.join("ca.pem");
+    let server_cert = root.join("server.pem");
+    let server_key_path = root.join("server.key");
+    let client_cert = root.join("client.pem");
+    let client_key_path = root.join("client.key");
+    let crl_path = root.join("revoked.pem");
+    std::fs::write(&ca_path, ca.pem()).unwrap();
+    std::fs::write(&server_cert, server.pem()).unwrap();
+    std::fs::write(&server_key_path, server_key.serialize_pem()).unwrap();
+    std::fs::write(&client_cert, client.pem()).unwrap();
+    std::fs::write(&client_key_path, client_key.serialize_pem()).unwrap();
+
+    let revoked = rcgen::CertificateRevocationListParams {
+        this_update: time::OffsetDateTime::now_utc() - time::Duration::hours(1),
+        next_update: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+        crl_number: 1u64.into(),
+        issuing_distribution_point: None,
+        revoked_certs: vec![rcgen::RevokedCertParams {
+            serial_number: 2u64.into(),
+            revocation_time: time::OffsetDateTime::now_utc() - time::Duration::minutes(30),
+            reason_code: None,
+            invalidity_date: None,
+        }],
+        key_identifier_method: rcgen::KeyIdMethod::Sha256,
+    };
+    std::fs::write(
+        &crl_path,
+        revoked
+            .signed_by(&ca, &ca_key)
+            .expect("crl")
+            .pem()
+            .expect("crl pem"),
+    )
+    .unwrap();
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(CertificateDer::from(ca.der().to_vec()))
+        .expect("add ca");
+    let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+        Arc::new(roots),
+        Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
+    )
+    .build()
+    .expect("client verifier");
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("versions")
+    .with_client_cert_verifier(verifier)
+    .with_single_cert(
+        vec![CertificateDer::from(server.der().to_vec())],
+        PrivateKeyDer::Pkcs8(server_key.serialize_der().into()),
+    )
+    .expect("server config");
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mtls upstream");
+    let upstream = listener.local_addr().expect("mtls addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(mut stream) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 7\r\n\
+                          Connection: close\r\n\r\nmtls-ok",
+                    )
+                    .await;
+            });
+        }
+    });
+
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[upstream_tls]
+ca = "{}"
+client_cert = "{}"
+client_key = "{}"
+
+[[upstreams]]
+name = "secure"
+servers = ["{upstream}"]
+sni = "localhost"
+tls = true
+
+[[routes]]
+host = "*"
+upstream = "secure"
+"#,
+        ca_path.display(),
+        client_cert.display(),
+        client_key_path.display()
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let response = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&response), "HTTP/1.1 200 OK", "{response}");
+    assert!(response.ends_with("mtls-ok"), "{response}");
+
+    // Without a client certificate the handshake must fail and surface as a
+    // bad gateway instead of a hung request.
+    let missing = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[upstream_tls]
+ca = "{}"
+
+[[upstreams]]
+name = "secure"
+servers = ["{upstream}"]
+sni = "localhost"
+tls = true
+
+[[routes]]
+host = "*"
+upstream = "secure"
+"#,
+        ca_path.display()
+    );
+    let (addr, _stop, _metrics) = start(&missing).await;
+    let response = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&response), "HTTP/1.1 502 Bad Gateway", "{response}");
+
+    // A CRL that revokes the server certificate must also be enforced.
+    let revoked_config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[upstream_tls]
+ca = "{}"
+client_crl = "{}"
+
+[[upstreams]]
+name = "secure"
+servers = ["{upstream}"]
+sni = "localhost"
+tls = true
+
+[[routes]]
+host = "*"
+upstream = "secure"
+"#,
+        ca_path.display(),
+        crl_path.display()
+    );
+    let (addr, _stop, _metrics) = start(&revoked_config).await;
+    let response = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&response), "HTTP/1.1 502 Bad Gateway", "{response}");
+}
+
+#[tokio::test]
 async fn sendfile_serves_a_plain_static_get() {
     let root = temp_root("sendfile");
     std::fs::write(root.join("app.bin"), vec![b'x'; 256 * 1024]).unwrap();

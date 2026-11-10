@@ -421,10 +421,26 @@ dns_cleanup_hook = "/usr/local/lib/elira/cloudflare-dns.sh"
 | `ca` | путь | нет | дополнительный PEM-корень к системным |
 | `http2` | bool | `false` | предлагать `h2` в ALPN; HTTP/1.1 остаётся |
 | `min_version` | `tls12` \| `tls13` | `tls12` | минимальная версия TLS до upstream |
+| `client_cert` | путь | нет | PEM-сертификат для mTLS к upstream |
+| `client_key` | путь | нет | PEM-ключ к `client_cert`; задаётся только вместе с ним |
+| `client_crl` | путь | нет | PEM-списки отзыва для сертификата upstream |
+| `cipher_suites` | массив строк | все rustls | TLS cipher suites в именах rustls |
+| `curves` | массив строк | все rustls | key exchange groups в именах rustls |
 
 Применяется ко всем upstream'ам с `tls = true`. `insecure` нужен только для
 внутренних self-signed бэкендов. С `http2 = true` ALPN предлагает `h2` и
 `http/1.1`; выбор делает upstream.
+
+`client_cert` и `client_key` включают mutual TLS: Elira предъявляет этот
+сертификат при подключении к upstream. Пара обязательна целиком — один
+`client_cert` без ключа отклоняется при загрузке. С `client_crl` проверяется
+отзыв сертификата upstream по перечисленным в PEM CRL; отозванный сертификат
+даёт `502 Bad Gateway`.
+
+`cipher_suites` и `curves` сужают политику TLS до upstream. Имена берутся из
+rustls: например `TLS13_AES_128_GCM_SHA256` и `X25519`; регистр в именах групп
+не важен. Неизвестное имя или пустой список останавливают загрузку. Без этих
+полей остаются все suites и группы провайдера.
 
 ## `[http3]`
 

@@ -8,7 +8,9 @@ use hyper_rustls::{FixedServerNameResolver, HttpsConnector, HttpsConnectorBuilde
 use hyper_util::client::legacy::connect::HttpConnector;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::pki_types::{
+    CertificateDer, CertificateRevocationListDer, PrivateKeyDer, ServerName, UnixTime,
+};
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
 
 /// TLS settings for a single upstream.
@@ -26,6 +28,14 @@ pub struct TlsOptions {
     pub http2: bool,
     /// Refuse anything below TLS 1.3.
     pub tls13_only: bool,
+    /// Client certificate and key for mTLS to the upstream.
+    pub client_cert: Option<PathBuf>,
+    pub client_key: Option<PathBuf>,
+    /// PEM CRLs used when verifying the upstream certificate.
+    pub client_crl: Option<PathBuf>,
+    /// Cipher suites and key exchange groups, using rustls names.
+    pub cipher_suites: Option<Vec<String>>,
+    pub curves: Option<Vec<String>>,
 }
 
 /// Build an HTTPS connector that accepts both `https` and `http` upstreams.
@@ -64,7 +74,7 @@ pub fn https_connector(options: &TlsOptions) -> anyhow::Result<HttpsConnector<Ht
 pub fn client_config(options: &TlsOptions) -> anyhow::Result<ClientConfig> {
     // Pick the provider explicitly. Relying on the process default breaks as
     // soon as another crate installs a different backend.
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let provider = Arc::new(crypto_provider(options)?);
     let versions: &[&rustls::SupportedProtocolVersion] = if options.tls13_only {
         &[&rustls::version::TLS13]
     } else {
@@ -74,18 +84,133 @@ pub fn client_config(options: &TlsOptions) -> anyhow::Result<ClientConfig> {
         .with_protocol_versions(versions)
         .context("rustls provider does not support the requested protocol versions")?;
 
-    let config = if options.insecure {
+    let crls = match options.client_crl.as_deref() {
+        Some(path) => load_crls(path)?,
+        None => Vec::new(),
+    };
+    let builder = if options.insecure {
         // A custom CA is irrelevant here: the verifier accepts every chain.
         builder
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoCertificateVerification { provider }))
-            .with_no_client_auth()
     } else {
         let roots = root_store(options.ca.as_deref())?;
-        builder.with_root_certificates(roots).with_no_client_auth()
+        if crls.is_empty() {
+            builder.with_root_certificates(roots)
+        } else {
+            let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+                Arc::new(roots),
+                provider,
+            )
+            .with_crls(crls)
+            .build()
+            .context("failed to build a CRL-aware upstream verifier")?;
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(verifier)
+        }
     };
 
+    let config = match (&options.client_cert, &options.client_key) {
+        (Some(cert), Some(key)) => {
+            let (chain, key) = client_auth(cert, key)?;
+            builder
+                .with_client_auth_cert(chain, key)
+                .context("upstream rejected the client certificate and key pair")
+        }
+        _ => Ok(builder.with_no_client_auth()),
+    }?;
+
     Ok(config)
+}
+
+/// Build the crypto provider, narrowed to the configured cipher suites and
+/// key exchange groups. Both lists use the rustls names, for example
+/// `TLS13_AES_128_GCM_SHA256` and `X25519`.
+fn crypto_provider(options: &TlsOptions) -> anyhow::Result<CryptoProvider> {
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+
+    if let Some(names) = &options.cipher_suites {
+        if names.is_empty() {
+            anyhow::bail!("upstream_tls.cipher_suites is empty");
+        }
+        let mut suites = Vec::with_capacity(names.len());
+        for name in names {
+            let suite = rustls::crypto::aws_lc_rs::ALL_CIPHER_SUITES
+                .iter()
+                .copied()
+                .find(|suite| format!("{:?}", suite.suite()) == *name)
+                .with_context(|| format!("unknown TLS cipher suite {name:?}"))?;
+            suites.push(suite);
+        }
+        provider.cipher_suites = suites;
+    }
+
+    if let Some(names) = &options.curves {
+        if names.is_empty() {
+            anyhow::bail!("upstream_tls.curves is empty");
+        }
+        let mut groups = Vec::with_capacity(names.len());
+        for name in names {
+            let group = rustls::crypto::aws_lc_rs::ALL_KX_GROUPS
+                .iter()
+                .copied()
+                .find(|group| format!("{:?}", group.name()).eq_ignore_ascii_case(name))
+                .with_context(|| format!("unknown TLS key exchange group {name:?}"))?;
+            groups.push(group);
+        }
+        provider.kx_groups = groups;
+    }
+
+    Ok(provider)
+}
+
+fn load_crls(path: &Path) -> anyhow::Result<Vec<CertificateRevocationListDer<'static>>> {
+    let pem = std::fs::read(path)
+        .with_context(|| format!("failed to read CRL file {}", path.display()))?;
+    let mut reader = pem.as_slice();
+    let crls = rustls_pemfile::crls(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .with_context(|| format!("failed to parse CRL file {} as PEM", path.display()))?;
+
+    if crls.is_empty() {
+        anyhow::bail!("CRL file {} contains no CRLs", path.display());
+    }
+
+    Ok(crls)
+}
+
+fn client_auth(
+    cert: &Path,
+    key: &Path,
+) -> anyhow::Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+    let cert_pem = std::fs::read(cert)
+        .with_context(|| format!("failed to read client certificate {}", cert.display()))?;
+    let mut reader = cert_pem.as_slice();
+    let chain = rustls_pemfile::certs(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .with_context(|| {
+            format!(
+                "failed to parse client certificate {} as PEM",
+                cert.display()
+            )
+        })?;
+
+    if chain.is_empty() {
+        anyhow::bail!(
+            "client certificate {} contains no certificates",
+            cert.display()
+        );
+    }
+
+    let key_pem = std::fs::read(key)
+        .with_context(|| format!("failed to read client key {}", key.display()))?;
+    let mut reader = key_pem.as_slice();
+    let key = rustls_pemfile::private_key(&mut reader)
+        .with_context(|| format!("failed to parse client key {} as PEM", key.display()))?
+        .with_context(|| format!("client key {} contains no private key", key.display()))?;
+
+    Ok((chain, key))
 }
 
 fn root_store(ca: Option<&Path>) -> anyhow::Result<RootCertStore> {
@@ -199,7 +324,7 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio_rustls::TlsAcceptor;
 
-    use super::{https_connector, TlsOptions};
+    use super::{client_config, https_connector, TlsOptions};
 
     struct TestServer {
         addr: SocketAddr,
@@ -307,6 +432,7 @@ mod tests {
                 sni: None,
                 http2: false,
                 tls13_only: false,
+                ..TlsOptions::default()
             },
             server.localhost_uri(),
         )
@@ -338,6 +464,7 @@ mod tests {
                 sni: Some("localhost".to_owned()),
                 http2: false,
                 tls13_only: false,
+                ..TlsOptions::default()
             },
             server.ip_uri(),
         )
@@ -366,5 +493,60 @@ mod tests {
             message.contains(&path.display().to_string()),
             "error should mention {path:?}: {message}"
         );
+    }
+
+    #[test]
+    fn cipher_suite_policy_is_applied() {
+        let options = TlsOptions {
+            cipher_suites: Some(vec!["TLS13_AES_128_GCM_SHA256".to_owned()]),
+            ..TlsOptions::default()
+        };
+        client_config(&options).expect("known cipher suite should be accepted");
+
+        let error = client_config(&TlsOptions {
+            cipher_suites: Some(vec!["TLS13_NOPE".to_owned()]),
+            ..TlsOptions::default()
+        })
+        .expect_err("unknown cipher suite must fail");
+        assert!(
+            format!("{error:#}").contains("TLS13_NOPE"),
+            "error should mention the suite: {error:#}"
+        );
+    }
+
+    #[test]
+    fn curve_policy_is_applied() {
+        let options = TlsOptions {
+            curves: Some(vec!["X25519".to_owned()]),
+            ..TlsOptions::default()
+        };
+        client_config(&options).expect("known curve should be accepted");
+
+        let error = client_config(&TlsOptions {
+            curves: Some(vec!["X9999".to_owned()]),
+            ..TlsOptions::default()
+        })
+        .expect_err("unknown curve must fail");
+        assert!(
+            format!("{error:#}").contains("X9999"),
+            "error should mention the curve: {error:#}"
+        );
+    }
+
+    #[test]
+    fn empty_policy_lists_are_rejected() {
+        let error = client_config(&TlsOptions {
+            cipher_suites: Some(Vec::new()),
+            ..TlsOptions::default()
+        })
+        .expect_err("empty cipher suite list must fail");
+        assert!(format!("{error:#}").contains("cipher_suites"));
+
+        let error = client_config(&TlsOptions {
+            curves: Some(Vec::new()),
+            ..TlsOptions::default()
+        })
+        .expect_err("empty curve list must fail");
+        assert!(format!("{error:#}").contains("curves"));
     }
 }
