@@ -551,8 +551,8 @@ HTTP/3 живёт на отдельном UDP-порту и не делит со
   других проверок назначения нет.
 - Туннели ограничены тем же числом, что `limits.max_connections`, и тем же
   `upstream_timeout_secs` на установку соединения.
-- `CONNECT` работает по HTTP/1.1 и HTTP/2. Для HTTP/2 нужен TLS с ALPN
-  `h2` или `h2c = true`; HTTP/3-туннели пока не поддерживаются.
+- `CONNECT` работает по HTTP/1.1, HTTP/2 и HTTP/3. Для HTTP/2 нужен TLS с
+  ALPN `h2` или `h2c = true`; HTTP/3 использует QUIC-поток напрямую.
 - WebSocket over HTTP/2 (RFC 8441) принимается как extended `CONNECT` с
   `:protocol = websocket` и проксируется в upstream как обычный HTTP/1.1
   `Upgrade`. Исходные `Sec-WebSocket-*` заголовки сохраняются.

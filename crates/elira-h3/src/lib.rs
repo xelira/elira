@@ -14,6 +14,8 @@ use bytes::{Buf, Bytes};
 use http::{Request, Response};
 use http_body::{Body as _, Frame};
 use http_body_util::{BodyExt, StreamBody};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -253,6 +255,105 @@ async fn connection(
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn connect<S, B>(
+    req: Request<()>,
+    mut stream: h3::server::RequestStream<S, B>,
+    peer: SocketAddr,
+    proxy: Arc<dyn Fn() -> Proxy + Send + Sync>,
+    metrics: Arc<Metrics>,
+    body_timeout: Option<std::time::Duration>,
+) -> Result<(), BoxError>
+where
+    S: h3::quic::BidiStream<B> + Send + 'static,
+    S::RecvStream: Send + 'static,
+    B: Buf + From<Bytes> + Send + 'static,
+{
+    let started = Instant::now();
+    let target = match proxy().connect_target(&req) {
+        Ok(target) => target,
+        Err(error) => {
+            let response = Response::builder().status(error.status()).body(())?;
+            stream.send_response(response).await?;
+            stream.finish().await?;
+            return Ok(());
+        }
+    };
+
+    let tcp = match TcpStream::connect(&target).await {
+        Ok(tcp) => tcp,
+        Err(err) => {
+            tracing::debug!(%peer, target = %target, error = %err, "http/3 CONNECT failed");
+            let response = Response::builder()
+                .status(http::StatusCode::BAD_GATEWAY)
+                .body(())?;
+            stream.send_response(response).await?;
+            stream.finish().await?;
+            return Ok(());
+        }
+    };
+
+    stream
+        .send_response(Response::builder().status(http::StatusCode::OK).body(())?)
+        .await?;
+    let (mut send, mut recv) = stream.split();
+    let (mut tcp_read, mut tcp_write) = tcp.into_split();
+
+    let client_to_tcp = tokio::spawn(async move {
+        loop {
+            let data = match body_timeout {
+                Some(idle) => match tokio::time::timeout(idle, recv.recv_data()).await {
+                    Ok(result) => result,
+                    Err(_) => break,
+                },
+                None => recv.recv_data().await,
+            };
+            let Ok(Some(mut data)) = data else { break };
+            let bytes = data.copy_to_bytes(data.remaining());
+            let write = tcp_write.write_all(&bytes);
+            let ok = match body_timeout {
+                Some(idle) => matches!(tokio::time::timeout(idle, write).await, Ok(Ok(()))),
+                None => write.await.is_ok(),
+            };
+            if !ok {
+                break;
+            }
+        }
+        let _ = tcp_write.shutdown().await;
+    });
+
+    let mut buffer = [0u8; 16 * 1024];
+    loop {
+        let read = match body_timeout {
+            Some(idle) => match tokio::time::timeout(idle, tcp_read.read(&mut buffer)).await {
+                Ok(result) => result,
+                Err(_) => break,
+            },
+            None => tcp_read.read(&mut buffer).await,
+        };
+        let Ok(read) = read else { break };
+        if read == 0 {
+            break;
+        }
+        let data = B::from(Bytes::copy_from_slice(&buffer[..read]));
+        let send_data = send.send_data(data);
+        let ok = match body_timeout {
+            Some(idle) => matches!(tokio::time::timeout(idle, send_data).await, Ok(Ok(()))),
+            None => send_data.await.is_ok(),
+        };
+        if !ok {
+            break;
+        }
+    }
+
+    client_to_tcp.abort();
+    let _ = client_to_tcp.await;
+    let _ = send.finish().await;
+
+    metrics.record_request(http::StatusCode::OK.as_u16(), started.elapsed());
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn request<S, B>(
     req: Request<()>,
     stream: h3::server::RequestStream<S, B>,
@@ -271,6 +372,9 @@ where
     let started = Instant::now();
     let id = request_id();
     let method = req.method().clone();
+    if method == http::Method::CONNECT {
+        return connect(req, stream, peer, proxy, metrics, body_timeout).await;
+    }
     let version = req.version();
     let path = req
         .uri()

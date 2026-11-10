@@ -19,17 +19,37 @@ use tokio::net::{TcpStream, UnixStream};
 
 use crate::*;
 
-impl Proxy {
-    /// CONNECT is only useful when the target is already trusted; anything
-    /// else turns the proxy into an open relay.
-    pub(crate) async fn connect(
-        &self,
-        mut req: Request<Body>,
-    ) -> Result<Response<Body>, Response<Body>> {
-        let Some(allowed) = &self.inner.connect else {
-            return Err(text(StatusCode::METHOD_NOT_ALLOWED, "CONNECT is disabled"));
-        };
+/// Why a CONNECT target was refused.
+#[derive(Debug, Clone, Copy)]
+pub enum ConnectError {
+    Disabled,
+    Forbidden,
+    BadTarget,
+}
 
+impl ConnectError {
+    pub fn status(self) -> StatusCode {
+        match self {
+            Self::Disabled => StatusCode::METHOD_NOT_ALLOWED,
+            Self::Forbidden => StatusCode::FORBIDDEN,
+            Self::BadTarget => StatusCode::BAD_REQUEST,
+        }
+    }
+
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Disabled => "CONNECT is disabled",
+            Self::Forbidden => "CONNECT target is not allowed",
+            Self::BadTarget => "CONNECT needs host:port",
+        }
+    }
+}
+
+impl Proxy {
+    /// Validate a CONNECT target without opening the tunnel. The HTTP/3 path
+    /// uses this and then owns the QUIC stream directly.
+    pub fn connect_target<B>(&self, req: &Request<B>) -> Result<String, ConnectError> {
+        let allowed = self.inner.connect.as_ref().ok_or(ConnectError::Disabled)?;
         let target = req
             .uri()
             .authority()
@@ -42,11 +62,22 @@ impl Proxy {
                     .ok()
                     .map(|value| value.as_str().to_owned())
             })
-            .ok_or_else(|| text(StatusCode::BAD_REQUEST, "CONNECT needs host:port"))?;
-
+            .ok_or(ConnectError::BadTarget)?;
         if !allowed.iter().any(|entry| entry.as_str() == target) {
-            return Err(text(StatusCode::FORBIDDEN, "CONNECT target is not allowed"));
+            return Err(ConnectError::Forbidden);
         }
+        Ok(target)
+    }
+
+    /// CONNECT is only useful when the target is already trusted; anything
+    /// else turns the proxy into an open relay.
+    pub(crate) async fn connect(
+        &self,
+        mut req: Request<Body>,
+    ) -> Result<Response<Body>, Response<Body>> {
+        let target = self
+            .connect_target(&req)
+            .map_err(|error| text(error.status(), error.message()))?;
 
         let permit = match self.inner.tunnels.clone().try_acquire_owned() {
             Ok(permit) => permit,

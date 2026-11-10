@@ -53,6 +53,7 @@ use health::*;
 pub(crate) use helpers::*;
 pub use helpers::{compressible, preferred_encoding};
 pub(crate) use pool::*;
+pub use tunnel::ConnectError;
 use variables::*;
 
 use files::Files;
