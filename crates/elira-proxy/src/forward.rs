@@ -243,6 +243,22 @@ impl Proxy {
 
         let vars = self.request_vars(&req, &key, &forward_host, scheme, peer, &request_id);
 
+        let conn_guard = match &entry.conn_limit {
+            Some(limiter) => match limiter.try_enter(peer.ip()) {
+                Some(guard) => Some(guard),
+                None => {
+                    let mut response = text(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "too many concurrent requests",
+                    );
+                    self.apply_error_page(&mut response, entry, &vars, peer)
+                        .await;
+                    return Err(response);
+                }
+            },
+            None => None,
+        };
+
         if let Some(response) = self.if_response(entry, &vars, &request_id) {
             return Ok(response);
         }
@@ -284,6 +300,9 @@ impl Proxy {
                     .await;
                 return response.map(|mut response| {
                     self.throttle(&mut response, entry);
+                    if let Some(guard) = conn_guard {
+                        self.hold(&mut response, guard);
+                    }
                     response
                 });
             }
@@ -413,6 +432,7 @@ impl Proxy {
                     route_timeout,
                     proxy_permit,
                     connect_protocol.is_some(),
+                    conn_guard.map(|guard| Box::new(guard) as Box<dyn Send + Sync>),
                 )
                 .await;
             match &result {
@@ -467,6 +487,9 @@ impl Proxy {
             .await;
         result.map(|mut response| {
             self.throttle(&mut response, entry);
+            if let Some(guard) = conn_guard {
+                self.hold(&mut response, guard);
+            }
             response
         })
     }
@@ -482,6 +505,12 @@ impl Proxy {
         }
         let body = std::mem::replace(response.body_mut(), empty());
         *response.body_mut() = rate_limit_body(body, rate, entry.rate_after);
+    }
+
+    /// Keep a route concurrency permit until the response body is finished.
+    fn hold(&self, response: &mut Response<Body>, guard: RequestGuard) {
+        let body = std::mem::replace(response.body_mut(), empty());
+        *response.body_mut() = hold_body(body, Box::new(guard));
     }
 
     fn request_vars(

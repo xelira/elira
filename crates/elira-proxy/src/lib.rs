@@ -92,6 +92,58 @@ pub struct UpstreamInfo {
     pub time: Duration,
 }
 
+/// Counts in-flight requests per client IP for a route's `limit_conn`.
+pub(crate) struct RequestLimiter {
+    limit: usize,
+    active: Mutex<HashMap<std::net::IpAddr, usize>>,
+}
+
+impl RequestLimiter {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            active: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn try_enter(self: &Arc<Self>, ip: std::net::IpAddr) -> Option<RequestGuard> {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let count = active.entry(ip).or_insert(0);
+        if *count >= self.limit {
+            return None;
+        }
+        *count += 1;
+        Some(RequestGuard {
+            limiter: self.clone(),
+            ip,
+        })
+    }
+}
+
+pub(crate) struct RequestGuard {
+    limiter: Arc<RequestLimiter>,
+    ip: std::net::IpAddr,
+}
+
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        let mut active = self
+            .limiter
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(count) = active.get_mut(&self.ip) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                active.remove(&self.ip);
+            }
+        }
+    }
+}
+
 /// Marks a response whose body already came from an error page.
 #[derive(Clone, Copy)]
 struct ErrorPageApplied;
@@ -267,6 +319,7 @@ struct RouteEntry {
     rate: Option<u64>,
     rate_after: u64,
     rate_delay: bool,
+    conn_limit: Option<Arc<RequestLimiter>>,
     limiter: Option<Arc<RateLimiter>>,
     rate_key: RequestKey,
     body_limit: Option<usize>,

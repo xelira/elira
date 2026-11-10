@@ -2268,6 +2268,7 @@ upstream = "app"
 limit_rate = 2000
 limit_rate_after = 0
 rate_delay = true
+limit_conn = 4
 "#;
     let cfg = Config::parse(base).expect("valid config");
     assert_eq!(cfg.limits.limit_rate, 1000);
@@ -2275,6 +2276,7 @@ rate_delay = true
     assert_eq!(cfg.routes[0].limit_rate, Some(2000));
     assert_eq!(cfg.routes[0].limit_rate_after, Some(0));
     assert_eq!(cfg.routes[0].rate_delay, Some(true));
+    assert_eq!(cfg.routes[0].limit_conn, Some(4));
 }
 
 #[test]

@@ -4660,6 +4660,52 @@ upstream = "app"
     );
 }
 
+#[tokio::test]
+async fn route_limit_conn_rejects_parallel_requests() {
+    let slow = TcpListener::bind("127.0.0.1:0").await.expect("bind slow");
+    let slow_addr = slow.local_addr().expect("slow addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = slow.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut head = [0u8; 1024];
+                let _ = stream.read(&mut head).await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .await;
+            });
+        }
+    });
+
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[upstreams]]
+name = "slow"
+servers = ["{slow_addr}"]
+
+[[routes]]
+host = "*"
+upstream = "slow"
+limit_conn = 1
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+    let request = "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
+    let first = tokio::spawn(async move { roundtrip(addr, request).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let second = roundtrip(addr, request).await;
+    assert_eq!(status(&second), "HTTP/1.1 503 Service Unavailable");
+
+    let first = first.await.expect("first request");
+    assert_eq!(status(&first), "HTTP/1.1 200 OK");
+}
+
 /// An upstream that varies its answer by Accept-Language and says so.
 async fn vary_upstream() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0")

@@ -201,6 +201,41 @@ pub fn rate_limit_body(body: Body, rate: u64, after: u64) -> Body {
     .boxed()
 }
 
+/// Keep `hold` alive until the response body is finished. Used by per-route
+/// concurrency limits, which must cover streamed responses.
+pub(crate) fn hold_body(body: Body, hold: Box<dyn Send + Sync>) -> Body {
+    HoldBody {
+        inner: body,
+        _hold: hold,
+    }
+    .boxed()
+}
+
+struct HoldBody {
+    inner: Body,
+    _hold: Box<dyn Send + Sync>,
+}
+
+impl HttpBody for HoldBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        Pin::new(&mut self.get_mut().inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
 struct RateBody {
     inner: Body,
     rate: u64,

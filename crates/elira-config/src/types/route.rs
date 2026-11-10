@@ -331,6 +331,11 @@ pub struct Route {
     #[serde(default)]
     pub rate_key: Option<String>,
 
+    /// Concurrent requests allowed per client IP on this route. Zero disables
+    /// the limit.
+    #[serde(default)]
+    pub limit_conn: Option<u32>,
+
     /// Delay requests over the rate instead of rejecting them until the burst
     /// queue is full. False keeps nginx's `nodelay` behaviour.
     #[serde(default)]

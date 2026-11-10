@@ -370,6 +370,10 @@ pub(crate) fn build_route(
             .limit_rate_after
             .unwrap_or(cfg.limits.limit_rate_after),
         rate_delay: route.rate_delay.unwrap_or(false),
+        conn_limit: route
+            .limit_conn
+            .filter(|limit| *limit > 0)
+            .map(|limit| Arc::new(RequestLimiter::new(limit as usize))),
         limiter,
         rate_key: parse_request_key(route.rate_key.as_deref()),
         body_limit: route.max_body_bytes,

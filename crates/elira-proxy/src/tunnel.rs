@@ -135,6 +135,7 @@ impl Proxy {
         timeout: Duration,
         client_permit: Option<tokio::sync::OwnedSemaphorePermit>,
         extended_connect: bool,
+        hold: Option<Box<dyn Send + Sync>>,
     ) -> Result<Response<Body>, Response<Body>> {
         // Tunnels outlive the connection task that the accept loop tracks,
         // so they need their own bound.
@@ -207,6 +208,7 @@ impl Proxy {
         tokio::spawn(async move {
             let _permit = permit;
             let _client_permit = client_permit;
+            let _hold = hold;
             match client_upgrade.await {
                 Ok(client) => {
                     let mut client = TokioIo::new(client);
