@@ -60,24 +60,19 @@ impl Proxy {
         }
         let status = response.status();
         let page = entry
-            .and_then(|entry| {
-                entry
-                    .error_pages
-                    .iter()
-                    .find(|(code, _, _)| *code == status)
-            })
+            .and_then(|entry| entry.error_pages.iter().find(|page| page.status == status))
             .or_else(|| {
                 self.inner
                     .error_pages
                     .iter()
-                    .find(|(code, _, _)| *code == status)
+                    .find(|page| page.status == status)
             });
-        let Some((_, path, files)) = page else {
+        let Some(page) = page else {
             return;
         };
         let path = match vars {
-            Some(vars) => vars.render(path),
-            None => path.clone(),
+            Some(vars) => vars.render(&page.path),
+            None => page.path.clone(),
         };
 
         let request = Request::builder()
@@ -88,9 +83,11 @@ impl Proxy {
             return;
         };
 
-        let mut page = files.serve(&request, peer).await;
-        if page.status().is_success() {
-            *page.status_mut() = status;
+        let mut page_response = page.files.serve(&request, peer).await;
+        if let Some(override_status) = page.override_status {
+            *page_response.status_mut() = override_status;
+        } else if page_response.status().is_success() {
+            *page_response.status_mut() = status;
         }
         // These describe the error itself, not the page body.
         for name in [
@@ -99,11 +96,11 @@ impl Proxy {
             http::header::ALLOW,
         ] {
             if let Some(value) = response.headers().get(&name) {
-                page.headers_mut().insert(name, value.clone());
+                page_response.headers_mut().insert(name, value.clone());
             }
         }
-        page.extensions_mut().insert(ErrorPageApplied);
-        *response = page;
+        page_response.extensions_mut().insert(ErrorPageApplied);
+        *response = page_response;
     }
 
     pub(crate) fn fixed_response(

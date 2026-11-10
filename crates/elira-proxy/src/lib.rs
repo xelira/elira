@@ -111,6 +111,15 @@ pub struct Proxy {
     inner: Arc<Inner>,
 }
 
+/// One configured error page.
+#[derive(Clone)]
+pub(crate) struct ErrorPage {
+    pub(crate) status: StatusCode,
+    pub(crate) path: String,
+    pub(crate) files: Arc<Files>,
+    pub(crate) override_status: Option<StatusCode>,
+}
+
 struct Inner {
     routers: HashMap<String, Router>,
     rewrites: Vec<CompiledRewrite>,
@@ -142,7 +151,7 @@ struct Inner {
     spooled: AtomicU64,
     max_app_response: usize,
     max_upstream_response: usize,
-    error_pages: Vec<(StatusCode, String, Arc<Files>)>,
+    error_pages: Vec<ErrorPage>,
     fastcgi_pool: elira_fastcgi::Pool,
     refreshing: Arc<Mutex<HashSet<String>>>,
 }
@@ -239,7 +248,7 @@ struct RouteEntry {
     limiter: Option<Arc<RateLimiter>>,
     rate_key: RequestKey,
     body_limit: Option<usize>,
-    error_pages: Vec<(StatusCode, String, Arc<Files>)>,
+    error_pages: Vec<ErrorPage>,
     app_permits: Option<Arc<Semaphore>>,
     proxy_permits: Option<Arc<Semaphore>>,
     max_response: Option<usize>,

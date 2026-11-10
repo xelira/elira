@@ -273,9 +273,18 @@ impl Config {
                 return Err(Error::GlobalErrorPagesNeedRoot);
             }
             for page in &self.error_pages {
-                let mut parts = page.splitn(2, char::is_whitespace);
+                let mut parts = page.split_whitespace();
                 let status = parts.next().unwrap_or_default();
-                let path = parts.next().unwrap_or_default().trim();
+                let mut path = parts.next().unwrap_or_default();
+                if let Some(code) = path.strip_prefix('=') {
+                    if !code
+                        .parse::<u16>()
+                        .is_ok_and(|code| (200..=599).contains(&code))
+                    {
+                        return Err(Error::BadGlobalErrorPage { page: page.clone() });
+                    }
+                    path = parts.next().unwrap_or_default();
+                }
                 if status.parse::<u16>().is_err()
                     || !(100..=599).contains(&status.parse::<u16>().unwrap_or(0))
                     || !path.starts_with('/')
@@ -988,9 +997,21 @@ impl Config {
         }
 
         for page in &route.error_pages {
-            let mut parts = page.splitn(2, char::is_whitespace);
+            let mut parts = page.split_whitespace();
             let status = parts.next().unwrap_or_default();
-            let path = parts.next().unwrap_or_default().trim();
+            let mut path = parts.next().unwrap_or_default();
+            if let Some(code) = path.strip_prefix('=') {
+                if !code
+                    .parse::<u16>()
+                    .is_ok_and(|code| (200..=599).contains(&code))
+                {
+                    return Err(Error::BadErrorPage {
+                        index,
+                        page: page.clone(),
+                    });
+                }
+                path = parts.next().unwrap_or_default();
+            }
             if status.parse::<u16>().is_err()
                 || !(100..=599).contains(&status.parse::<u16>().unwrap_or(0))
                 || !path.starts_with('/')

@@ -175,6 +175,7 @@
 - `satisfy any/all` для ACL, `auth_file` и `auth_request`.
 - `secure_link` с query- и path-формой, base64url/hex и сроком действия.
 - `X-Accel-Redirect` и `X-Sendfile` с ограничением файлов корнем маршрута.
+- `error_page` со сменой статуса (`404 =200 /404.html`).
 - `CONNECT` поверх HTTP/3 с прямым туннелем QUIC-потока.
 - FastCGI multiplexing через `fastcgi_multiplex`.
 - OpenSSL TLS backend (`tls.backend = "openssl"`) с TLS 1.0/1.1/1.2/1.3,

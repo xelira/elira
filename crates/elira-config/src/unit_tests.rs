@@ -1841,6 +1841,25 @@ x_sendfile_root = "/srv/files"
 }
 
 #[test]
+fn error_page_status_overrides_are_validated() {
+    let base = r#"
+listen = "127.0.0.1:8080"
+
+[[routes]]
+host = "*"
+root = "/srv"
+error_pages = ["404 =200 /404.html"]
+"#;
+    assert!(Config::parse(base).is_ok());
+
+    let bad = base.replace("=200", "=abc");
+    assert!(matches!(
+        Config::parse(&bad),
+        Err(Error::BadErrorPage { .. })
+    ));
+}
+
+#[test]
 fn named_locations_are_validated() {
     let base = r#"
 listen = "127.0.0.1:8080"

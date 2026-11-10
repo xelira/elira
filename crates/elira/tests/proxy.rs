@@ -3891,6 +3891,33 @@ error_pages = ["404 /404.html"]
 }
 
 #[tokio::test]
+async fn error_page_can_override_the_status() {
+    let root = temp_root("error-page-status");
+    std::fs::write(root.join("missing.html"), "soft not found").unwrap();
+
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[routes]]
+host = "*"
+root = "{root}"
+error_pages = ["404 =200 /missing.html"]
+"#,
+        root = root.display()
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let response = roundtrip(
+        addr,
+        "GET /missing HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&response), "HTTP/1.1 200 OK", "{response}");
+    assert!(response.ends_with("soft not found"), "{response}");
+}
+
+#[tokio::test]
 async fn global_error_page_replaces_the_default_404() {
     let root = temp_root("global-error");
     let pages = temp_root("global-pages");

@@ -20,7 +20,7 @@ use tokio::io::BufReader;
 use tokio_util::io::{ReaderStream, StreamReader};
 
 use crate::files::Files;
-use crate::{Body, BoxError, ServerAddr};
+use crate::{Body, BoxError, ErrorPage, ServerAddr};
 
 pub(crate) fn serialize_head(req: &Request<Body>) -> String {
     let path = req
@@ -351,7 +351,7 @@ pub(crate) fn error_page_set(
     root: std::path::PathBuf,
     index: Vec<String>,
     pages: &[String],
-) -> Vec<(StatusCode, String, Arc<Files>)> {
+) -> Vec<ErrorPage> {
     if pages.is_empty() {
         return Vec::new();
     }
@@ -369,12 +369,29 @@ pub(crate) fn error_page_set(
     ));
     let mut out = Vec::new();
     for page in pages {
-        let mut parts = page.splitn(2, char::is_whitespace);
-        let status = parts.next().and_then(|s| s.parse::<u16>().ok());
-        let path = parts.next().unwrap_or_default().trim();
-        if let Some(status) = status.and_then(|s| StatusCode::from_u16(s).ok()) {
-            out.push((status, path.to_owned(), files.clone()));
-        }
+        let mut parts = page.split_whitespace();
+        let Some(status) = parts.next().and_then(|status| status.parse::<u16>().ok()) else {
+            continue;
+        };
+        let Some(status) = StatusCode::from_u16(status).ok() else {
+            continue;
+        };
+        let next = parts.next().unwrap_or_default();
+        let (override_status, path) = if let Some(code) = next.strip_prefix('=') {
+            let override_status = code
+                .parse::<u16>()
+                .ok()
+                .and_then(|code| StatusCode::from_u16(code).ok());
+            (override_status, parts.next().unwrap_or_default())
+        } else {
+            (None, next)
+        };
+        out.push(ErrorPage {
+            status,
+            path: path.to_owned(),
+            files: files.clone(),
+            override_status,
+        });
     }
     out
 }
