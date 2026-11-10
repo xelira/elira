@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -16,7 +16,7 @@ use hyper::body::Incoming;
 use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UnixListener};
 use tokio::sync::{watch, Semaphore};
 
@@ -254,6 +254,50 @@ impl Drop for ConnGuard {
     }
 }
 
+fn clone_tcp(stream: &TcpStream) -> std::io::Result<TcpStream> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let fd = unsafe { libc::dup(stream.as_raw_fd()) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+    std_stream.set_nonblocking(true)?;
+    TcpStream::from_std(std_stream)
+}
+
+struct TcpGuard {
+    stream: TcpStream,
+    linger: bool,
+    timeout: Duration,
+    reset: bool,
+}
+
+impl TcpGuard {
+    async fn finish(self, timed_out: bool) {
+        if timed_out && self.reset {
+            #[allow(deprecated)]
+            let _ = self.stream.set_linger(Some(Duration::ZERO));
+            return;
+        }
+        if !self.linger {
+            return;
+        }
+        let mut stream = self.stream;
+        let _ = stream.shutdown().await;
+        let mut buf = [0u8; 4096];
+        let drain = async {
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        };
+        let _ = tokio::time::timeout(self.timeout, drain).await;
+    }
+}
+
 /// What the accept loop needs. Everything here is captured at startup and a
 /// reload cannot change it.
 #[derive(Clone)]
@@ -267,6 +311,9 @@ pub struct Options {
     pub idle_timeout: Duration,
     pub keepalive_requests: usize,
     pub client_header_timeout: Option<Duration>,
+    pub lingering_close: bool,
+    pub lingering_timeout: Duration,
+    pub reset_timedout_connection: bool,
     pub proxy_protocol: bool,
     pub sendfile: bool,
     pub h2c: bool,
@@ -297,6 +344,9 @@ impl Options {
                 0 => None,
                 secs => Some(Duration::from_secs(secs)),
             },
+            lingering_close: cfg.limits.lingering_close,
+            lingering_timeout: Duration::from_secs(cfg.limits.lingering_timeout_secs),
+            reset_timedout_connection: cfg.limits.reset_timedout_connection,
             proxy_protocol: cfg.proxy_protocol,
             sendfile: cfg.sendfile,
             h2c: cfg.h2c,
@@ -495,6 +545,7 @@ pub async fn serve_unix(
                             None,
                             None,
                             "unix".to_owned(),
+                            None,
                         )
                         .await;
                         return;
@@ -530,6 +581,7 @@ pub async fn serve_unix(
                                 None,
                                 identity,
                                 "unix".to_owned(),
+                            None,
                             )
                             .await;
                         }
@@ -648,6 +700,17 @@ async fn serve_stream(
         None => None,
     };
 
+    let mut tcp_guard = if options.lingering_close || options.reset_timedout_connection {
+        clone_tcp(&stream).ok().map(|stream| TcpGuard {
+            stream,
+            linger: options.lingering_close,
+            timeout: options.lingering_timeout,
+            reset: options.reset_timedout_connection,
+        })
+    } else {
+        None
+    };
+
     let conn = ConnOptions {
         max_headers: options.max_headers,
         max_buf_size: options.max_buf_size,
@@ -678,6 +741,7 @@ async fn serve_stream(
                 Some(acme.clone()),
                 None,
                 options.name.clone(),
+                tcp_guard.take(),
             )
             .await;
             return;
@@ -700,6 +764,7 @@ async fn serve_stream(
                     Some(acme.clone()),
                     None,
                     options.name.clone(),
+                    tcp_guard.take(),
                 )
                 .await;
             }
@@ -742,6 +807,7 @@ async fn serve_stream(
                     None,
                     None,
                     options.name.clone(),
+                    tcp_guard.take(),
                 )
                 .await;
                 return;
@@ -789,6 +855,7 @@ async fn serve_stream(
                         options.acme.clone(),
                         identity,
                         options.name.clone(),
+                        tcp_guard.take(),
                     )
                     .await;
                 }
@@ -813,6 +880,7 @@ async fn serve_stream(
                 None,
                 None,
                 options.name.clone(),
+                tcp_guard.take(),
             )
             .await
         }
@@ -830,6 +898,7 @@ async fn serve_conn<I>(
     acme: Option<Arc<elira_acme::Acme>>,
     client_cert: Option<elira_tls::ClientIdentity>,
     listener: String,
+    guard: Option<TcpGuard>,
 ) where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -841,6 +910,8 @@ async fn serve_conn<I>(
     let body_timeout = opts.body_timeout;
     let keepalive_requests = opts.keepalive_requests;
     let served_for_service = Arc::new(AtomicU64::new(0));
+    let upgraded = Arc::new(AtomicBool::new(false));
+    let upgraded_for_service = upgraded.clone();
     let metrics_for_service = metrics.clone();
     let acme_for_service = acme.clone();
     let client_cert = client_cert.map(Arc::new);
@@ -849,6 +920,7 @@ async fn serve_conn<I>(
     let service = service_fn(move |mut req: hyper::Request<Incoming>| {
         let runtime = runtime.clone();
         let served = served_for_service.clone();
+        let upgraded = upgraded_for_service.clone();
         let idle = idle_for_service.clone();
         let metrics = metrics_for_service.clone();
         let acme = acme_for_service.clone();
@@ -858,6 +930,12 @@ async fn serve_conn<I>(
             // Reset the keep-alive watchdog: a request means the client is
             // still there, even if the response takes a while.
             idle.notify_one();
+
+            if req.method() == hyper::Method::CONNECT
+                || req.headers().contains_key(hyper::header::UPGRADE)
+            {
+                upgraded.store(true, Ordering::Relaxed);
+            }
 
             if let Some(identity) = &client_cert {
                 req.extensions_mut().insert(identity.as_ref().clone());
@@ -996,6 +1074,7 @@ async fn serve_conn<I>(
         }
     });
 
+    let mut timed_out = false;
     if opts.h2 {
         let mut builder = http2::Builder::new(TokioExecutor::new());
         builder
@@ -1035,6 +1114,7 @@ async fn serve_conn<I>(
                 drain(conn.as_mut(), peer, opts.drain_timeout).await;
             }
             _ = idle_watch(idle.clone(), opts.idle_timeout) => {
+                timed_out = true;
                 conn.as_mut().graceful_shutdown();
                 drain(conn.as_mut(), peer, opts.drain_timeout).await;
             }
@@ -1063,12 +1143,18 @@ async fn serve_conn<I>(
                 drain(conn.as_mut(), peer, opts.drain_timeout).await;
             }
             _ = idle_watch(idle.clone(), opts.idle_timeout) => {
+                timed_out = true;
                 conn.as_mut().graceful_shutdown();
                 drain(conn.as_mut(), peer, opts.drain_timeout).await;
             }
         }
     }
 
+    if !upgraded.load(Ordering::Relaxed) {
+        if let Some(guard) = guard {
+            guard.finish(timed_out).await;
+        }
+    }
     metrics.connection_finished();
 }
 

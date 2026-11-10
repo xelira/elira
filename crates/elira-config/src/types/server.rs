@@ -149,6 +149,18 @@ pub struct Limits {
     #[serde(default = "Limits::default_websocket_idle_secs")]
     pub websocket_idle_secs: u64,
 
+    /// Drain unread client bytes before closing a finished connection.
+    #[serde(default = "Limits::default_lingering_close")]
+    pub lingering_close: bool,
+
+    /// Maximum time spent draining a lingering close.
+    #[serde(default = "Limits::default_lingering_timeout_secs")]
+    pub lingering_timeout_secs: u64,
+
+    /// Send TCP RST instead of FIN when a connection ends on a timeout.
+    #[serde(default)]
+    pub reset_timedout_connection: bool,
+
     /// Idle FastCGI connections kept per backend.
     #[serde(default = "Limits::default_fastcgi_pool_idle")]
     pub fastcgi_pool_idle: usize,
@@ -312,6 +324,9 @@ impl Default for Limits {
             client_header_timeout_secs: Self::default_client_header_timeout_secs(),
             upstream_body_timeout_secs: Self::default_body_timeout_secs(),
             websocket_idle_secs: Self::default_websocket_idle_secs(),
+            lingering_close: Self::default_lingering_close(),
+            lingering_timeout_secs: Self::default_lingering_timeout_secs(),
+            reset_timedout_connection: false,
             connection_drain_secs: Self::default_drain_timeout_secs(),
             shutdown_timeout_secs: Self::default_shutdown_timeout_secs(),
             response_buffer_bytes: 0,
@@ -370,6 +385,14 @@ impl Limits {
 
     fn default_websocket_idle_secs() -> u64 {
         3600
+    }
+
+    fn default_lingering_close() -> bool {
+        true
+    }
+
+    fn default_lingering_timeout_secs() -> u64 {
+        5
     }
 
     fn default_drain_timeout_secs() -> u64 {

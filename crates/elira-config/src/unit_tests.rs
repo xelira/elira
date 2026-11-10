@@ -2420,6 +2420,26 @@ root = "/srv"
 }
 
 #[test]
+fn lingering_close_settings_are_parsed() {
+    let text = r#"
+listen = "127.0.0.1:8080"
+
+[limits]
+lingering_close = false
+lingering_timeout_secs = 2
+reset_timedout_connection = true
+
+[[routes]]
+host = "*"
+root = "/srv"
+"#;
+    let cfg = Config::parse(text).expect("valid limits");
+    assert!(!cfg.limits.lingering_close);
+    assert_eq!(cfg.limits.lingering_timeout_secs, 2);
+    assert!(cfg.limits.reset_timedout_connection);
+}
+
+#[test]
 fn named_locations_are_validated() {
     let base = r#"
 listen = "127.0.0.1:8080"

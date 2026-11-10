@@ -181,7 +181,7 @@ Living list for the self-improvement loop. One item per session.
 - [x] `limit_req` delay/nodelay semantics on top of the token bucket.
 - [x] `keepalive_requests` per connection.
 - [x] Configurable `client_header_timeout`.
-- [ ] `lingering_close` and `reset_timedout_connection`.
+- [x] `lingering_close` and `reset_timedout_connection`.
 - [x] Log reopen on SIGUSR1 for external rotation.
 - [x] `open_file_cache` for static metadata.
 - [x] `worker_rlimit_nofile` before worker spawn and `workers = "auto"`.
