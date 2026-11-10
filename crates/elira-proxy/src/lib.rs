@@ -232,6 +232,7 @@ struct RouteEntry {
     proxy_permits: Option<Arc<Semaphore>>,
     max_response: Option<usize>,
     fastcgi_pool: Option<Arc<elira_fastcgi::Pool>>,
+    fastcgi_mux: Option<Arc<elira_fastcgi::MultiplexPool>>,
     cache: Option<bool>,
     cache_ttl: Option<Duration>,
     access_log: bool,

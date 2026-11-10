@@ -819,6 +819,9 @@ impl Config {
         if route.fastcgi_pool_idle.is_some() && route.fastcgi_pass.is_none() {
             return Err(Error::PoolWithoutFastCgi { index });
         }
+        if route.fastcgi_multiplex && route.fastcgi_pass.is_none() {
+            return Err(Error::MultiplexWithoutFastCgi { index });
+        }
 
         if let Some(target) = &route.fastcgi_pass {
             if target.trim().is_empty() {

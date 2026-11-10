@@ -26,6 +26,7 @@
 //! ```
 
 mod error;
+mod multiplex;
 mod pool;
 mod protocol;
 mod response;
@@ -36,6 +37,7 @@ mod target;
 use std::time::Duration;
 
 pub use error::Error;
+pub use multiplex::MultiplexPool;
 pub use pool::Pool;
 pub use stream::{execute_stream, BodyStream, StreamResponse};
 pub use target::Target;
@@ -211,6 +213,18 @@ pub(crate) async fn write_record<S>(
 where
     S: AsyncWrite + Unpin,
 {
+    write_record_id(stream, protocol::REQUEST_ID, record_type, content).await
+}
+
+pub(crate) async fn write_record_id<S>(
+    stream: &mut S,
+    request_id: u16,
+    record_type: RecordType,
+    content: &[u8],
+) -> Result<(), Error>
+where
+    S: AsyncWrite + Unpin,
+{
     if content.len() > protocol::MAX_CONTENT {
         return Err(Error::Request(format!(
             "{} record is {} bytes; the maximum is {}",
@@ -220,8 +234,7 @@ where
         )));
     }
 
-    let header =
-        protocol::encode_header(record_type, protocol::REQUEST_ID, content.len() as u16, 0);
+    let header = protocol::encode_header(record_type, request_id, content.len() as u16, 0);
     stream.write_all(&header).await.map_err(write_error)?;
     stream.write_all(content).await.map_err(write_error)
 }

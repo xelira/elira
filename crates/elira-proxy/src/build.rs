@@ -256,6 +256,12 @@ pub(crate) fn build_route(
                 Duration::from_secs(cfg.limits.fastcgi_pool_idle_secs),
             ))
         }),
+        fastcgi_mux: route.fastcgi_multiplex.then(|| {
+            Arc::new(elira_fastcgi::MultiplexPool::new(
+                route.fastcgi_pool_idle.unwrap_or(4).max(1),
+                16,
+            ))
+        }),
     };
     Ok(entry)
 }

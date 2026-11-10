@@ -142,7 +142,7 @@ Living list for the self-improvement loop. One item per session.
 - [x] SCGI upstreams.
 - [x] uWSGI upstreams.
 - [x] AJP upstreams.
-- [ ] FastCGI multiplexing.
+- [x] FastCGI multiplexing.
 
 - [ ] `auth_request` subrequests.
 - [ ] `satisfy any/all` for auth plus ACL combinations.

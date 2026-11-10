@@ -297,6 +297,12 @@ pub struct Route {
     #[serde(default)]
     pub fastcgi_pool_idle: Option<usize>,
 
+    /// Keep several FastCGI requests in flight on one connection. The server
+    /// must support `FCGI_MPXS_CONNS`; request and response bodies are
+    /// buffered in this mode.
+    #[serde(default)]
+    pub fastcgi_multiplex: bool,
+
     /// Overrides whether this route uses the shared cache.
     #[serde(default)]
     pub cache_enabled: Option<bool>,

@@ -1676,6 +1676,34 @@ ajp_secret = "s3cret"
 }
 
 #[test]
+fn fastcgi_multiplex_needs_fastcgi() {
+    let base = r#"
+listen = "127.0.0.1:8080"
+
+[[routes]]
+host = "*"
+fastcgi_pass = "127.0.0.1:9000"
+fastcgi_root = "/srv/app"
+fastcgi_multiplex = true
+"#;
+    let cfg = Config::parse(base).expect("valid");
+    assert!(cfg.routes[0].fastcgi_multiplex);
+
+    let no_fastcgi = r#"
+listen = "127.0.0.1:8080"
+
+[[routes]]
+host = "*"
+fastcgi_multiplex = true
+return = { status = 200, body = "x" }
+"#;
+    assert!(matches!(
+        Config::parse(no_fastcgi),
+        Err(Error::MultiplexWithoutFastCgi { .. })
+    ));
+}
+
+#[test]
 fn named_locations_are_validated() {
     let base = r#"
 listen = "127.0.0.1:8080"

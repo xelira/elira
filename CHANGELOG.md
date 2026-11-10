@@ -172,6 +172,7 @@
 - uWSGI upstream через `uwsgi_pass`, `uwsgi_modifier1/2` и `uwsgi_param`.
 - AJP13 upstream через `ajp_pass` и `ajp_secret`.
 - `CONNECT` поверх HTTP/3 с прямым туннелем QUIC-потока.
+- FastCGI multiplexing через `fastcgi_multiplex`.
 - `Cache-Control: must-revalidate` запрещает stale-выдачу; `Expires`/`Date`
   задают TTL, если `max-age` нет. Запросы с `no-cache`/`no-store` обходят кэш.
 - Заголовки `Forwarded` и `X-Forwarded-Port` к upstream.

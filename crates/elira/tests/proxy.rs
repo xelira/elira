@@ -4983,6 +4983,136 @@ ajp_pass = "{upstream}"
     assert!(response.contains(&body), "large body was not forwarded");
 }
 
+/// A FastCGI responder that waits for two requests on the same connection
+/// before answering both, proving that request ids are multiplexed.
+async fn fastcgi_multiplex_upstream() -> SocketAddr {
+    fn read_name_value(data: &[u8], position: &mut usize) -> Option<(String, String)> {
+        fn length(data: &[u8], position: &mut usize) -> Option<usize> {
+            let first = *data.get(*position)?;
+            if first & 0x80 == 0 {
+                *position += 1;
+                Some(first as usize)
+            } else {
+                let bytes = data.get(*position..*position + 4)?;
+                *position += 4;
+                Some(u32::from_be_bytes(bytes.try_into().ok()?) as usize & 0x7FFF_FFFF)
+            }
+        }
+        let name_len = length(data, position)?;
+        let value_len = length(data, position)?;
+        let name = String::from_utf8_lossy(data.get(*position..*position + name_len)?).to_string();
+        *position += name_len;
+        let value =
+            String::from_utf8_lossy(data.get(*position..*position + value_len)?).to_string();
+        *position += value_len;
+        Some((name, value))
+    }
+
+    async fn write_record(stream: &mut TcpStream, id: u16, kind: u8, content: &[u8]) {
+        let mut header = vec![1, kind];
+        header.extend_from_slice(&id.to_be_bytes());
+        header.extend_from_slice(&(content.len() as u16).to_be_bytes());
+        header.extend_from_slice(&[0, 0]);
+        let _ = stream.write_all(&header).await;
+        let _ = stream.write_all(content).await;
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind multiplexed fcgi");
+    let addr = listener.local_addr().expect("fcgi addr");
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut uris: std::collections::HashMap<u16, String> =
+                    std::collections::HashMap::new();
+                let mut ready = Vec::new();
+                loop {
+                    let mut header = [0u8; 8];
+                    if stream.read_exact(&mut header).await.is_err() {
+                        return;
+                    }
+                    let kind = header[1];
+                    let id = u16::from_be_bytes([header[2], header[3]]);
+                    let length = u16::from_be_bytes([header[4], header[5]]) as usize;
+                    let padding = header[6] as usize;
+                    let mut content = vec![0u8; length + padding];
+                    if stream.read_exact(&mut content).await.is_err() {
+                        return;
+                    }
+                    content.truncate(length);
+
+                    match kind {
+                        4 => {
+                            let mut position = 0;
+                            while let Some((name, value)) = read_name_value(&content, &mut position)
+                            {
+                                if name == "REQUEST_URI" {
+                                    uris.insert(id, value);
+                                }
+                            }
+                        }
+                        5 if length == 0 => {
+                            ready.push(id);
+                            if ready.len() == 2 {
+                                for id in std::mem::take(&mut ready) {
+                                    let uri = uris.get(&id).cloned().unwrap_or_default();
+                                    let body =
+                                        format!("Content-Type: text/plain\r\n\r\nmultiplex:{uri}");
+                                    write_record(&mut stream, id, 6, body.as_bytes()).await;
+                                    write_record(&mut stream, id, 3, &[0, 0, 0, 0, 0, 0, 0, 0])
+                                        .await;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        }
+    });
+
+    addr
+}
+
+#[tokio::test]
+async fn fastcgi_multiplexes_two_requests_on_one_connection() {
+    let upstream = fastcgi_multiplex_upstream().await;
+    let root = temp_root("fastcgi-mux");
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[routes]]
+host = "*"
+fastcgi_pass = "{upstream}"
+fastcgi_root = "{root}"
+fastcgi_multiplex = true
+"#,
+        root = root.display()
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let first = roundtrip(
+        addr,
+        "GET /one HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    );
+    let second = roundtrip(
+        addr,
+        "GET /two HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    );
+    let (first, second) = tokio::join!(first, second);
+
+    assert_eq!(status(&first), "HTTP/1.1 200 OK", "{first}");
+    assert_eq!(status(&second), "HTTP/1.1 200 OK", "{second}");
+    assert!(first.contains("multiplex:/one"), "{first}");
+    assert!(second.contains("multiplex:/two"), "{second}");
+}
+
 #[tokio::test]
 async fn cleartext_http2_is_available_with_prior_knowledge() {
     use http_body_util::Empty;

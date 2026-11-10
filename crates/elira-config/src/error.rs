@@ -507,4 +507,7 @@ pub enum Error {
 
     #[error("route {index}: ajp_pass is empty")]
     EmptyAjpTarget { index: usize },
+
+    #[error("route {index}: fastcgi_multiplex needs fastcgi_pass")]
+    MultiplexWithoutFastCgi { index: usize },
 }

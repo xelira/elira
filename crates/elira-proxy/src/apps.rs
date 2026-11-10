@@ -107,18 +107,39 @@ impl Proxy {
         let request_body = limit_body(request_body, limit).boxed();
         let timeout = entry.timeout.unwrap_or(self.inner.timeout);
 
+        let max_response = entry.max_response.unwrap_or(self.inner.max_app_response);
+
+        if let Some(mux) = &entry.fastcgi_mux {
+            let mut stream = request_body;
+            let mut body = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                match chunk {
+                    Ok(chunk) => body.extend_from_slice(&chunk),
+                    Err(err) => {
+                        tracing::warn!(error = %err, "FastCGI request body failed");
+                        return text(StatusCode::BAD_GATEWAY, "FastCGI request failed");
+                    }
+                }
+            }
+            return match mux
+                .execute(target, &params, &body, timeout, max_response)
+                .await
+            {
+                Ok(response) => app_result(response.status, response.headers, response.body)
+                    .unwrap_or_else(|status| text(status, "FastCGI response failed")),
+                Err(err) => {
+                    tracing::warn!(error = %err, "FastCGI multiplexed request failed");
+                    text(StatusCode::BAD_GATEWAY, "FastCGI request failed")
+                }
+            };
+        }
+
         let fastcgi_pool = entry
             .fastcgi_pool
             .as_deref()
             .unwrap_or(&self.inner.fastcgi_pool);
         let response = match fastcgi_pool
-            .execute_stream(
-                target,
-                params,
-                request_body,
-                timeout,
-                entry.max_response.unwrap_or(self.inner.max_app_response),
-            )
+            .execute_stream(target, params, request_body, timeout, max_response)
             .await
         {
             Ok(response) => response,

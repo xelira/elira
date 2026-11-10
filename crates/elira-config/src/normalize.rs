@@ -114,6 +114,7 @@ fn inherit(parent: &Route, child: &mut Route) -> Result<(), Error> {
         .max_upstream_response_bytes
         .or(parent.max_upstream_response_bytes);
     child.fastcgi_pool_idle = child.fastcgi_pool_idle.or(parent.fastcgi_pool_idle);
+    child.fastcgi_multiplex |= parent.fastcgi_multiplex;
     child.cache_enabled = child.cache_enabled.or(parent.cache_enabled);
     child.cache_ttl_secs = child.cache_ttl_secs.or(parent.cache_ttl_secs);
     child.access_log_sample = child.access_log_sample.or(parent.access_log_sample);
@@ -273,6 +274,7 @@ mod tests {
             max_response_bytes: None,
             max_upstream_response_bytes: None,
             fastcgi_pool_idle: None,
+            fastcgi_multiplex: false,
             cache_enabled: None,
             cache_ttl_secs: None,
             access_log: Route::default_access_log(),
