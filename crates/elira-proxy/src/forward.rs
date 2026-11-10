@@ -864,6 +864,7 @@ impl Proxy {
                 .map_err(|_| text(StatusCode::BAD_GATEWAY, "bad request"))?;
             *upstream.headers_mut() = template.clone();
 
+            let started = Instant::now();
             match send_request(
                 pool,
                 &server,
@@ -874,12 +875,18 @@ impl Proxy {
             )
             .await
             {
-                Ok(answer) => {
-                    if attempt + 1 < attempts && pool.retry_on.status(answer.status().as_u16()) {
+                Ok(mut answer) => {
+                    let status = answer.status().as_u16();
+                    answer.extensions_mut().insert(UpstreamInfo {
+                        addr: server.to_string(),
+                        status: Some(status),
+                        time: started.elapsed(),
+                    });
+                    if attempt + 1 < attempts && pool.retry_on.status(status) {
                         pool.record_success(index);
                         tracing::warn!(
                             upstream = %server,
-                            status = answer.status().as_u16(),
+                            status,
                             "upstream returned a retryable status"
                         );
                         continue;
@@ -895,7 +902,13 @@ impl Proxy {
                     pool.record_failure(index);
                     tracing::warn!(upstream = %server, error = %err, "upstream request failed");
                     if !pool.retry_on.error || attempt + 1 == attempts {
-                        return Err(text(StatusCode::BAD_GATEWAY, "bad gateway"));
+                        let mut error = text(StatusCode::BAD_GATEWAY, "bad gateway");
+                        error.extensions_mut().insert(UpstreamInfo {
+                            addr: server.to_string(),
+                            status: None,
+                            time: started.elapsed(),
+                        });
+                        return Err(error);
                     }
                 }
                 Err(SendError::Timeout) => {
@@ -905,7 +918,13 @@ impl Proxy {
                     pool.record_failure(index);
                     tracing::warn!(upstream = %server, "upstream timed out");
                     if !pool.retry_on.timeout || attempt + 1 == attempts {
-                        return Err(text(StatusCode::GATEWAY_TIMEOUT, "gateway timeout"));
+                        let mut error = text(StatusCode::GATEWAY_TIMEOUT, "gateway timeout");
+                        error.extensions_mut().insert(UpstreamInfo {
+                            addr: server.to_string(),
+                            status: None,
+                            time: started.elapsed(),
+                        });
+                        return Err(error);
                     }
                 }
             }
@@ -946,6 +965,7 @@ impl Proxy {
             ));
         }
 
+        let upstream_info = response.extensions().get::<UpstreamInfo>().cloned();
         let (parts, body) = response.into_parts();
 
         if let Some(location) = parts
@@ -1003,6 +1023,9 @@ impl Proxy {
                 access_log: entry.access_log,
                 access_log_sample: entry.access_log_sample,
             });
+            if let Some(info) = upstream_info.clone() {
+                response.extensions_mut().insert(info);
+            }
             self.apply_error_page(&mut response, entry, vars, peer)
                 .await;
             self.apply_route(&mut response, entry, vars, request_id);
@@ -1221,6 +1244,9 @@ impl Proxy {
             access_log: entry.access_log,
             access_log_sample: entry.access_log_sample,
         });
+        if let Some(info) = upstream_info {
+            response.extensions_mut().insert(info);
+        }
         self.apply_error_page(&mut response, entry, vars, peer)
             .await;
         self.apply_route(&mut response, entry, vars, request_id);

@@ -84,6 +84,14 @@ pub struct Labels {
     pub access_log_sample: f64,
 }
 
+/// Per-request upstream details for access logs and admin output.
+#[derive(Clone, Debug)]
+pub struct UpstreamInfo {
+    pub addr: String,
+    pub status: Option<u16>,
+    pub time: Duration,
+}
+
 /// Marks a response whose body already came from an error page.
 #[derive(Clone, Copy)]
 struct ErrorPageApplied;

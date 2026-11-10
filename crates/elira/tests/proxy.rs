@@ -4614,6 +4614,52 @@ cache_zone = "tiny"
     );
 }
 
+#[tokio::test]
+async fn access_log_includes_upstream_details() {
+    let upstream = fixed_upstream("ok").await;
+    let root = temp_root("upstream-log");
+    let log = root.join("access.log");
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[log]
+file = "{log}"
+max_bytes = 1048576
+template = "$upstream_addr $upstream_status $upstream_response_time"
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "*"
+upstream = "app"
+"#,
+        log = log.display()
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let response = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&response), "HTTP/1.1 200 OK", "{response}");
+
+    let line = std::fs::read_to_string(&log).expect("access log");
+    assert!(
+        line.starts_with(&format!("{} 200 ", upstream)),
+        "unexpected line: {line}"
+    );
+    assert!(
+        line.split_whitespace()
+            .nth(2)
+            .is_some_and(|time| time.contains('.')),
+        "response time should be fractional: {line}"
+    );
+}
+
 /// An upstream that varies its answer by Accept-Language and says so.
 async fn vary_upstream() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0")

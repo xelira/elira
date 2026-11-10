@@ -909,6 +909,14 @@ async fn serve_conn<I>(
                 access_log = labels.access_log;
                 access_log_sample = labels.access_log_sample;
             }
+            let (upstream_addr, upstream_status, upstream_time) = match response
+                .extensions()
+                .get::<elira_proxy::UpstreamInfo>()
+                .cloned()
+            {
+                Some(info) => (Some(info.addr), info.status, Some(info.time)),
+                None => (None, None, None),
+            };
             let cache_result = match response
                 .headers()
                 .get("x-cache")
@@ -944,6 +952,9 @@ async fn serve_conn<I>(
                 user_agent,
                 request_id: id,
                 upstream,
+                upstream_addr,
+                upstream_status,
+                upstream_time,
             };
 
             if write_log {

@@ -474,6 +474,14 @@ where
         upstream = labels.upstream;
         log_sample = labels.access_log_sample;
     }
+    let (upstream_addr, upstream_status, upstream_time) = match response
+        .extensions()
+        .get::<elira_proxy::UpstreamInfo>()
+        .cloned()
+    {
+        Some(info) => (Some(info.addr), info.status, Some(info.time)),
+        None => (None, None, None),
+    };
     match response
         .headers()
         .get("x-cache")
@@ -531,6 +539,9 @@ where
         user_agent,
         request_id: id,
         upstream,
+        upstream_addr,
+        upstream_status,
+        upstream_time,
     };
     if write_log {
         log(&entry);

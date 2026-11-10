@@ -35,6 +35,12 @@ pub struct Entry {
     pub request_id: String,
     /// Upstream that served the request, when the route proxied.
     pub upstream: Option<String>,
+    /// Address of the upstream attempt that produced the response.
+    pub upstream_addr: Option<String>,
+    /// Status returned by that attempt, if it answered.
+    pub upstream_status: Option<u16>,
+    /// Time spent waiting for that attempt.
+    pub upstream_time: Option<Duration>,
 }
 
 impl Entry {
@@ -120,6 +126,27 @@ impl Entry {
                 out.push_str("null,");
             }
         }
+        match &self.upstream_addr {
+            Some(addr) => push_str(&mut out, "upstream_addr", addr),
+            None => {
+                push_key(&mut out, "upstream_addr");
+                out.push_str("null,");
+            }
+        }
+        match self.upstream_status {
+            Some(status) => push_num(&mut out, "upstream_status", u128::from(status)),
+            None => {
+                push_key(&mut out, "upstream_status");
+                out.push_str("null,");
+            }
+        }
+        match self.upstream_time {
+            Some(time) => push_num(&mut out, "upstream_response_time_ms", time.as_millis()),
+            None => {
+                push_key(&mut out, "upstream_response_time_ms");
+                out.push_str("null,");
+            }
+        }
 
         out.pop();
         out.push('}');
@@ -160,6 +187,9 @@ enum Variable {
     RemotePort,
     Host,
     Upstream,
+    UpstreamAddr,
+    UpstreamStatus,
+    UpstreamResponseTime,
     Request,
     RequestMethod,
     RequestUri,
@@ -181,6 +211,9 @@ impl Variable {
             "remote_port" => Self::RemotePort,
             "host" => Self::Host,
             "upstream" => Self::Upstream,
+            "upstream_addr" => Self::UpstreamAddr,
+            "upstream_status" => Self::UpstreamStatus,
+            "upstream_response_time" => Self::UpstreamResponseTime,
             "request" => Self::Request,
             "request_method" => Self::RequestMethod,
             "request_uri" => Self::RequestUri,
@@ -208,6 +241,26 @@ impl Variable {
             Self::Host => escape_line(&entry.host, out),
             Self::Upstream => match entry.upstream.as_deref().filter(|name| !name.is_empty()) {
                 Some(name) => escape_line(name, out),
+                None => out.push('-'),
+            },
+            Self::UpstreamAddr => match entry
+                .upstream_addr
+                .as_deref()
+                .filter(|addr| !addr.is_empty())
+            {
+                Some(addr) => escape_line(addr, out),
+                None => out.push('-'),
+            },
+            Self::UpstreamStatus => match entry.upstream_status {
+                Some(status) => {
+                    let _ = write!(out, "{status}");
+                }
+                None => out.push('-'),
+            },
+            Self::UpstreamResponseTime => match entry.upstream_time {
+                Some(time) => {
+                    let _ = write!(out, "{}.{:03}", time.as_secs(), time.subsec_millis());
+                }
                 None => out.push('-'),
             },
             Self::Request => {
@@ -545,7 +598,22 @@ mod tests {
             user_agent: Some("curl/8.0".to_owned()),
             request_id: "a1b2c3d4e5f60718".to_owned(),
             upstream: None,
+            upstream_addr: None,
+            upstream_status: None,
+            upstream_time: None,
         }
+    }
+
+    #[test]
+    fn format_renders_upstream_details() {
+        let mut entry = entry();
+        entry.upstream_addr = Some("10.0.0.5:8080".to_owned());
+        entry.upstream_status = Some(201);
+        entry.upstream_time = Some(Duration::from_millis(42));
+
+        let format =
+            Format::parse("$upstream_addr $upstream_status $upstream_response_time").unwrap();
+        assert_eq!(format.render(&entry), "10.0.0.5:8080 201 0.042");
     }
 
     #[test]
@@ -595,7 +663,8 @@ mod tests {
                 r#"{"peer":"203.0.113.5","method":"GET","version":"HTTP/1.1","host":"example.com","#,
                 r#""path":"/a\"b\\c\nline\ttab\u0007","#,
                 r#""status":200,"bytes":1234,"duration_ms":12,"#,
-                r#""user_agent":"ua\"\\\r","request_id":"a1b2c3d4e5f60718","upstream":null}"#
+                r#""user_agent":"ua\"\\\r","request_id":"a1b2c3d4e5f60718","upstream":null,"#,
+                r#""upstream_addr":null,"upstream_status":null,"upstream_response_time_ms":null}"#
             )
         );
         assert!(!e.json().contains('\n'));

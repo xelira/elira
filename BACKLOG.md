@@ -198,7 +198,7 @@ Living list for the self-improvement loop. One item per session.
 
 ### Section 6 — observability
 
-- [ ] `$upstream_addr`, `$upstream_status`, `$upstream_response_time` in
+- [x] `$upstream_addr`, `$upstream_status`, `$upstream_response_time` in
   access logs and templates.
 - [ ] Map-derived log variables.
 - [ ] Request/response bytes and timings split per route and upstream.
