@@ -82,6 +82,7 @@ impl Runtime {
                         default,
                         named: &named,
                         reject_unknown_sni: tls.reject_unknown_sni,
+                        verify_ocsp: tls.verify_ocsp,
                         client_ca: tls.client_ca.as_deref(),
                         client_crl: tls.client_crl.as_deref(),
                         client_auth: mode,

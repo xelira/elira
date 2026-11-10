@@ -12,6 +12,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
+use openssl::hash::MessageDigest;
+use openssl::ocsp::{OcspCertId, OcspCertStatus, OcspFlag, OcspResponse, OcspResponseStatus};
+use openssl::stack::Stack;
+use openssl::x509::store::X509StoreBuilder;
+use openssl::x509::X509;
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKeyDer};
 use rustls::server::danger::ClientCertVerifier;
@@ -44,6 +49,8 @@ pub struct ServerOptions<'a> {
     pub named: &'a [NamedCert],
     /// Reject clients whose SNI does not match a named certificate.
     pub reject_unknown_sni: bool,
+    /// Verify the stapled OCSP response against the issuing certificate.
+    pub verify_ocsp: bool,
     pub client_ca: Option<&'a Path>,
     /// Pem bundle of CRLs used when a client certificate is presented.
     pub client_crl: Option<&'a Path>,
@@ -254,6 +261,9 @@ pub enum Error {
     #[error("no CRLs in {path}")]
     NoCrls { path: PathBuf },
 
+    #[error("verify OCSP for {path}: {reason}")]
+    OcspVerification { path: PathBuf, reason: String },
+
     #[error("ticket key: {0}")]
     TicketKey(String),
 
@@ -322,6 +332,7 @@ pub fn server_config(cert: &Path, key: &Path) -> Result<ServerConfig, Error> {
         default: Some((cert, key)),
         named: &[],
         reject_unknown_sni: false,
+        verify_ocsp: false,
         client_ca: None,
         client_crl: None,
         client_auth: ClientAuth::Off,
@@ -358,6 +369,7 @@ pub fn server_config_with_client_auth(
         default: Some((cert, key)),
         named: &[],
         reject_unknown_sni: false,
+        verify_ocsp: false,
         client_ca,
         client_crl: None,
         client_auth: mode,
@@ -420,6 +432,7 @@ pub fn quic_server_config_full(
             default: Some((cert, key)),
             named,
             reject_unknown_sni,
+            verify_ocsp: false,
             client_ca,
             client_crl,
             client_auth: mode,
@@ -669,10 +682,10 @@ fn build(options: &ServerOptions<'_>, alpn: &[&[u8]]) -> Result<ServerConfig, Er
 
     let ocsp = read_ocsp(options.ocsp)?;
 
-    let named = build_named(options.named)?;
+    let named = build_named(options.named, options.verify_ocsp)?;
 
     let default = match options.default {
-        Some((cert, key)) => Some(Arc::new(certified(cert, key, ocsp)?)),
+        Some((cert, key)) => Some(Arc::new(certified(cert, key, ocsp, options.verify_ocsp)?)),
         None => None,
     };
 
@@ -702,7 +715,7 @@ fn build(options: &ServerOptions<'_>, alpn: &[&[u8]]) -> Result<ServerConfig, Er
     Ok(config)
 }
 
-fn build_named(named: &[NamedCert]) -> Result<Vec<NamedCertKey>, Error> {
+fn build_named(named: &[NamedCert], verify_ocsp: bool) -> Result<Vec<NamedCertKey>, Error> {
     let mut out = Vec::with_capacity(named.len());
     for entry in named {
         out.push((
@@ -711,6 +724,7 @@ fn build_named(named: &[NamedCert]) -> Result<Vec<NamedCertKey>, Error> {
                 &entry.cert,
                 &entry.key,
                 read_ocsp(entry.ocsp.as_deref())?,
+                verify_ocsp,
             )?),
         ));
     }
@@ -727,7 +741,60 @@ fn read_ocsp(path: Option<&Path>) -> Result<Option<Vec<u8>>, Error> {
     }
 }
 
-fn certified(cert: &Path, key: &Path, ocsp: Option<Vec<u8>>) -> Result<CertifiedKey, Error> {
+fn verify_ocsp_response(
+    cert_path: &Path,
+    chain: &[CertificateDer<'_>],
+    response: &[u8],
+) -> Result<(), Error> {
+    let reason = |reason: String| Error::OcspVerification {
+        path: cert_path.to_path_buf(),
+        reason,
+    };
+
+    let leaf = X509::from_der(chain[0].as_ref()).map_err(|err| reason(err.to_string()))?;
+    let issuer = chain
+        .get(1)
+        .ok_or_else(|| reason("certificate chain has no issuer".to_owned()))?;
+    let issuer = X509::from_der(issuer.as_ref()).map_err(|err| reason(err.to_string()))?;
+
+    let response = OcspResponse::from_der(response).map_err(|err| reason(err.to_string()))?;
+    if response.status() != OcspResponseStatus::SUCCESSFUL {
+        return Err(reason(
+            "responder did not return a successful status".to_owned(),
+        ));
+    }
+    let basic = response.basic().map_err(|err| reason(err.to_string()))?;
+
+    let mut store = X509StoreBuilder::new().map_err(|err| reason(err.to_string()))?;
+    store
+        .add_cert(issuer.clone())
+        .map_err(|err| reason(err.to_string()))?;
+    let store = store.build();
+    let mut certs = Stack::new().map_err(|err| reason(err.to_string()))?;
+    certs
+        .push(issuer.clone())
+        .map_err(|err| reason(err.to_string()))?;
+    basic
+        .verify(certs.as_ref(), &store, OcspFlag::empty())
+        .map_err(|err| reason(err.to_string()))?;
+
+    let id = OcspCertId::from_cert(MessageDigest::sha1(), &leaf, &issuer)
+        .map_err(|err| reason(err.to_string()))?;
+    let status = basic
+        .find_status(&id)
+        .ok_or_else(|| reason("response does not cover this certificate".to_owned()))?;
+    if status.status != OcspCertStatus::GOOD {
+        return Err(reason("certificate is not reported as good".to_owned()));
+    }
+    Ok(())
+}
+
+fn certified(
+    cert: &Path,
+    key: &Path,
+    ocsp: Option<Vec<u8>>,
+    verify_ocsp: bool,
+) -> Result<CertifiedKey, Error> {
     let chain = load_chain(cert)?;
     let key_der = load_key(key)?;
     let signing = rustls::crypto::aws_lc_rs::sign::any_supported_type(&key_der).map_err(|_| {
@@ -735,6 +802,11 @@ fn certified(cert: &Path, key: &Path, ocsp: Option<Vec<u8>>) -> Result<Certified
             path: key.to_path_buf(),
         }
     })?;
+    if verify_ocsp {
+        if let Some(response) = &ocsp {
+            verify_ocsp_response(cert, &chain, response)?;
+        }
+    }
     let mut certified = CertifiedKey::new(chain, signing);
     certified.ocsp = ocsp;
     Ok(certified)
@@ -1200,8 +1272,13 @@ mod tests {
     fn sni_matching_is_exact_and_wildcard_shallow() {
         let fixtures = fixtures();
         let key = Arc::new(
-            certified(&fixtures.join("cert.pem"), &fixtures.join("key.pem"), None)
-                .expect("fixture certificate"),
+            certified(
+                &fixtures.join("cert.pem"),
+                &fixtures.join("key.pem"),
+                None,
+                false,
+            )
+            .expect("fixture certificate"),
         );
         let resolver = NamedResolver {
             named: vec![(
@@ -1245,6 +1322,7 @@ mod tests {
                 default: Some((&fixtures.join("cert.pem"), &fixtures.join("key.pem"))),
                 named: &[],
                 reject_unknown_sni: false,
+                verify_ocsp: false,
                 client_ca: None,
                 client_crl: None,
                 client_auth: ClientAuth::Off,
@@ -1299,7 +1377,7 @@ mod tests {
         ];
 
         let resolver = NamedResolver {
-            named: build_named(&named).expect("named certificates"),
+            named: build_named(&named, false).expect("named certificates"),
             default: None,
             reject_unknown: false,
         };
@@ -1320,6 +1398,7 @@ mod tests {
             default: Some((&fixtures.join("cert.pem"), &fixtures.join("key.pem"))),
             named: &[],
             reject_unknown_sni: false,
+            verify_ocsp: false,
             client_ca: None,
             client_crl: None,
             client_auth: ClientAuth::Off,
@@ -1352,6 +1431,7 @@ mod tests {
             default: Some((&fixtures.join("cert.pem"), &fixtures.join("key.pem"))),
             named: &[],
             reject_unknown_sni: false,
+            verify_ocsp: false,
             client_ca: None,
             client_crl: None,
             client_auth: ClientAuth::Off,
@@ -1372,6 +1452,7 @@ mod tests {
             default: Some((&fixtures.join("cert.pem"), &fixtures.join("key.pem"))),
             named: &[],
             reject_unknown_sni: false,
+            verify_ocsp: false,
             client_ca: None,
             client_crl: None,
             client_auth: ClientAuth::Off,

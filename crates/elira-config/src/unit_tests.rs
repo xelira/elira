@@ -2400,6 +2400,24 @@ root = "/srv"
 }
 
 #[test]
+fn verify_ocsp_is_parsed() {
+    let text = r#"
+listen = "127.0.0.1:8080"
+
+[tls]
+cert = "cert.pem"
+key = "key.pem"
+verify_ocsp = true
+
+[[routes]]
+host = "*"
+root = "/srv"
+"#;
+    let cfg = Config::parse(text).expect("valid tls");
+    assert!(cfg.tls.as_ref().unwrap().verify_ocsp);
+}
+
+#[test]
 fn named_locations_are_validated() {
     let base = r#"
 listen = "127.0.0.1:8080"

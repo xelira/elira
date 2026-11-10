@@ -80,6 +80,10 @@ pub struct Tls {
     /// is rejected too, so this needs `[[tls.certificates]]` entries.
     #[serde(default)]
     pub reject_unknown_sni: bool,
+
+    /// Verify a stapled OCSP response against its issuer before serving it.
+    #[serde(default)]
+    pub verify_ocsp: bool,
 }
 
 /// A certificate and the names it should answer for.
