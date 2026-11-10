@@ -202,8 +202,9 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
     let (stop_tx, stop_rx) = watch::channel(false);
     let (reload_tx, mut reload_rx) = watch::channel(0u64);
     let (restart_tx, mut restart_rx) = watch::channel(0u64);
+    let (reopen_tx, mut reopen_rx) = watch::channel(0u64);
 
-    spawn_signal_task(stop_tx.clone(), reload_tx.clone(), restart_tx)?;
+    spawn_signal_task(stop_tx.clone(), reload_tx.clone(), restart_tx, reopen_tx)?;
     if std::env::var_os("ELIRA_WORKER").is_none() {
         if let Some(tls) = &cfg.tls {
             if let Some(hook) = &tls.ocsp_hook {
@@ -355,6 +356,13 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
                 tracing::error!("replacement did not become ready; keeping this process");
             }
 
+            changed = reopen_rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                runtime.load().reopen_logs();
+                tracing::info!("access log reopened");
+            }
             changed = reload_rx.changed() => {
                 if changed.is_err() {
                     break;
@@ -1356,11 +1364,13 @@ fn spawn_signal_task(
     stop: watch::Sender<bool>,
     reload: watch::Sender<u64>,
     restart: watch::Sender<u64>,
+    reopen: watch::Sender<u64>,
 ) -> anyhow::Result<()> {
     use tokio::signal::unix::{signal, SignalKind};
 
     let mut term = signal(SignalKind::terminate())?;
     let mut hup = signal(SignalKind::hangup())?;
+    let mut usr1 = signal(SignalKind::user_defined1())?;
     let mut usr2 = signal(SignalKind::user_defined2())?;
 
     tokio::spawn(async move {
@@ -1368,6 +1378,7 @@ fn spawn_signal_task(
         tokio::pin!(ctrl_c);
         let mut reload_seq = 0u64;
         let mut restart_seq = 0u64;
+        let mut reopen_seq = 0u64;
 
         loop {
             tokio::select! {
@@ -1376,6 +1387,10 @@ fn spawn_signal_task(
                 _ = hup.recv() => {
                     reload_seq += 1;
                     let _ = reload.send(reload_seq);
+                }
+                _ = usr1.recv() => {
+                    reopen_seq += 1;
+                    let _ = reopen.send(reopen_seq);
                 }
                 _ = usr2.recv() => {
                     restart_seq += 1;
@@ -1393,6 +1408,7 @@ fn spawn_signal_task(
     stop: watch::Sender<bool>,
     _reload: watch::Sender<u64>,
     _restart: watch::Sender<u64>,
+    _reopen: watch::Sender<u64>,
 ) -> anyhow::Result<()> {
     tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;

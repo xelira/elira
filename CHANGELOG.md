@@ -141,6 +141,7 @@
   keep-alive соединении.
 - Именованные зоны кэша `[cache.zones.NAME]` и маршрутный `cache_zone`.
 - `limit_rate`/`limit_rate_after` и `limit_conn_per_ip`.
+- Повторное открытие access-лога по `SIGUSR1` для внешней ротации.
 - `GET /config` на админском листенере: эффективный конфиг в JSON.
 - Тесты FastCGI/CGI на обрезанные заголовки, длину записи, padding и хвост
   после `END_REQUEST`.

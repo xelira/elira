@@ -34,6 +34,24 @@ impl AccessLog {
         })
     }
 
+    /// Reopen the configured path without rotating. Used after an external
+    /// logrotate has renamed the file and sent SIGUSR1.
+    pub fn reopen(&self) {
+        if let Ok(file) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        {
+            let written = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+            let mut state = match self.state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            state.file = file;
+            state.written = written;
+        }
+    }
+
     pub fn write(&self, line: &str) {
         let mut state = match self.state.lock() {
             Ok(state) => state,

@@ -19,7 +19,8 @@ subset of nginx configuration and prints what it could not carry over.
 SIGHUP reloads routes, upstreams, certificates, TLS settings, cache policy,
 health checks and the access log without dropping HTTP/1.1 or HTTP/2
 connections. The listen addresses and connection limits need a restart, and
-the server says so instead of pretending otherwise.
+the server says so instead of pretending otherwise. SIGUSR1 reopens the
+access-log file in place, for logrotate to use without a full reload.
 
 SIGUSR2 starts a replacement and waits for it to bind every listener before
 draining the old process. If the replacement fails, the old process keeps

@@ -164,6 +164,13 @@ impl Runtime {
         self.access_log_sample
     }
 
+    /// Reopen the access-log file after external rotation.
+    pub fn reopen_logs(&self) {
+        if let Some(log) = &self.access_log {
+            log.reopen();
+        }
+    }
+
     /// Render one access line and send it to every configured sink.
     pub fn write_log(&self, entry: &Entry) {
         let line = match &self.template {
