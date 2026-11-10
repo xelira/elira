@@ -169,7 +169,8 @@ Living list for the self-improvement loop. One item per session.
 - [x] `proxy_redirect`, `proxy_cookie_domain/path`, `proxy_hide_header`.
 - [x] `random` balancing and `keepalive`/`keepalive_secs`.
 - [x] Per-server `max_conns`, `backup`, `down`, `slow_start`.
-- [ ] `keepalive_requests`.
+- [ ] Upstream `keepalive_requests` (hyper's legacy client does not expose a
+  per-connection request count).
 - [x] Configurable resolver with runtime DNS and TTL policy.
 
 ### Section 4 — limits and operations
@@ -177,7 +178,7 @@ Living list for the self-improvement loop. One item per session.
 - [ ] `limit_rate` and `limit_rate_after` bandwidth throttling.
 - [ ] `limit_conn` per-IP concurrent connection limits.
 - [ ] `limit_req` delay/nodelay semantics on top of the token bucket.
-- [ ] `keepalive_requests` per connection.
+- [x] `keepalive_requests` per connection.
 - [ ] Configurable `client_header_timeout`, `lingering_close`,
   `reset_timedout_connection`.
 - [ ] Log reopen on SIGUSR1 for external rotation.

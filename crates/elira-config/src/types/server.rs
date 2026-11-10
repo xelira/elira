@@ -75,6 +75,11 @@ pub struct Limits {
     #[serde(default = "Limits::default_max_connections")]
     pub max_connections: usize,
 
+    /// Close a keep-alive connection after this many requests. Zero disables
+    /// the cap.
+    #[serde(default = "Limits::default_keepalive_requests")]
+    pub keepalive_requests: usize,
+
     /// Close a keep-alive connection after this many seconds without a
     /// request. Zero disables the timer.
     #[serde(default = "Limits::default_idle_timeout_secs")]
@@ -215,6 +220,7 @@ impl Default for Limits {
             upstream_timeout_secs: Self::default_upstream_timeout_secs(),
             upstream_connect_timeout_secs: Self::default_upstream_connect_timeout_secs(),
             upstream_send_timeout_secs: 0,
+            keepalive_requests: Self::default_keepalive_requests(),
             max_connections: Self::default_max_connections(),
             idle_timeout_secs: Self::default_idle_timeout_secs(),
             max_body_bytes: 0,
@@ -262,6 +268,10 @@ impl Limits {
 
     fn default_idle_timeout_secs() -> u64 {
         60
+    }
+
+    fn default_keepalive_requests() -> usize {
+        1000
     }
 
     fn default_body_timeout_secs() -> u64 {

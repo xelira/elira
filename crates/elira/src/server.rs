@@ -4,6 +4,7 @@
 //! and drive the real server instead of a simplified copy of it.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -191,6 +192,7 @@ pub struct Options {
     pub max_headers: usize,
     pub max_buf_size: usize,
     pub idle_timeout: Duration,
+    pub keepalive_requests: usize,
     pub proxy_protocol: bool,
     pub sendfile: bool,
     pub h2c: bool,
@@ -212,6 +214,7 @@ impl Options {
             max_headers: cfg.limits.max_headers,
             max_buf_size: cfg.limits.max_header_bytes,
             idle_timeout: Duration::from_secs(cfg.limits.idle_timeout_secs),
+            keepalive_requests: cfg.limits.keepalive_requests,
             proxy_protocol: cfg.proxy_protocol,
             sendfile: cfg.sendfile,
             h2c: cfg.h2c,
@@ -389,6 +392,7 @@ pub async fn serve_unix(
                     max_headers: options.max_headers,
                     max_buf_size: options.max_buf_size,
                     idle_timeout: options.idle_timeout,
+                    keepalive_requests: options.keepalive_requests,
                     body_timeout: options.body_timeout,
                     drain_timeout: options.drain_timeout,
                     h2: false,
@@ -522,6 +526,7 @@ struct ConnOptions {
     max_headers: usize,
     max_buf_size: usize,
     idle_timeout: Duration,
+    keepalive_requests: usize,
     body_timeout: Option<Duration>,
     drain_timeout: Duration,
     h2: bool,
@@ -550,6 +555,7 @@ async fn serve_stream(
         max_headers: options.max_headers,
         max_buf_size: options.max_buf_size,
         idle_timeout: options.idle_timeout,
+        keepalive_requests: options.keepalive_requests,
         body_timeout: options.body_timeout,
         drain_timeout: options.drain_timeout,
         h2: false,
@@ -731,6 +737,8 @@ async fn serve_conn<I>(
     let idle_for_service = idle.clone();
     let scheme = if opts.secure { "https" } else { "http" };
     let body_timeout = opts.body_timeout;
+    let keepalive_requests = opts.keepalive_requests;
+    let served_for_service = Arc::new(AtomicU64::new(0));
     let metrics_for_service = metrics.clone();
     let acme_for_service = acme.clone();
     let client_cert = client_cert.map(Arc::new);
@@ -738,6 +746,7 @@ async fn serve_conn<I>(
 
     let service = service_fn(move |mut req: hyper::Request<Incoming>| {
         let runtime = runtime.clone();
+        let served = served_for_service.clone();
         let idle = idle_for_service.clone();
         let metrics = metrics_for_service.clone();
         let acme = acme_for_service.clone();
@@ -787,7 +796,7 @@ async fn serve_conn<I>(
                     None => body,
                 }
             });
-            let response = if let Some(acme) = &acme {
+            let mut response = if let Some(acme) = &acme {
                 let token = path
                     .strip_prefix("/.well-known/acme-challenge/")
                     .map(|token| token.split('?').next().unwrap_or(token));
@@ -855,6 +864,16 @@ async fn serve_conn<I>(
 
             if write_log {
                 current.write_log(&entry);
+            }
+
+            if keepalive_requests > 0
+                && matches!(version, http::Version::HTTP_10 | http::Version::HTTP_11)
+                && served.fetch_add(1, Ordering::Relaxed) + 1 >= keepalive_requests as u64
+            {
+                response.headers_mut().insert(
+                    http::header::CONNECTION,
+                    hyper::header::HeaderValue::from_static("close"),
+                );
             }
 
             Ok::<_, std::convert::Infallible>(response)

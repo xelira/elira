@@ -449,7 +449,7 @@ async fn fixed_upstream(body: &'static str) -> SocketAddr {
                     }
                 }
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
                     body.len(),
                     body
                 );
@@ -478,6 +478,33 @@ async fn roundtrip(addr: SocketAddr, request: &str) -> String {
     }
 
     String::from_utf8_lossy(&response).to_string()
+}
+
+async fn read_http_response(stream: &mut TcpStream) -> String {
+    let mut data = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let read = stream.read(&mut buf).await.expect("read response");
+        assert!(read > 0, "connection closed before a complete response");
+        data.extend_from_slice(&buf[..read]);
+        let text = String::from_utf8_lossy(&data).to_string();
+        if let Some(pos) = text.find("\r\n\r\n") {
+            let length = text[..pos]
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    if name.eq_ignore_ascii_case("content-length") {
+                        value.trim().parse::<usize>().ok()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
+            if data.len() >= pos + 4 + length {
+                return String::from_utf8_lossy(&data[..pos + 4 + length]).into_owned();
+            }
+        }
+    }
 }
 
 fn status(response: &str) -> &str {
@@ -590,6 +617,53 @@ async fn idle_connection_is_closed() {
     assert!(
         matches!(closed, Ok(Ok(0)) | Ok(Err(_))),
         "connection should be closed, got {closed:?}"
+    );
+}
+
+#[tokio::test]
+async fn keepalive_requests_limits_reuse() {
+    let upstream = fixed_upstream("ok").await;
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[limits]
+keepalive_requests = 2
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "*"
+upstream = "app"
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    let request = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+    for _ in 0..2 {
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write request");
+        let response = read_http_response(&mut stream).await;
+        assert_eq!(status(&response), "HTTP/1.1 200 OK", "{response}");
+    }
+
+    // The second response asked hyper to close. A third request either fails
+    // to write or reads EOF; neither may produce another response.
+    let result = tokio::time::timeout(Duration::from_secs(1), async {
+        stream.write_all(request.as_bytes()).await?;
+        let mut buf = [0u8; 1];
+        let read = stream.read(&mut buf).await?;
+        Ok::<_, std::io::Error>(read)
+    })
+    .await;
+    assert!(
+        matches!(result, Ok(Ok(0)) | Ok(Err(_))),
+        "connection should be closed after two requests, got {result:?}"
     );
 }
 
@@ -4315,7 +4389,7 @@ async fn proxy_protocol_and_bind_reach_the_upstream() {
                 let first = text.lines().next().unwrap_or_default();
                 let body = format!("peer={peer}\n{first}");
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
                     body.len(),
                     body
                 );
