@@ -118,7 +118,140 @@ pub(crate) fn build_route(
     cfg: &Config,
     pools: &Pools,
 ) -> Result<RouteEntry, Error> {
-    let target = if let Some(upstream) = &route.upstream {
+    let target = build_target(route, cfg, pools)?;
+
+    let auth = build_auth(route)?;
+
+    let acl = build_acl(route)?;
+
+    let limiter = build_limiter(route);
+
+    let error_root = route.error_root.clone().or_else(|| route.root.clone());
+    let error_pages = match error_root {
+        Some(root) => error_page_set(root, route.index.clone(), &route.error_pages),
+        None => Vec::new(),
+    };
+
+    let app_permits = match &target {
+        Target::FastCgi { .. } | Target::Cgi { .. } | Target::Module(_) => {
+            Some(Arc::new(Semaphore::new(route.max_concurrent.unwrap_or(16))))
+        }
+        _ => None,
+    };
+    let proxy_permits = match &target {
+        Target::Proxy(_) => route
+            .max_concurrent
+            .map(|limit| Arc::new(Semaphore::new(limit))),
+        _ => None,
+    };
+
+    let if_conditions = build_if_conditions(route)?;
+
+    let entry = RouteEntry {
+        label: match &route.name {
+            Some(name) => format!("{}{name}", route.host),
+            None => format!(
+                "{}{}",
+                route.host,
+                route
+                    .path
+                    .as_deref()
+                    .or(route.path_regex.as_deref())
+                    .unwrap_or_default()
+            ),
+        },
+        host: route.host.trim().to_ascii_lowercase(),
+        name: route.name.clone(),
+        internal: route.internal,
+        prefix: route
+            .path
+            .clone()
+            .or_else(|| route.regex_prefix.clone())
+            .unwrap_or_default(),
+        exact: route.match_type == elira_config::RouteMatch::Exact,
+        no_regex: route.no_regex,
+        regex: route
+            .path_regex
+            .as_deref()
+            .and_then(|pattern| regex::Regex::new(pattern).ok()),
+        target,
+        strip_prefix: route.strip_prefix,
+        add_headers: route
+            .add_headers
+            .iter()
+            .filter_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                Some((
+                    HeaderName::from_bytes(name.trim().as_bytes()).ok()?,
+                    value.trim().to_owned(),
+                ))
+            })
+            .collect(),
+        remove_headers: route
+            .remove_headers
+            .iter()
+            .filter_map(|name| HeaderName::from_bytes(name.as_bytes()).ok())
+            .collect(),
+        request_headers: route
+            .request_headers
+            .iter()
+            .filter_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                Some((
+                    HeaderName::from_bytes(name.trim().as_bytes()).ok()?,
+                    value.trim().to_owned(),
+                ))
+            })
+            .collect(),
+        request_remove_headers: route
+            .request_remove_headers
+            .iter()
+            .filter_map(|name| HeaderName::from_bytes(name.as_bytes()).ok())
+            .collect(),
+        if_conditions,
+        auth,
+        acl,
+        timeout: route.timeout_secs.map(Duration::from_secs),
+        limiter,
+        rate_key: parse_request_key(route.rate_key.as_deref()),
+        body_limit: route.max_body_bytes,
+        error_pages,
+        app_permits,
+        proxy_permits,
+        max_response: route.max_response_bytes,
+        cache: route.cache_enabled,
+        cache_ttl: route.cache_ttl_secs.map(Duration::from_secs),
+        access_log: route.access_log,
+        access_log_sample: route.access_log_sample.unwrap_or(cfg.log.sample),
+        client_auth: route.client_auth.then(|| ClientCertRule {
+            subject_cn: route.client_cn.clone(),
+            issuer_cn: route.client_issuer_cn.clone(),
+        }),
+        max_upstream_response: route.max_upstream_response_bytes,
+        expires_secs: route.expires_secs,
+        etag: route.etag.unwrap_or(true),
+        fastcgi_param: route
+            .fastcgi_param
+            .iter()
+            .filter_map(|line| parse_param(line))
+            .collect(),
+        cgi_param: route
+            .cgi_param
+            .iter()
+            .filter_map(|line| parse_param(line))
+            .collect(),
+        fastcgi_pool: route.fastcgi_pool_idle.map(|idle| {
+            Arc::new(elira_fastcgi::Pool::new(
+                idle,
+                Duration::from_secs(cfg.limits.fastcgi_pool_idle_secs),
+            ))
+        }),
+    };
+    Ok(entry)
+}
+
+fn build_target(route: &elira_config::Route, cfg: &Config, pools: &Pools) -> Result<Target, Error> {
+    Ok(if let Some(upstream) = &route.upstream {
         Target::Proxy(
             pools
                 .get(upstream)
@@ -241,9 +374,11 @@ pub(crate) fn build_route(
         return Err(Error::MissingTarget {
             host: route.host.clone(),
         });
-    };
+    })
+}
 
-    let auth = match &route.auth_file {
+fn build_auth(route: &elira_config::Route) -> Result<Option<Arc<BasicAuth>>, Error> {
+    Ok(match &route.auth_file {
         Some(path) => Some(Arc::new(BasicAuth::from_file(path).map_err(|err| {
             Error::RouteConfig {
                 host: route.host.clone(),
@@ -251,9 +386,11 @@ pub(crate) fn build_route(
             }
         })?)),
         None => None,
-    };
+    })
+}
 
-    let acl = if route.ip_allow.is_empty() && route.ip_deny.is_empty() {
+fn build_acl(route: &elira_config::Route) -> Result<Option<Arc<IpAcl>>, Error> {
+    Ok(if route.ip_allow.is_empty() && route.ip_deny.is_empty() {
         None
     } else {
         Some(Arc::new(
@@ -262,36 +399,21 @@ pub(crate) fn build_route(
                 reason: err.to_string(),
             })?,
         ))
-    };
+    })
+}
 
-    let limiter = match route.requests_per_second {
+fn build_limiter(route: &elira_config::Route) -> Option<Arc<RateLimiter>> {
+    match route.requests_per_second {
         Some(rate) if rate > 0 => Some(Arc::new(RateLimiter::new(
             rate,
             route.burst.unwrap_or(rate).max(rate),
         ))),
         _ => None,
-    };
+    }
+}
 
-    let error_root = route.error_root.clone().or_else(|| route.root.clone());
-    let error_pages = match error_root {
-        Some(root) => error_page_set(root, route.index.clone(), &route.error_pages),
-        None => Vec::new(),
-    };
-
-    let app_permits = match &target {
-        Target::FastCgi { .. } | Target::Cgi { .. } | Target::Module(_) => {
-            Some(Arc::new(Semaphore::new(route.max_concurrent.unwrap_or(16))))
-        }
-        _ => None,
-    };
-    let proxy_permits = match &target {
-        Target::Proxy(_) => route
-            .max_concurrent
-            .map(|limit| Arc::new(Semaphore::new(limit))),
-        _ => None,
-    };
-
-    let if_conditions = route
+fn build_if_conditions(route: &elira_config::Route) -> Result<Vec<CompiledIf>, Error> {
+    route
         .if_conditions
         .iter()
         .map(|condition| {
@@ -323,109 +445,7 @@ pub(crate) fn build_route(
                 content_type: ret.content_type.clone(),
             })
         })
-        .collect::<Result<Vec<_>, Error>>()?;
-
-    let entry = RouteEntry {
-        label: match &route.name {
-            Some(name) => format!("{}{name}", route.host),
-            None => format!(
-                "{}{}",
-                route.host,
-                route
-                    .path
-                    .as_deref()
-                    .or(route.path_regex.as_deref())
-                    .unwrap_or_default()
-            ),
-        },
-        host: route.host.trim().to_ascii_lowercase(),
-        name: route.name.clone(),
-        internal: route.internal,
-        prefix: route
-            .path
-            .clone()
-            .or_else(|| route.regex_prefix.clone())
-            .unwrap_or_default(),
-        exact: route.match_type == elira_config::RouteMatch::Exact,
-        no_regex: route.no_regex,
-        regex: route
-            .path_regex
-            .as_deref()
-            .and_then(|pattern| regex::Regex::new(pattern).ok()),
-        target,
-        strip_prefix: route.strip_prefix,
-        add_headers: route
-            .add_headers
-            .iter()
-            .filter_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                Some((
-                    HeaderName::from_bytes(name.trim().as_bytes()).ok()?,
-                    value.trim().to_owned(),
-                ))
-            })
-            .collect(),
-        remove_headers: route
-            .remove_headers
-            .iter()
-            .filter_map(|name| HeaderName::from_bytes(name.as_bytes()).ok())
-            .collect(),
-        request_headers: route
-            .request_headers
-            .iter()
-            .filter_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                Some((
-                    HeaderName::from_bytes(name.trim().as_bytes()).ok()?,
-                    value.trim().to_owned(),
-                ))
-            })
-            .collect(),
-        request_remove_headers: route
-            .request_remove_headers
-            .iter()
-            .filter_map(|name| HeaderName::from_bytes(name.as_bytes()).ok())
-            .collect(),
-        if_conditions,
-        auth,
-        acl,
-        timeout: route.timeout_secs.map(Duration::from_secs),
-        limiter,
-        rate_key: parse_request_key(route.rate_key.as_deref()),
-        body_limit: route.max_body_bytes,
-        error_pages,
-        app_permits,
-        proxy_permits,
-        max_response: route.max_response_bytes,
-        cache: route.cache_enabled,
-        cache_ttl: route.cache_ttl_secs.map(Duration::from_secs),
-        access_log: route.access_log,
-        access_log_sample: route.access_log_sample.unwrap_or(cfg.log.sample),
-        client_auth: route.client_auth.then(|| ClientCertRule {
-            subject_cn: route.client_cn.clone(),
-            issuer_cn: route.client_issuer_cn.clone(),
-        }),
-        max_upstream_response: route.max_upstream_response_bytes,
-        expires_secs: route.expires_secs,
-        etag: route.etag.unwrap_or(true),
-        fastcgi_param: route
-            .fastcgi_param
-            .iter()
-            .filter_map(|line| parse_param(line))
-            .collect(),
-        cgi_param: route
-            .cgi_param
-            .iter()
-            .filter_map(|line| parse_param(line))
-            .collect(),
-        fastcgi_pool: route.fastcgi_pool_idle.map(|idle| {
-            Arc::new(elira_fastcgi::Pool::new(
-                idle,
-                Duration::from_secs(cfg.limits.fastcgi_pool_idle_secs),
-            ))
-        }),
-    };
-    Ok(entry)
+        .collect::<Result<Vec<_>, Error>>()
 }
 
 pub(crate) fn build_routers(
