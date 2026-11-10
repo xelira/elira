@@ -9,6 +9,21 @@ use crate::*;
 
 impl Config {
     pub(crate) fn validate(&self) -> Result<(), Error> {
+        let listener_names = self.validate_server()?;
+        self.validate_tls()?;
+        let upstream_names = self.validate_upstreams()?;
+        self.validate_routes(&listener_names, &upstream_names)?;
+        Ok(())
+    }
+
+    fn validate_server(&self) -> Result<HashSet<String>, Error> {
+        let listener_names = self.validate_listeners()?;
+        self.validate_limits()?;
+        self.validate_services()?;
+        Ok(listener_names)
+    }
+
+    fn validate_listeners(&self) -> Result<HashSet<String>, Error> {
         if let Some(path) = &self.listen_unix {
             if path.as_os_str().is_empty() {
                 return Err(Error::EmptyUnixListen);
@@ -192,6 +207,10 @@ impl Config {
         if self.unix_tls && self.tls.is_none() {
             return Err(Error::UnixTlsWithoutTls);
         }
+        Ok(listener_names)
+    }
+
+    fn validate_limits(&self) -> Result<(), Error> {
         if self.limits.max_header_bytes < 8192 {
             return Err(Error::MaxHeaderBytesTooSmall);
         }
@@ -267,6 +286,10 @@ impl Config {
             }
         }
 
+        Ok(())
+    }
+
+    fn validate_services(&self) -> Result<(), Error> {
         if self.health.enabled {
             if !self.health.path.starts_with('/')
                 || self.health.path.chars().any(|c| c.is_control() || c == ' ')
@@ -430,6 +453,10 @@ impl Config {
             return Err(Error::NoRoutes);
         }
 
+        Ok(())
+    }
+
+    fn validate_tls(&self) -> Result<(), Error> {
         if let Some(tls) = &self.tls {
             let has_cert = !tls.cert.as_os_str().is_empty();
             let has_key = !tls.key.as_os_str().is_empty();
@@ -521,6 +548,10 @@ impl Config {
             }
         }
 
+        Ok(())
+    }
+
+    fn validate_upstreams(&self) -> Result<HashSet<&str>, Error> {
         let mut names = HashSet::new();
         for up in &self.upstreams {
             if up.name.trim().is_empty() {
@@ -647,6 +678,14 @@ impl Config {
             }
         }
 
+        Ok(names)
+    }
+
+    fn validate_routes(
+        &self,
+        listener_names: &HashSet<String>,
+        names: &HashSet<&str>,
+    ) -> Result<(), Error> {
         let named_names: HashSet<&str> = self
             .routes
             .iter()
@@ -654,398 +693,422 @@ impl Config {
             .collect();
         let mut seen = HashSet::new();
         for (index, route) in self.routes.iter().enumerate() {
-            let host = route.host.trim().to_ascii_lowercase();
-            if host.is_empty() {
-                return Err(Error::EmptyRouteHost { index });
-            }
-            if let Some(name) = &route.name {
-                if !is_location_name(name) {
-                    return Err(Error::BadLocationName { index });
-                }
-                if route.path.is_some() || route.path_regex.is_some() {
-                    return Err(Error::NamedLocationPath { index });
-                }
-            }
-            for name in &route.listeners {
-                if !listener_names.contains(name) {
-                    return Err(Error::UnknownListener {
-                        index,
-                        name: name.clone(),
-                    });
-                }
-            }
+            self.validate_route_identity(route, index, listener_names, &mut seen)?;
+            self.validate_route_target(route, index)?;
+            self.validate_route_policy(route, index, names, &named_names)?;
+        }
+        Ok(())
+    }
 
-            // The same host may appear several times with different paths;
-            // only an identical pair is ambiguous.
-            let mut discriminator = match &route.name {
-                Some(name) => format!("name|{name}"),
-                None => route
-                    .path
-                    .clone()
-                    .or_else(|| route.path_regex.clone())
-                    .unwrap_or_default(),
-            };
-            if let Some(prefix) = &route.regex_prefix {
-                discriminator = format!("{prefix}|{discriminator}");
+    fn validate_route_identity(
+        &self,
+        route: &Route,
+        index: usize,
+        listener_names: &HashSet<String>,
+        seen: &mut HashSet<(String, String, String)>,
+    ) -> Result<(), Error> {
+        let host = route.host.trim().to_ascii_lowercase();
+        if host.is_empty() {
+            return Err(Error::EmptyRouteHost { index });
+        }
+        if let Some(name) = &route.name {
+            if !is_location_name(name) {
+                return Err(Error::BadLocationName { index });
             }
-            if route.match_type == RouteMatch::Exact {
-                discriminator.push_str("|exact");
+            if route.path.is_some() || route.path_regex.is_some() {
+                return Err(Error::NamedLocationPath { index });
             }
-            if route.no_regex {
-                discriminator.push_str("|noregex");
-            }
-            let mut route_listeners = route.listeners.clone();
-            route_listeners.sort();
-            route_listeners.dedup();
-            if !seen.insert((host.clone(), discriminator, route_listeners.join(","))) {
-                return Err(Error::DuplicateRoute {
-                    host: route.host.clone(),
+        }
+        for name in &route.listeners {
+            if !listener_names.contains(name) {
+                return Err(Error::UnknownListener {
+                    index,
+                    name: name.clone(),
                 });
             }
+        }
 
-            let targets = usize::from(route.upstream.is_some())
-                + usize::from(route.root.is_some())
-                + usize::from(route.alias.is_some())
-                + usize::from(route.redirect.is_some())
-                + usize::from(route.return_response.is_some())
-                + usize::from(route.fastcgi_pass.is_some())
-                + usize::from(route.cgi_pass.is_some())
-                + usize::from(route.module.is_some())
-                + usize::from(route.wasm.is_some());
-            if targets == 0 {
-                return Err(Error::RouteNeedsTarget { index });
-            }
-            if targets > 1 {
-                return Err(Error::RouteHasTwoTargets { index });
-            }
-            if let Some(alias) = &route.alias {
-                if alias.as_os_str().is_empty() || !alias.is_absolute() {
-                    return Err(Error::BadAlias { index });
-                }
-                if route.path.is_none() || route.path_regex.is_some() {
-                    return Err(Error::AliasNeedsPrefix { index });
-                }
-            }
-            if let Some(ret) = &route.return_response {
-                if !(200..=599).contains(&ret.status) {
-                    return Err(Error::BadReturnStatus { index });
-                }
-                if let Some(content_type) = &ret.content_type {
-                    if HeaderValue::from_str(content_type).is_err() {
-                        return Err(Error::BadReturnContentType { index });
-                    }
-                }
-            }
-            for condition in &route.if_conditions {
-                if !condition.variable.starts_with('$')
-                    || condition.variable.len() < 2
-                    || condition.equals.is_some() == condition.matches.is_some()
-                {
-                    return Err(Error::BadIf { index });
-                }
-                let Some(ret) = &condition.return_response else {
-                    return Err(Error::BadIf { index });
-                };
-                if !(200..=599).contains(&ret.status) {
-                    return Err(Error::BadReturnStatus { index });
-                }
-                if let Some(content_type) = &ret.content_type {
-                    if HeaderValue::from_str(content_type).is_err() {
-                        return Err(Error::BadReturnContentType { index });
-                    }
-                }
-            }
+        // The same host may appear several times with different paths;
+        // only an identical pair is ambiguous.
+        let mut discriminator = match &route.name {
+            Some(name) => format!("name|{name}"),
+            None => route
+                .path
+                .clone()
+                .or_else(|| route.path_regex.clone())
+                .unwrap_or_default(),
+        };
+        if let Some(prefix) = &route.regex_prefix {
+            discriminator = format!("{prefix}|{discriminator}");
+        }
+        if route.match_type == RouteMatch::Exact {
+            discriminator.push_str("|exact");
+        }
+        if route.no_regex {
+            discriminator.push_str("|noregex");
+        }
+        let mut route_listeners = route.listeners.clone();
+        route_listeners.sort();
+        route_listeners.dedup();
+        if !seen.insert((host.clone(), discriminator, route_listeners.join(","))) {
+            return Err(Error::DuplicateRoute {
+                host: route.host.clone(),
+            });
+        }
 
-            if route.fastcgi_pool_idle.is_some() && route.fastcgi_pass.is_none() {
-                return Err(Error::PoolWithoutFastCgi { index });
-            }
+        let targets = usize::from(route.upstream.is_some())
+            + usize::from(route.root.is_some())
+            + usize::from(route.alias.is_some())
+            + usize::from(route.redirect.is_some())
+            + usize::from(route.return_response.is_some())
+            + usize::from(route.fastcgi_pass.is_some())
+            + usize::from(route.cgi_pass.is_some())
+            + usize::from(route.module.is_some())
+            + usize::from(route.wasm.is_some());
+        if targets == 0 {
+            return Err(Error::RouteNeedsTarget { index });
+        }
+        if targets > 1 {
+            return Err(Error::RouteHasTwoTargets { index });
+        }
+        Ok(())
+    }
 
-            if let Some(target) = &route.fastcgi_pass {
-                if target.trim().is_empty() {
-                    return Err(Error::EmptyFastCgiTarget { index });
-                }
-                if route
-                    .fastcgi_root
-                    .as_ref()
-                    .is_none_or(|root| root.as_os_str().is_empty())
-                {
-                    return Err(Error::FastCgiNeedRoot { index });
-                }
+    fn validate_route_target(&self, route: &Route, index: usize) -> Result<(), Error> {
+        if let Some(alias) = &route.alias {
+            if alias.as_os_str().is_empty() || !alias.is_absolute() {
+                return Err(Error::BadAlias { index });
             }
-            if route.fastcgi_index.contains('/') || route.fastcgi_index.contains("..") {
-                return Err(Error::BadFastCgiIndex { index });
+            if route.path.is_none() || route.path_regex.is_some() {
+                return Err(Error::AliasNeedsPrefix { index });
             }
-            for param in route.fastcgi_param.iter().chain(route.cgi_param.iter()) {
-                if parse_param(param).is_none() {
-                    return Err(Error::BadAppParam {
-                        index,
-                        param: param.clone(),
-                    });
+        }
+        if let Some(ret) = &route.return_response {
+            if !(200..=599).contains(&ret.status) {
+                return Err(Error::BadReturnStatus { index });
+            }
+            if let Some(content_type) = &ret.content_type {
+                if HeaderValue::from_str(content_type).is_err() {
+                    return Err(Error::BadReturnContentType { index });
                 }
             }
-            if let Some(script) = &route.cgi_pass {
-                if script.as_os_str().is_empty() || !script.is_absolute() {
-                    return Err(Error::BadCgiScript { index });
-                }
-            }
-            if let Some(module) = &route.module {
-                if module.as_os_str().is_empty() || !module.is_absolute() {
-                    return Err(Error::BadModulePath { index });
-                }
-            }
-            if let Some(wasm) = &route.wasm {
-                if wasm.as_os_str().is_empty() || !wasm.is_absolute() {
-                    return Err(Error::BadWasmPath { index });
-                }
-            }
-            if route.module_sandbox && route.module.is_none() {
-                return Err(Error::SandboxWithoutModule { index });
-            }
-            if route.max_concurrent == Some(0) {
-                return Err(Error::BadConcurrency { index });
-            }
-            if route.max_response_bytes == Some(0) {
-                return Err(Error::BadResponseCap { index });
-            }
-            if route.max_upstream_response_bytes == Some(0) {
-                return Err(Error::BadUpstreamResponseCap { index });
-            }
-            if let Some(sample) = route.access_log_sample {
-                if !sample.is_finite() || !(0.0..=1.0).contains(&sample) {
-                    return Err(Error::BadRouteLogSample { index });
-                }
-            }
-            if route.cache_ttl_secs == Some(0) {
-                return Err(Error::BadRouteCacheTtl { index });
-            }
-
-            if let Some(path) = &route.path {
-                if !path.starts_with('/') || path.chars().any(char::is_control) {
-                    return Err(Error::BadPath {
-                        index,
-                        path: path.clone(),
-                    });
-                }
-            }
-            if route.path.is_some() && route.path_regex.is_some() {
-                return Err(Error::PathAndRegex { index });
-            }
-            if (route.match_type == RouteMatch::Exact || route.no_regex)
-                && (route.path.is_none() || route.path_regex.is_some())
+        }
+        for condition in &route.if_conditions {
+            if !condition.variable.starts_with('$')
+                || condition.variable.len() < 2
+                || condition.equals.is_some() == condition.matches.is_some()
             {
-                return Err(Error::BadRouteMatch { index });
+                return Err(Error::BadIf { index });
             }
-            if route.match_type == RouteMatch::Exact && route.no_regex {
-                return Err(Error::BadRouteMatch { index });
+            let Some(ret) = &condition.return_response else {
+                return Err(Error::BadIf { index });
+            };
+            if !(200..=599).contains(&ret.status) {
+                return Err(Error::BadReturnStatus { index });
             }
-            if let Some(pattern) = &route.path_regex {
-                if regex::Regex::new(pattern).is_err() {
-                    return Err(Error::BadPathRegex {
-                        index,
-                        pattern: pattern.clone(),
-                    });
-                }
-                if route.strip_prefix {
-                    return Err(Error::StripPrefixWithRegex { index });
-                }
-            }
-
-            if route.strip_prefix && route.upstream.is_none() {
-                return Err(Error::StripWithoutUpstream { index });
-            }
-
-            if route.autoindex && route.root.is_none() {
-                return Err(Error::AutoindexWithoutRoot { index });
-            }
-
-            if route.timeout_secs == Some(0) {
-                return Err(Error::BadRouteTimeout { index });
-            }
-
-            if route.requests_per_second == Some(0) {
-                return Err(Error::BadRouteRate { index });
-            }
-            if let Some(key) = &route.rate_key {
-                if route.requests_per_second.is_none() {
-                    return Err(Error::RateKeyWithoutRate { index });
-                }
-                if !valid_rate_key(key) {
-                    return Err(Error::BadRateKey {
-                        index,
-                        key: key.clone(),
-                    });
-                }
-            }
-
-            if route.error_root.is_some() && route.error_pages.is_empty() {
-                return Err(Error::ErrorRootWithoutPages { index });
-            }
-
-            for page in &route.error_pages {
-                let mut parts = page.splitn(2, char::is_whitespace);
-                let status = parts.next().unwrap_or_default();
-                let path = parts.next().unwrap_or_default().trim();
-                if status.parse::<u16>().is_err()
-                    || !(100..=599).contains(&status.parse::<u16>().unwrap_or(0))
-                    || !path.starts_with('/')
-                    || path.contains("..")
-                {
-                    return Err(Error::BadErrorPage {
-                        index,
-                        page: page.clone(),
-                    });
-                }
-            }
-
-            if (route.client_cn.is_some() || route.client_issuer_cn.is_some()) && !route.client_auth
-            {
-                return Err(Error::RouteClientFilterWithoutAuth { index });
-            }
-            if route.client_auth {
-                let listener_ok = self
-                    .tls
-                    .as_ref()
-                    .is_some_and(|tls| tls.client_auth != ClientAuthMode::Off);
-                if !listener_ok {
-                    return Err(Error::RouteClientAuthWithoutTls { index });
-                }
-                if self
-                    .http3
-                    .as_ref()
-                    .is_some_and(|http3| http3.client_auth == ClientAuthMode::Off)
-                {
-                    return Err(Error::RouteClientAuthWithoutHttp3 { index });
-                }
-            }
-            if route
-                .client_cn
-                .as_ref()
-                .is_some_and(|cn| cn.trim().is_empty())
-            {
-                return Err(Error::EmptyClientCn { index });
-            }
-            if route
-                .client_issuer_cn
-                .as_ref()
-                .is_some_and(|cn| cn.trim().is_empty())
-            {
-                return Err(Error::EmptyClientIssuerCn { index });
-            }
-
-            if let Some(path) = &route.auth_file {
-                if path.as_os_str().is_empty() {
-                    return Err(Error::EmptyAuthFile { index });
-                }
-            }
-
-            for value in route.ip_allow.iter().chain(route.ip_deny.iter()) {
-                value.parse::<ipnet::IpNet>().map_err(|_| Error::BadAcl {
-                    index,
-                    value: value.clone(),
-                })?;
-            }
-
-            for candidate in &route.try_files {
-                if candidate.is_empty()
-                    || candidate.chars().any(char::is_control)
-                    || candidate.contains("..")
-                {
-                    return Err(Error::BadTryFile {
-                        index,
-                        candidate: candidate.clone(),
-                    });
-                }
-            }
-            if let Some(name) = route.try_files.last().filter(|name| name.starts_with('@')) {
-                if !named_names.contains(name.as_str()) {
-                    return Err(Error::UnknownNamedLocation {
-                        index,
-                        name: name.clone(),
-                    });
-                }
-            }
-
-            if let Some(upstream) = &route.upstream {
-                if !names.contains(upstream.as_str()) {
-                    return Err(Error::UnknownUpstream {
-                        index,
-                        upstream: upstream.clone(),
-                    });
-                }
-            }
-
-            if let Some(root) = &route.root {
-                if root.as_os_str().is_empty() {
-                    return Err(Error::EmptyRoot { index });
-                }
-                if route.spa && route.index.is_empty() {
-                    return Err(Error::SpaNeedsIndex { index });
-                }
-                for entry in &route.index {
-                    if entry.is_empty() || entry.contains('/') || entry.contains("..") {
-                        return Err(Error::BadIndexEntry {
-                            index,
-                            entry: entry.clone(),
-                        });
-                    }
-                }
-            }
-
-            if let Some(redirect) = &route.redirect {
-                if redirect.to.is_empty() || redirect.to.chars().any(char::is_control) {
-                    return Err(Error::BadRedirect { index });
-                }
-                if !matches!(redirect.status, 301 | 302 | 303 | 307 | 308) {
-                    return Err(Error::BadRedirectStatus {
-                        index,
-                        status: redirect.status,
-                    });
-                }
-            }
-
-            for header in &route.add_headers {
-                parse_header_line(header).ok_or_else(|| Error::BadHeader {
-                    index,
-                    header: header.clone(),
-                })?;
-            }
-            for name in &route.remove_headers {
-                HeaderName::from_bytes(name.as_bytes()).map_err(|_| Error::BadHeader {
-                    index,
-                    header: name.clone(),
-                })?;
-            }
-            for header in &route.request_headers {
-                let (name, _) = parse_header_line(header).ok_or_else(|| Error::BadHeader {
-                    index,
-                    header: header.clone(),
-                })?;
-                if reserved_request_header(&name) {
-                    return Err(Error::ReservedRequestHeader { index });
-                }
-            }
-            for name in &route.request_remove_headers {
-                let name =
-                    HeaderName::from_bytes(name.as_bytes()).map_err(|_| Error::BadHeader {
-                        index,
-                        header: name.clone(),
-                    })?;
-                if reserved_request_header(&name) {
-                    return Err(Error::ReservedRequestHeader { index });
-                }
-            }
-
-            if host != "*" {
-                if let Some(suffix) = host.strip_prefix('*') {
-                    if !suffix.starts_with('.') || suffix.len() < 2 || suffix.contains('*') {
-                        return Err(Error::BadWildcardHost { index });
-                    }
-                } else if host.contains('*') {
-                    return Err(Error::BadWildcardHost { index });
+            if let Some(content_type) = &ret.content_type {
+                if HeaderValue::from_str(content_type).is_err() {
+                    return Err(Error::BadReturnContentType { index });
                 }
             }
         }
 
+        if route.fastcgi_pool_idle.is_some() && route.fastcgi_pass.is_none() {
+            return Err(Error::PoolWithoutFastCgi { index });
+        }
+
+        if let Some(target) = &route.fastcgi_pass {
+            if target.trim().is_empty() {
+                return Err(Error::EmptyFastCgiTarget { index });
+            }
+            if route
+                .fastcgi_root
+                .as_ref()
+                .is_none_or(|root| root.as_os_str().is_empty())
+            {
+                return Err(Error::FastCgiNeedRoot { index });
+            }
+        }
+        if route.fastcgi_index.contains('/') || route.fastcgi_index.contains("..") {
+            return Err(Error::BadFastCgiIndex { index });
+        }
+        for param in route.fastcgi_param.iter().chain(route.cgi_param.iter()) {
+            if parse_param(param).is_none() {
+                return Err(Error::BadAppParam {
+                    index,
+                    param: param.clone(),
+                });
+            }
+        }
+        if let Some(script) = &route.cgi_pass {
+            if script.as_os_str().is_empty() || !script.is_absolute() {
+                return Err(Error::BadCgiScript { index });
+            }
+        }
+        if let Some(module) = &route.module {
+            if module.as_os_str().is_empty() || !module.is_absolute() {
+                return Err(Error::BadModulePath { index });
+            }
+        }
+        if let Some(wasm) = &route.wasm {
+            if wasm.as_os_str().is_empty() || !wasm.is_absolute() {
+                return Err(Error::BadWasmPath { index });
+            }
+        }
+        if route.module_sandbox && route.module.is_none() {
+            return Err(Error::SandboxWithoutModule { index });
+        }
+        if route.max_concurrent == Some(0) {
+            return Err(Error::BadConcurrency { index });
+        }
+        if route.max_response_bytes == Some(0) {
+            return Err(Error::BadResponseCap { index });
+        }
+        if route.max_upstream_response_bytes == Some(0) {
+            return Err(Error::BadUpstreamResponseCap { index });
+        }
+        if let Some(sample) = route.access_log_sample {
+            if !sample.is_finite() || !(0.0..=1.0).contains(&sample) {
+                return Err(Error::BadRouteLogSample { index });
+            }
+        }
+        if route.cache_ttl_secs == Some(0) {
+            return Err(Error::BadRouteCacheTtl { index });
+        }
+        Ok(())
+    }
+
+    fn validate_route_policy(
+        &self,
+        route: &Route,
+        index: usize,
+        names: &HashSet<&str>,
+        named_names: &HashSet<&str>,
+    ) -> Result<(), Error> {
+        let host = route.host.trim().to_ascii_lowercase();
+        if let Some(path) = &route.path {
+            if !path.starts_with('/') || path.chars().any(char::is_control) {
+                return Err(Error::BadPath {
+                    index,
+                    path: path.clone(),
+                });
+            }
+        }
+        if route.path.is_some() && route.path_regex.is_some() {
+            return Err(Error::PathAndRegex { index });
+        }
+        if (route.match_type == RouteMatch::Exact || route.no_regex)
+            && (route.path.is_none() || route.path_regex.is_some())
+        {
+            return Err(Error::BadRouteMatch { index });
+        }
+        if route.match_type == RouteMatch::Exact && route.no_regex {
+            return Err(Error::BadRouteMatch { index });
+        }
+        if let Some(pattern) = &route.path_regex {
+            if regex::Regex::new(pattern).is_err() {
+                return Err(Error::BadPathRegex {
+                    index,
+                    pattern: pattern.clone(),
+                });
+            }
+            if route.strip_prefix {
+                return Err(Error::StripPrefixWithRegex { index });
+            }
+        }
+
+        if route.strip_prefix && route.upstream.is_none() {
+            return Err(Error::StripWithoutUpstream { index });
+        }
+
+        if route.autoindex && route.root.is_none() {
+            return Err(Error::AutoindexWithoutRoot { index });
+        }
+
+        if route.timeout_secs == Some(0) {
+            return Err(Error::BadRouteTimeout { index });
+        }
+
+        if route.requests_per_second == Some(0) {
+            return Err(Error::BadRouteRate { index });
+        }
+        if let Some(key) = &route.rate_key {
+            if route.requests_per_second.is_none() {
+                return Err(Error::RateKeyWithoutRate { index });
+            }
+            if !valid_rate_key(key) {
+                return Err(Error::BadRateKey {
+                    index,
+                    key: key.clone(),
+                });
+            }
+        }
+
+        if route.error_root.is_some() && route.error_pages.is_empty() {
+            return Err(Error::ErrorRootWithoutPages { index });
+        }
+
+        for page in &route.error_pages {
+            let mut parts = page.splitn(2, char::is_whitespace);
+            let status = parts.next().unwrap_or_default();
+            let path = parts.next().unwrap_or_default().trim();
+            if status.parse::<u16>().is_err()
+                || !(100..=599).contains(&status.parse::<u16>().unwrap_or(0))
+                || !path.starts_with('/')
+                || path.contains("..")
+            {
+                return Err(Error::BadErrorPage {
+                    index,
+                    page: page.clone(),
+                });
+            }
+        }
+
+        if (route.client_cn.is_some() || route.client_issuer_cn.is_some()) && !route.client_auth {
+            return Err(Error::RouteClientFilterWithoutAuth { index });
+        }
+        if route.client_auth {
+            let listener_ok = self
+                .tls
+                .as_ref()
+                .is_some_and(|tls| tls.client_auth != ClientAuthMode::Off);
+            if !listener_ok {
+                return Err(Error::RouteClientAuthWithoutTls { index });
+            }
+            if self
+                .http3
+                .as_ref()
+                .is_some_and(|http3| http3.client_auth == ClientAuthMode::Off)
+            {
+                return Err(Error::RouteClientAuthWithoutHttp3 { index });
+            }
+        }
+        if route
+            .client_cn
+            .as_ref()
+            .is_some_and(|cn| cn.trim().is_empty())
+        {
+            return Err(Error::EmptyClientCn { index });
+        }
+        if route
+            .client_issuer_cn
+            .as_ref()
+            .is_some_and(|cn| cn.trim().is_empty())
+        {
+            return Err(Error::EmptyClientIssuerCn { index });
+        }
+
+        if let Some(path) = &route.auth_file {
+            if path.as_os_str().is_empty() {
+                return Err(Error::EmptyAuthFile { index });
+            }
+        }
+
+        for value in route.ip_allow.iter().chain(route.ip_deny.iter()) {
+            value.parse::<ipnet::IpNet>().map_err(|_| Error::BadAcl {
+                index,
+                value: value.clone(),
+            })?;
+        }
+
+        for candidate in &route.try_files {
+            if candidate.is_empty()
+                || candidate.chars().any(char::is_control)
+                || candidate.contains("..")
+            {
+                return Err(Error::BadTryFile {
+                    index,
+                    candidate: candidate.clone(),
+                });
+            }
+        }
+        if let Some(name) = route.try_files.last().filter(|name| name.starts_with('@')) {
+            if !named_names.contains(name.as_str()) {
+                return Err(Error::UnknownNamedLocation {
+                    index,
+                    name: name.clone(),
+                });
+            }
+        }
+
+        if let Some(upstream) = &route.upstream {
+            if !names.contains(upstream.as_str()) {
+                return Err(Error::UnknownUpstream {
+                    index,
+                    upstream: upstream.clone(),
+                });
+            }
+        }
+
+        if let Some(root) = &route.root {
+            if root.as_os_str().is_empty() {
+                return Err(Error::EmptyRoot { index });
+            }
+            if route.spa && route.index.is_empty() {
+                return Err(Error::SpaNeedsIndex { index });
+            }
+            for entry in &route.index {
+                if entry.is_empty() || entry.contains('/') || entry.contains("..") {
+                    return Err(Error::BadIndexEntry {
+                        index,
+                        entry: entry.clone(),
+                    });
+                }
+            }
+        }
+
+        if let Some(redirect) = &route.redirect {
+            if redirect.to.is_empty() || redirect.to.chars().any(char::is_control) {
+                return Err(Error::BadRedirect { index });
+            }
+            if !matches!(redirect.status, 301 | 302 | 303 | 307 | 308) {
+                return Err(Error::BadRedirectStatus {
+                    index,
+                    status: redirect.status,
+                });
+            }
+        }
+
+        for header in &route.add_headers {
+            parse_header_line(header).ok_or_else(|| Error::BadHeader {
+                index,
+                header: header.clone(),
+            })?;
+        }
+        for name in &route.remove_headers {
+            HeaderName::from_bytes(name.as_bytes()).map_err(|_| Error::BadHeader {
+                index,
+                header: name.clone(),
+            })?;
+        }
+        for header in &route.request_headers {
+            let (name, _) = parse_header_line(header).ok_or_else(|| Error::BadHeader {
+                index,
+                header: header.clone(),
+            })?;
+            if reserved_request_header(&name) {
+                return Err(Error::ReservedRequestHeader { index });
+            }
+        }
+        for name in &route.request_remove_headers {
+            let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| Error::BadHeader {
+                index,
+                header: name.clone(),
+            })?;
+            if reserved_request_header(&name) {
+                return Err(Error::ReservedRequestHeader { index });
+            }
+        }
+
+        if host != "*" {
+            if let Some(suffix) = host.strip_prefix('*') {
+                if !suffix.starts_with('.') || suffix.len() < 2 || suffix.contains('*') {
+                    return Err(Error::BadWildcardHost { index });
+                }
+            } else if host.contains('*') {
+                return Err(Error::BadWildcardHost { index });
+            }
+        }
         Ok(())
     }
 }
