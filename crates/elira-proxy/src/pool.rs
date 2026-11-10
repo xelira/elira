@@ -1,7 +1,9 @@
 //! Upstream pools, balancing and passive ejection.
 
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use http::uri::Authority;
@@ -11,7 +13,10 @@ use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioIo;
+use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
+use tokio_rustls::rustls::pki_types::ServerName;
+use tokio_rustls::TlsConnector;
 
 use elira_config::Balance;
 use elira_upstream::TlsOptions;
@@ -79,6 +84,8 @@ pub(crate) struct Pool {
     pub(crate) scheme: &'static str,
     pub(crate) client: Client<HttpsConnector<HttpConnector>, Body>,
     pub(crate) tls: TlsOptions,
+    pub(crate) tls_config: Arc<tokio_rustls::rustls::ClientConfig>,
+    pub(crate) proxy_protocol: bool,
     pub(crate) health_path: Option<String>,
     pub(crate) health_method: Option<String>,
     pub(crate) health_status: Option<Vec<u16>>,
@@ -323,7 +330,11 @@ pub(crate) async fn send_request(
     request: Request<Body>,
     timeout: Duration,
     connect_timeout: Duration,
+    peer: SocketAddr,
 ) -> Result<Response<Body>, SendError> {
+    if pool.proxy_protocol && server.tcp().is_some() {
+        return send_direct(pool, server, request, timeout, connect_timeout, peer).await;
+    }
     let Some(path) = server.unix() else {
         if let Some(h3) = &pool.h3 {
             let uri = request.uri().clone();
@@ -372,5 +383,116 @@ pub(crate) async fn send_request(
             .map(|body| BodyExt::map_err(body, |err| -> BoxError { Box::new(err) }).boxed())),
         Ok(Err(err)) => Err(SendError::Failed(err.to_string())),
         Err(_) => Err(SendError::Timeout),
+    }
+}
+
+/// Send a request over a fresh connection preceded by a PROXY protocol v1
+/// header.
+///
+/// The header names the client of the request that opened the connection, so
+/// it cannot be reused from a pool shared by several clients. This path
+/// therefore always opens a new connection and speaks HTTP/1.1.
+async fn send_direct(
+    pool: &Pool,
+    server: &ServerAddr,
+    request: Request<Body>,
+    timeout: Duration,
+    connect_timeout: Duration,
+    peer: SocketAddr,
+) -> Result<Response<Body>, SendError> {
+    let Some(authority) = server.tcp() else {
+        return Err(SendError::Failed(
+            "proxy_protocol needs a TCP upstream".to_owned(),
+        ));
+    };
+    let host = authority
+        .host()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_owned();
+    let port = authority
+        .port_u16()
+        .unwrap_or(if pool.scheme == "https" { 443 } else { 80 });
+
+    let connect = async {
+        let mut stream = elira_upstream::tcp_connect(&host, port, pool.tls.local_address)
+            .await
+            .map_err(|err| SendError::Failed(err.to_string()))?;
+        let _ = stream.set_nodelay(true);
+        let dest = stream
+            .peer_addr()
+            .map_err(|err| SendError::Failed(err.to_string()))?;
+        stream
+            .write_all(&proxy_header(peer, dest))
+            .await
+            .map_err(|err| SendError::Failed(err.to_string()))?;
+
+        if pool.scheme == "https" {
+            let name = pool.tls.sni.clone().unwrap_or_else(|| host.clone());
+            let name = match name.parse::<IpAddr>() {
+                Ok(ip) => ServerName::IpAddress(ip.into()),
+                Err(_) => {
+                    ServerName::try_from(name).map_err(|err| SendError::Failed(err.to_string()))?
+                }
+            };
+            let connector = TlsConnector::from(pool.tls_config.clone());
+            let tls = connector
+                .connect(name, stream)
+                .await
+                .map_err(|err| SendError::Failed(err.to_string()))?;
+            Ok::<Box<dyn DirectIo>, SendError>(Box::new(tls))
+        } else {
+            Ok::<Box<dyn DirectIo>, SendError>(Box::new(stream))
+        }
+    };
+
+    let stream = match tokio::time::timeout(connect_timeout, connect).await {
+        Ok(result) => result?,
+        Err(_) => return Err(SendError::Timeout),
+    };
+
+    let work = async {
+        let (mut sender, connection) =
+            hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let response = sender.send_request(request).await?;
+        Ok::<_, BoxError>(response)
+    };
+
+    match tokio::time::timeout(timeout, work).await {
+        Ok(Ok(response)) => Ok(response
+            .map(|body| BodyExt::map_err(body, |err| -> BoxError { Box::new(err) }).boxed())),
+        Ok(Err(err)) => Err(SendError::Failed(err.to_string())),
+        Err(_) => Err(SendError::Timeout),
+    }
+}
+
+trait DirectIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> DirectIo for T {}
+
+/// Encode a PROXY protocol v1 header. Mixed address families cannot be
+/// expressed by v1, so they fall back to `UNKNOWN`, which still tells the
+/// upstream that the protocol is in use.
+pub(crate) fn proxy_header(client: SocketAddr, server: SocketAddr) -> Vec<u8> {
+    match (client, server) {
+        (SocketAddr::V4(client), SocketAddr::V4(server)) => format!(
+            "PROXY TCP4 {} {} {} {}\r\n",
+            client.ip(),
+            server.ip(),
+            client.port(),
+            server.port()
+        )
+        .into_bytes(),
+        (SocketAddr::V6(client), SocketAddr::V6(server)) => format!(
+            "PROXY TCP6 {} {} {} {}\r\n",
+            client.ip(),
+            server.ip(),
+            client.port(),
+            server.port()
+        )
+        .into_bytes(),
+        _ => b"PROXY UNKNOWN\r\n".to_vec(),
     }
 }

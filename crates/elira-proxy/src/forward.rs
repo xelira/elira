@@ -372,6 +372,7 @@ impl Proxy {
                     is_head,
                     route_timeout,
                     connect_timeout,
+                    peer,
                 )
                 .await;
             _cache_flight = flight;
@@ -407,6 +408,9 @@ impl Proxy {
                     upgrade,
                     server,
                     connect_timeout,
+                    pool.tls.local_address,
+                    pool.proxy_protocol,
+                    peer,
                     route_timeout,
                     proxy_permit,
                     connect_protocol.is_some(),
@@ -691,6 +695,7 @@ impl Proxy {
         is_head: bool,
         route_timeout: Duration,
         connect_timeout: Duration,
+        peer: SocketAddr,
     ) -> (Option<Response<Body>>, Option<CacheFlightGuard>) {
         let mut flight = None;
         if let Some(cache) = &self.inner.cache {
@@ -758,6 +763,7 @@ impl Proxy {
                             pool.clone(),
                             route_timeout,
                             connect_timeout,
+                            peer,
                             entry.cache_ttl_for(cached_status),
                         );
                     }
@@ -838,7 +844,16 @@ impl Proxy {
                 .map_err(|_| text(StatusCode::BAD_GATEWAY, "bad request"))?;
             *upstream.headers_mut() = template.clone();
 
-            match send_request(pool, &server, upstream, route_timeout, connect_timeout).await {
+            match send_request(
+                pool,
+                &server,
+                upstream,
+                route_timeout,
+                connect_timeout,
+                peer,
+            )
+            .await
+            {
                 Ok(answer) => {
                     if attempt + 1 < attempts && pool.retry_on.status(answer.status().as_u16()) {
                         pool.record_success(index);

@@ -235,6 +235,7 @@ Upstreams:
 - TCP and unix sockets in the same pool
 - TLS with a custom CA, explicit `insecure`, per-upstream SNI and HTTP/2,
   upstream client certificates, CRL checks and cipher/curve policy
+- per-upstream source address binding and PROXY protocol v1 toward upstreams
 - WebSocket and other `Upgrade` tunnelling over HTTP/1.1, WebSocket over
   HTTP/2 via RFC 8441 extended `CONNECT`, and `CONNECT` over HTTP/1.1,
   HTTP/2 or HTTP/3 with an explicit allowlist

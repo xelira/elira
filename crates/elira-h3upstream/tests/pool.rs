@@ -252,6 +252,7 @@ fn config(max_connections: usize) -> PoolConfig {
             insecure: true,
             ..TlsOptions::default()
         },
+        bind: None,
     }
 }
 
@@ -460,6 +461,7 @@ async fn silent_server_hits_the_connect_timeout() {
             insecure: true,
             ..TlsOptions::default()
         },
+        bind: None,
     });
     let uri: Uri = format!("https://127.0.0.1:{port}/")
         .parse()

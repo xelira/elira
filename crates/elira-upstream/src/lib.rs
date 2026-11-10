@@ -40,6 +40,9 @@ pub struct TlsOptions {
     /// Time limit for the TCP and TLS handshake. `None` keeps the connector
     /// default.
     pub connect_timeout: Option<Duration>,
+    /// Local IP address to bind before connecting. `None` lets the kernel
+    /// choose.
+    pub local_address: Option<std::net::IpAddr>,
 }
 
 /// Build an HTTPS connector that accepts both `https` and `http` upstreams.
@@ -57,6 +60,7 @@ pub fn https_connector(options: &TlsOptions) -> anyhow::Result<HttpsConnector<Ht
     if let Some(timeout) = options.connect_timeout {
         http.set_connect_timeout(Some(timeout));
     }
+    http.set_local_address(options.local_address);
 
     let builder = HttpsConnectorBuilder::new()
         .with_tls_config(config)
@@ -223,6 +227,42 @@ fn client_auth(
         .with_context(|| format!("client key {} contains no private key", key.display()))?;
 
     Ok((chain, key))
+}
+
+/// Connect a TCP stream to `host:port`, optionally from a fixed local IP.
+///
+/// A plain `TcpStream::connect` cannot express a source address. The socket
+/// path resolves the name first so each candidate can be tried with the
+/// requested family.
+pub async fn tcp_connect(
+    host: &str,
+    port: u16,
+    bind: Option<std::net::IpAddr>,
+) -> std::io::Result<tokio::net::TcpStream> {
+    let Some(bind) = bind else {
+        return tokio::net::TcpStream::connect((host, port)).await;
+    };
+
+    let mut last = None;
+    for addr in tokio::net::lookup_host((host, port)).await? {
+        let socket = if addr.is_ipv4() {
+            tokio::net::TcpSocket::new_v4()?
+        } else {
+            tokio::net::TcpSocket::new_v6()?
+        };
+        if let Err(err) = socket.bind(std::net::SocketAddr::new(bind, 0)) {
+            last = Some(err);
+            continue;
+        }
+        match socket.connect(addr).await {
+            Ok(stream) => return Ok(stream),
+            Err(err) => last = Some(err),
+        }
+    }
+
+    Err(last.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "no usable address")
+    }))
 }
 
 fn root_store(ca: Option<&Path>) -> anyhow::Result<RootCertStore> {

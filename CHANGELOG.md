@@ -128,6 +128,7 @@
 - `cipher_suites`/`curves` для TCP и отдельно для HTTP/3.
 - Клиентские сертификаты, CRL и cipher/curve policy для TLS-upstream'ов в
   `[upstream_tls]`.
+- `bind` и `proxy_protocol` для исходящих соединений к upstream'ам.
 - `GET /config` на админском листенере: эффективный конфиг в JSON.
 - Тесты FastCGI/CGI на обрезанные заголовки, длину записи, padding и хвост
   после `END_REQUEST`.

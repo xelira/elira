@@ -14,6 +14,7 @@ rustls = { workspace = true }
 rustls-native-certs = "0.8"
 rustls-pemfile = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
 bytes = { workspace = true }

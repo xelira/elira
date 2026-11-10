@@ -156,6 +156,10 @@ fn least_conn_prefers_the_idle_server() {
         scheme: "http",
         client,
         tls,
+        tls_config: std::sync::Arc::new(
+            elira_upstream::client_config(&TlsOptions::default()).expect("tls config"),
+        ),
+        proxy_protocol: false,
         health_path: None,
         health_method: None,
         health_status: None,
@@ -207,6 +211,10 @@ fn weighted_least_conn_compares_active_over_weight() {
         scheme: "http",
         client,
         tls,
+        tls_config: std::sync::Arc::new(
+            elira_upstream::client_config(&TlsOptions::default()).expect("tls config"),
+        ),
+        proxy_protocol: false,
         health_path: None,
         health_method: None,
         health_status: None,
@@ -307,6 +315,10 @@ fn passive_ejection_skips_a_failing_server_until_the_cooldown() {
         scheme: "http",
         client,
         tls,
+        tls_config: std::sync::Arc::new(
+            elira_upstream::client_config(&TlsOptions::default()).expect("tls config"),
+        ),
+        proxy_protocol: false,
         health_path: None,
         health_method: None,
         health_status: None,

@@ -2067,6 +2067,47 @@ send_timeout_secs = 0
 }
 
 #[test]
+fn proxy_protocol_and_bind_are_validated() {
+    let base = r#"
+listen = "127.0.0.1:8080"
+
+[[upstreams]]
+name = "app"
+servers = ["127.0.0.1:9000"]
+bind = "127.0.0.2"
+proxy_protocol = true
+
+[[routes]]
+host = "*"
+upstream = "app"
+"#;
+    let cfg = Config::parse(base).expect("valid config");
+    assert_eq!(
+        cfg.upstreams[0].bind,
+        Some("127.0.0.2".parse().expect("ip"))
+    );
+    assert!(cfg.upstreams[0].proxy_protocol);
+
+    let h3 = base.replace(
+        "proxy_protocol = true",
+        "proxy_protocol = true\ntls = true\nh3_pool = true",
+    );
+    assert!(matches!(
+        Config::parse(&h3),
+        Err(Error::BadProxyProtocol { .. })
+    ));
+
+    let unix = base.replace(
+        "servers = [\"127.0.0.1:9000\"]",
+        "servers = [\"unix:/tmp/app.sock\"]",
+    );
+    assert!(matches!(
+        Config::parse(&unix),
+        Err(Error::BadProxyProtocol { .. })
+    ));
+}
+
+#[test]
 fn named_locations_are_validated() {
     let base = r#"
 listen = "127.0.0.1:8080"

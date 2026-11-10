@@ -647,6 +647,13 @@ impl Config {
                     name: up.name.clone(),
                 });
             }
+            if up.proxy_protocol
+                && (up.h3_pool || up.servers.iter().any(|server| server.starts_with("unix:")))
+            {
+                return Err(Error::BadProxyProtocol {
+                    name: up.name.clone(),
+                });
+            }
             if up.dns_ttl_secs == Some(0) {
                 return Err(Error::BadDnsTtl {
                     name: up.name.clone(),

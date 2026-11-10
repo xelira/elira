@@ -1,5 +1,6 @@
 //! Upstreams, health checks and balancing.
 
+use std::net::IpAddr;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -70,6 +71,14 @@ pub struct Upstream {
     /// Overrides `[upstream_tls] http2` for this upstream.
     #[serde(default)]
     pub http2: Option<bool>,
+
+    /// Local IP address to bind before connecting to the servers.
+    #[serde(default)]
+    pub bind: Option<IpAddr>,
+
+    /// Send a PROXY protocol v1 header before the upstream speaks HTTP or TLS.
+    #[serde(default)]
+    pub proxy_protocol: bool,
 
     /// Use Elira's own HTTP/2 pool instead of the HTTP/1.1/h2 legacy client.
     /// Clear-text upstreams speak h2c with prior knowledge.

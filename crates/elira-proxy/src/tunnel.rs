@@ -4,6 +4,7 @@
 //! hand, the 101 is parsed before hyper sees a response, and both directions
 //! are copied directly.
 
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -127,6 +128,9 @@ impl Proxy {
         upgrade: HeaderValue,
         server: ServerAddr,
         connect_timeout: Duration,
+        bind: Option<std::net::IpAddr>,
+        proxy_protocol: bool,
+        peer: SocketAddr,
         timeout: Duration,
         client_permit: Option<tokio::sync::OwnedSemaphorePermit>,
         extended_connect: bool,
@@ -138,10 +142,24 @@ impl Proxy {
             Err(_) => return Err(text(StatusCode::SERVICE_UNAVAILABLE, "too many tunnels")),
         };
 
-        let mut stream = match connect_server(&server, connect_timeout).await {
+        let mut stream = match connect_server(&server, connect_timeout, bind).await {
             Some(stream) => stream,
             None => return Err(text(StatusCode::BAD_GATEWAY, "bad gateway")),
         };
+
+        if proxy_protocol {
+            if let EitherStream::Tcp(tcp) = &mut stream {
+                let dest = match tcp.peer_addr() {
+                    Ok(dest) => dest,
+                    Err(_) => return Err(text(StatusCode::BAD_GATEWAY, "bad gateway")),
+                };
+                let header = crate::pool::proxy_header(peer, dest);
+                match tokio::time::timeout(connect_timeout, tcp.write_all(&header)).await {
+                    Ok(Ok(())) => {}
+                    _ => return Err(text(StatusCode::BAD_GATEWAY, "bad gateway")),
+                }
+            }
+        }
 
         let head = serialize_head(&upstream);
         match tokio::time::timeout(timeout, stream.write_all(head.as_bytes())).await {
@@ -341,7 +359,11 @@ impl AsyncWrite for EitherStream {
     }
 }
 
-async fn connect_server(server: &ServerAddr, timeout: Duration) -> Option<EitherStream> {
+async fn connect_server(
+    server: &ServerAddr,
+    timeout: Duration,
+    bind: Option<std::net::IpAddr>,
+) -> Option<EitherStream> {
     match server {
         ServerAddr::Tcp(authority) => {
             let host = authority
@@ -349,7 +371,8 @@ async fn connect_server(server: &ServerAddr, timeout: Duration) -> Option<Either
                 .trim_start_matches('[')
                 .trim_end_matches(']');
             let port = authority.port_u16().unwrap_or(80);
-            match tokio::time::timeout(timeout, TcpStream::connect((host, port))).await {
+            match tokio::time::timeout(timeout, elira_upstream::tcp_connect(host, port, bind)).await
+            {
                 Ok(Ok(stream)) => Some(EitherStream::Tcp(stream)),
                 _ => None,
             }

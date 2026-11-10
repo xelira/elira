@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UnixStream};
+use tokio::net::UnixStream;
 
 use elira_upstream::TlsOptions;
 
@@ -53,7 +53,12 @@ pub(crate) async fn probe_server(server: &ServerAddr, probe: &Probe<'_>) -> bool
         .port_u16()
         .unwrap_or(if probe.tls { 443 } else { 80 });
 
-    let stream = match tokio::time::timeout(probe.timeout, TcpStream::connect((host, port))).await {
+    let stream = match tokio::time::timeout(
+        probe.timeout,
+        elira_upstream::tcp_connect(host, port, probe.options.local_address),
+    )
+    .await
+    {
         Ok(Ok(stream)) => stream,
         _ => return false,
     };

@@ -44,7 +44,6 @@ use rustls::pki_types::ServerName;
 use rustls::ClientConfig;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpStream;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_rustls::TlsConnector;
 
@@ -78,6 +77,8 @@ pub struct PoolConfig {
     pub max_connections: usize,
     /// Deadline for DNS, TCP connect, TLS and the HTTP/2 preface together.
     pub connect_timeout: Duration,
+    /// Local IP address to bind before connecting.
+    pub bind: Option<std::net::IpAddr>,
     /// Trust settings for `https://` origins.
     ///
     /// [`TlsOptions::http2`] is ignored: this pool always offers `h2` and
@@ -98,6 +99,7 @@ impl Default for PoolConfig {
         Self {
             max_connections: 4,
             connect_timeout: Duration::from_secs(10),
+            bind: None,
             tls: TlsOptions::default(),
             max_concurrent_streams: None,
         }
@@ -374,12 +376,13 @@ impl Inner {
         let origin_name = origin.to_string();
 
         let established = tokio::time::timeout(timeout, async {
-            let tcp = TcpStream::connect((origin.host.as_str(), origin.port))
-                .await
-                .map_err(|source| Error::Connect {
-                    origin: origin_name.clone(),
-                    source,
-                })?;
+            let tcp =
+                elira_upstream::tcp_connect(origin.host.as_str(), origin.port, self.config.bind)
+                    .await
+                    .map_err(|source| Error::Connect {
+                        origin: origin_name.clone(),
+                        source,
+                    })?;
             let _ = tcp.set_nodelay(true);
 
             let io: BoxedIo = match origin.scheme {
@@ -692,7 +695,7 @@ impl Origin {
             uri: uri.to_string(),
         })?;
         // `Authority::host` keeps IPv6 brackets; the stored host is bare so
-        // the `(host, port)` tuple used for `TcpStream::connect` is valid.
+        // the `(host, port)` tuple used for connecting is valid.
         let host = authority.host();
         let host = host
             .strip_prefix('[')

@@ -189,6 +189,7 @@ impl Proxy {
         pool: Arc<Pool>,
         timeout: Duration,
         connect_timeout: Duration,
+        peer: SocketAddr,
         cache_ttl: Option<Duration>,
     ) {
         {
@@ -230,9 +231,10 @@ impl Proxy {
                 for (name, value) in &validators {
                     request.headers_mut().insert(name, value.clone());
                 }
-                let response = send_request(&pool, &server, request, timeout, connect_timeout)
-                    .await
-                    .ok()?;
+                let response =
+                    send_request(&pool, &server, request, timeout, connect_timeout, peer)
+                        .await
+                        .ok()?;
                 if response.status() == StatusCode::NOT_MODIFIED {
                     return Some((StatusCode::NOT_MODIFIED, HeaderMap::new(), Bytes::new()));
                 }

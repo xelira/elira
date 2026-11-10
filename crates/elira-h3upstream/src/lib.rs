@@ -88,6 +88,8 @@ pub struct PoolConfig {
     /// Trust settings. [`TlsOptions::http2`] is ignored: this pool always
     /// offers `h3` and QUIC already implies TLS 1.3.
     pub tls: TlsOptions,
+    /// Local IP address to bind the QUIC endpoint to.
+    pub bind: Option<IpAddr>,
 }
 
 impl Default for PoolConfig {
@@ -96,6 +98,7 @@ impl Default for PoolConfig {
             max_connections: 4,
             connect_timeout: Duration::from_secs(10),
             tls: TlsOptions::default(),
+            bind: None,
         }
     }
 }
@@ -107,6 +110,7 @@ impl PoolConfig {
             max_connections,
             connect_timeout,
             tls,
+            ..Self::default()
         }
     }
 }
@@ -518,9 +522,10 @@ impl Inner {
         }
 
         let config = self.quic_config()?;
-        let bind: SocketAddr = match family {
-            Family::V4 => SocketAddr::from(([0, 0, 0, 0], 0)),
-            Family::V6 => SocketAddr::from(([0; 8], 0)),
+        let bind: SocketAddr = match (self.config.bind, family) {
+            (Some(ip), _) => SocketAddr::new(ip, 0),
+            (None, Family::V4) => SocketAddr::from(([0, 0, 0, 0], 0)),
+            (None, Family::V6) => SocketAddr::from(([0; 8], 0)),
         };
 
         let mut endpoint = Endpoint::client(bind).map_err(|source| Error::Endpoint {

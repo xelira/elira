@@ -63,10 +63,17 @@ pub(crate) fn build_pools(cfg: &Config) -> Result<(Pools, Vec<Arc<Pool>>), Error
             connect_timeout: Some(Duration::from_secs(
                 cfg.limits.upstream_connect_timeout_secs,
             )),
+            local_address: up.bind,
         };
         let connector = https_connector(&tls).map_err(|err| Error::UpstreamTls {
             reason: err.to_string(),
         })?;
+        let tls_config =
+            Arc::new(
+                elira_upstream::client_config(&tls).map_err(|err| Error::UpstreamTls {
+                    reason: err.to_string(),
+                })?,
+            );
         let client = Client::builder(TokioExecutor::new())
             // Hyper resolves the name for each new connection, so the
             // pool lifetime is the upper bound on DNS staleness.
@@ -96,6 +103,8 @@ pub(crate) fn build_pools(cfg: &Config) -> Result<(Pools, Vec<Arc<Pool>>), Error
                 scheme: if up.tls { "https" } else { "http" },
                 client,
                 tls: tls.clone(),
+                tls_config,
+                proxy_protocol: up.proxy_protocol,
                 health_path: up.health_path.clone(),
                 health_method: up.health_method.clone(),
                 health_status: up.health_expect_status.clone(),
@@ -107,14 +116,17 @@ pub(crate) fn build_pools(cfg: &Config) -> Result<(Pools, Vec<Arc<Pool>>), Error
                             cfg.limits.upstream_connect_timeout_secs,
                         ),
                         tls: tls.clone(),
+                        bind: up.bind,
                     })
                 }),
                 h2: up.h2_pool.then(|| {
-                    elira_h2::Pool::new(elira_h2::PoolConfig::new(
+                    let mut config = elira_h2::PoolConfig::new(
                         4,
                         Duration::from_secs(cfg.limits.upstream_connect_timeout_secs),
                         tls.clone(),
-                    ))
+                    );
+                    config.bind = up.bind;
+                    elira_h2::Pool::new(config)
                 }),
             }),
         );

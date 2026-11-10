@@ -165,7 +165,7 @@ Living list for the self-improvement loop. One item per session.
 - [ ] FastCGI/CGI response caching.
 - [x] Upstream client certificates, upstream CRL and upstream cipher policy.
 - [x] Separate connect/send/read timeouts.
-- [ ] `proxy_protocol on` toward upstreams and `proxy_bind`.
+- [x] `proxy_protocol on` toward upstreams and `proxy_bind`.
 - [x] `proxy_redirect`, `proxy_cookie_domain/path`, `proxy_hide_header`.
 - [ ] Upstream keepalive tuning: `keepalive`, `keepalive_requests`, per-server
   `max_conns`, `backup`, `down`, `slow_start`, `random`.

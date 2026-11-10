@@ -236,6 +236,11 @@ pub enum Error {
     #[error("upstream \"{name}\": h3_pool and h2_pool are mutually exclusive")]
     H3AndH2Pool { name: String },
 
+    #[error(
+        "upstream \"{name}\": proxy_protocol needs TCP servers and cannot be combined with h3_pool"
+    )]
+    BadProxyProtocol { name: String },
+
     #[error("upstream \"{name}\": dns_ttl_secs must be greater than zero")]
     BadDnsTtl { name: String },
 
