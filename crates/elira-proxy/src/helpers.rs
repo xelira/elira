@@ -6,9 +6,11 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use async_compression::tokio::bufread::{BrotliEncoder, GzipEncoder};
 use bytes::Bytes;
+use elira_limit::{RateDecision, RateLimiter};
 use futures_util::TryStreamExt;
 use http::header::{
     HeaderName, HeaderValue, ACCEPT_ENCODING, CACHE_CONTROL, CONNECTION, CONTENT_LENGTH,
@@ -135,6 +137,26 @@ pub(crate) fn cacheable_response(headers: &HeaderMap) -> bool {
             !value.contains("no-store") && !value.contains("private")
         }
         None => true,
+    }
+}
+
+/// Spend one token, optionally waiting for the next refill instead of
+/// rejecting. Returns false when the burst queue is full.
+pub(crate) async fn rate_allowed<K: std::hash::Hash + ?Sized>(
+    limiter: &RateLimiter,
+    key: &K,
+    delay: bool,
+) -> bool {
+    if !delay {
+        return limiter.check(key, Instant::now());
+    }
+    match limiter.check_delay(key, Instant::now()) {
+        RateDecision::Allow => true,
+        RateDecision::Delay(wait) => {
+            tokio::time::sleep(wait).await;
+            true
+        }
+        RateDecision::Reject => false,
     }
 }
 

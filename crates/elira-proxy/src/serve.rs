@@ -169,7 +169,7 @@ impl Proxy {
                 .map(|value| value.as_str())
                 .unwrap_or("/");
             let bucket = request_key_value(&entry.rate_key, req.headers(), peer.ip(), key_path);
-            if !limiter.check(bucket.as_ref(), Instant::now()) {
+            if !rate_allowed(limiter, bucket.as_ref(), entry.rate_delay).await {
                 let mut response = text(StatusCode::TOO_MANY_REQUESTS, "too many requests");
                 response
                     .headers_mut()

@@ -331,6 +331,11 @@ pub struct Route {
     #[serde(default)]
     pub rate_key: Option<String>,
 
+    /// Delay requests over the rate instead of rejecting them until the burst
+    /// queue is full. False keeps nginx's `nodelay` behaviour.
+    #[serde(default)]
+    pub rate_delay: Option<bool>,
+
     /// Overrides `limits.max_body_bytes` for this route.
     #[serde(default)]
     pub max_body_bytes: Option<usize>,

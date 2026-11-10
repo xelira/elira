@@ -43,6 +43,14 @@ pub struct RateLimiter {
     buckets: Mutex<HashMap<u64, Bucket>>,
 }
 
+/// Result of a delayed token-bucket check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateDecision {
+    Allow,
+    Delay(Duration),
+    Reject,
+}
+
 impl RateLimiter {
     /// Creates a limiter allowing `rate` tokens per second with a maximum
     /// stored balance of `burst`.
@@ -99,6 +107,40 @@ impl RateLimiter {
         allowed
     }
 
+    /// Delayed variant of [`check`](Self::check).
+    ///
+    /// When the bucket is empty, a request may borrow against future refills
+    /// until the queue reaches the burst size. The caller is expected to wait
+    /// for the returned duration before serving the request.
+    pub fn check_delay<K: Hash + ?Sized>(&self, key: &K, now: Instant) -> RateDecision {
+        if self.rate == 0.0 {
+            return RateDecision::Allow;
+        }
+
+        let key = self.hasher.hash_one(key);
+        let mut buckets = self.lock();
+        let bucket = buckets.entry(key).or_insert_with(|| Bucket {
+            tokens: self.burst,
+            last_seen: now,
+        });
+        refill(bucket, self.rate, self.burst, now);
+
+        if bucket.tokens >= 1.0 {
+            bucket.tokens -= 1.0;
+            return RateDecision::Allow;
+        }
+
+        // The queue may grow until it is one full burst deep. Tokens below
+        // zero represent requests already promised a future slot.
+        if bucket.tokens > -(self.burst - 1.0) {
+            let wait = Duration::from_secs_f64((1.0 - bucket.tokens) / self.rate);
+            bucket.tokens -= 1.0;
+            RateDecision::Delay(wait)
+        } else {
+            RateDecision::Reject
+        }
+    }
+
     /// Number of keys currently tracked. Intended for tests and metrics.
     pub fn tracked(&self) -> usize {
         self.lock().len()
@@ -131,14 +173,7 @@ impl std::fmt::Debug for RateLimiter {
 
 /// Adds the tokens earned since the last check, then spends one if available.
 fn refill_and_take(bucket: &mut Bucket, rate: f64, burst: f64, now: Instant) -> bool {
-    // saturating_duration_since tolerates a caller passing a time earlier than
-    // the previous check instead of panicking on a non-monotonic argument.
-    let elapsed = now
-        .saturating_duration_since(bucket.last_seen)
-        .as_secs_f64();
-    bucket.tokens = (bucket.tokens + elapsed * rate).min(burst);
-    bucket.last_seen = now;
-
+    refill(bucket, rate, burst, now);
     if bucket.tokens >= 1.0 {
         bucket.tokens -= 1.0;
         true
@@ -147,6 +182,16 @@ fn refill_and_take(bucket: &mut Bucket, rate: f64, burst: f64, now: Instant) -> 
         // its allowance exactly when the refill says it should.
         false
     }
+}
+
+fn refill(bucket: &mut Bucket, rate: f64, burst: f64, now: Instant) {
+    // saturating_duration_since tolerates a caller passing a time earlier than
+    // the previous check instead of panicking on a non-monotonic argument.
+    let elapsed = now
+        .saturating_duration_since(bucket.last_seen)
+        .as_secs_f64();
+    bucket.tokens = (bucket.tokens + elapsed * rate).min(burst);
+    bucket.last_seen = now;
 }
 
 fn prune(buckets: &mut HashMap<u64, Bucket>, now: Instant) {
@@ -184,6 +229,30 @@ mod tests {
             assert!(limiter.check(&client, t2));
         }
         assert!(!limiter.check(&client, t2));
+    }
+
+    #[test]
+    fn delayed_checks_queue_up_to_the_burst() {
+        let limiter = RateLimiter::new(1, 3);
+        let client = peer(1);
+        let t0 = Instant::now();
+
+        for _ in 0..3 {
+            assert_eq!(limiter.check_delay(&client, t0), RateDecision::Allow);
+        }
+        assert_eq!(
+            limiter.check_delay(&client, t0),
+            RateDecision::Delay(Duration::from_secs(1))
+        );
+        assert_eq!(
+            limiter.check_delay(&client, t0),
+            RateDecision::Delay(Duration::from_secs(2))
+        );
+        assert_eq!(limiter.check_delay(&client, t0), RateDecision::Reject);
+
+        // After the promised time the queue drains.
+        let later = t0 + Duration::from_secs(3);
+        assert_eq!(limiter.check_delay(&client, later), RateDecision::Allow);
     }
 
     #[test]

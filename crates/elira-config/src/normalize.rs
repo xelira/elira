@@ -110,6 +110,7 @@ fn inherit(parent: &Route, child: &mut Route) -> Result<(), Error> {
     child.requests_per_second = child.requests_per_second.or(parent.requests_per_second);
     child.burst = child.burst.or(parent.burst);
     child.rate_key = child.rate_key.clone().or_else(|| parent.rate_key.clone());
+    child.rate_delay = child.rate_delay.or(parent.rate_delay);
     child.max_body_bytes = child.max_body_bytes.or(parent.max_body_bytes);
     child.max_response_bytes = child.max_response_bytes.or(parent.max_response_bytes);
     child.max_upstream_response_bytes = child
@@ -303,6 +304,7 @@ mod tests {
             requests_per_second: None,
             burst: None,
             rate_key: None,
+            rate_delay: None,
             max_body_bytes: None,
             max_response_bytes: None,
             max_upstream_response_bytes: None,

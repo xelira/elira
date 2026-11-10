@@ -274,14 +274,16 @@ upstream. Нужен `error_root`; задавать их можно только
   отключился.
 - `requests_per_second` включает token bucket на каждый IP. Превышение даёт
   `429` с `Retry-After: 1`. `burst` — глубина ведра; при `0` она равна
-  `requests_per_second`.
+  `requests_per_second`. `rate_delay = true` на маршруте вместо немедленного
+  `429` ждёт следующего токена; очередь ограничена `burst`, после чего запрос
+  всё равно получает `429`.
 - `trusted_proxies` — CIDR-блоки. Если peer входит в список, его
   `X-Forwarded-For` сохраняется и дополняется адресом peer'а. Для всех
   остальных заголовок заменяется адресом peer'а, а клиентские
   `X-Forwarded-*`/`Forwarded` отбрасываются.
-- Жёстко зашиты и не настраиваются: 30 с на чтение заголовков HTTP/1.1,
-  10 с на TLS-handshake, 5 с на connect к upstream, 30 с на idle в пуле
-  соединений, 5 с на дозавершение соединения при остановке.
+- TLS-handshake ограничен 10 секундами. Остальные таймауты вынесены в
+  конфиг: `client_header_timeout_secs`, `upstream_connect_timeout_secs`,
+  `keepalive_secs`, `connection_drain_secs`.
 
 ## `[compression]`
 
@@ -972,6 +974,7 @@ buckets = [{ percent = 10, value = "a" }, { percent = 90, value = "b" }]
 | `requests_per_second` | целое > 0 | глобальный лимит | свой token bucket для маршрута |
 | `burst` | целое ≥ 0 | равен rate | глубина bucket'а маршрута |
 | `rate_key` | строка | `"ip"` | ключ лимита: `ip`, `authorization`, `header:NAME`, `cookie:NAME`, `uri` |
+| `rate_delay` | bool | `false` | задерживать лишние запросы вместо `429` до заполнения burst |
 | `max_body_bytes` | целое ≥ 0 | глобальный лимит | свой предел `Content-Length` |
 | `limit_rate` | целое ≥ 0 | `limits.limit_rate` | свой байт/сек на ответ; `0` выключает |
 | `limit_rate_after` | целое ≥ 0 | `limits.limit_rate_after` | свой бесплатный префикс |

@@ -369,6 +369,7 @@ pub(crate) fn build_route(
         rate_after: route
             .limit_rate_after
             .unwrap_or(cfg.limits.limit_rate_after),
+        rate_delay: route.rate_delay.unwrap_or(false),
         limiter,
         rate_key: parse_request_key(route.rate_key.as_deref()),
         body_limit: route.max_body_bytes,

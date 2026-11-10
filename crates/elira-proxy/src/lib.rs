@@ -258,6 +258,7 @@ struct RouteEntry {
     send_timeout: Option<Duration>,
     rate: Option<u64>,
     rate_after: u64,
+    rate_delay: bool,
     limiter: Option<Arc<RateLimiter>>,
     rate_key: RequestKey,
     body_limit: Option<usize>,
@@ -607,7 +608,7 @@ impl Proxy {
         }
         if let Some(limiter) = &entry.limiter {
             let bucket = request_key_value(&entry.rate_key, headers, peer, path);
-            if !limiter.check(bucket.as_ref(), Instant::now()) {
+            if !rate_allowed(limiter, bucket.as_ref(), entry.rate_delay).await {
                 return None;
             }
         }
