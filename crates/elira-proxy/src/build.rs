@@ -211,6 +211,7 @@ pub(crate) fn build_route(
         auth_request: route.auth_request.clone(),
         satisfy: route.satisfy.unwrap_or_default(),
         secure_link: route.secure_link.clone(),
+        x_sendfile_root: route.x_sendfile_root.clone(),
         if_conditions,
         auth,
         acl,

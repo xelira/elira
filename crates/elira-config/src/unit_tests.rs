@@ -1818,6 +1818,29 @@ secure_link = { secret = "s3cret", md5 = "$arg_md5", expires = "$arg_expires" }
 }
 
 #[test]
+fn x_sendfile_root_is_validated() {
+    let base = r#"
+listen = "127.0.0.1:8080"
+
+[[routes]]
+host = "*"
+root = "/srv"
+x_sendfile_root = "/srv/files"
+"#;
+    let cfg = Config::parse(base).expect("valid");
+    assert_eq!(
+        cfg.routes[0].x_sendfile_root.as_deref(),
+        Some(std::path::Path::new("/srv/files"))
+    );
+
+    let empty = base.replace("x_sendfile_root = \"/srv/files\"", "x_sendfile_root = \"\"");
+    assert!(matches!(
+        Config::parse(&empty),
+        Err(Error::BadSendfileRoot { .. })
+    ));
+}
+
+#[test]
 fn named_locations_are_validated() {
     let base = r#"
 listen = "127.0.0.1:8080"

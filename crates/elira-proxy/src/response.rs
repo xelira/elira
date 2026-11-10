@@ -1,6 +1,7 @@
 //! Response finalisation: route headers, fixed returns and error pages.
 
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -278,5 +279,61 @@ impl Proxy {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .remove(&key);
         });
+    }
+
+    /// Serve a file named by an upstream `X-Sendfile` header, restricted to
+    /// the route's `x_sendfile_root`.
+    pub(crate) async fn sendfile_response(
+        &self,
+        raw_path: &str,
+        root: &Path,
+        entry: &RouteEntry,
+        request_headers: &HeaderMap,
+        peer: SocketAddr,
+    ) -> Response<Body> {
+        let path = Path::new(raw_path);
+        if !path.is_absolute() {
+            return text(StatusCode::FORBIDDEN, "X-Sendfile path is not absolute");
+        }
+        let root = match tokio::fs::canonicalize(root).await {
+            Ok(root) => root,
+            Err(_) => return text(StatusCode::NOT_FOUND, "X-Sendfile root is missing"),
+        };
+        let path = match tokio::fs::canonicalize(path).await {
+            Ok(path) => path,
+            Err(_) => return text(StatusCode::NOT_FOUND, "X-Sendfile file is missing"),
+        };
+        if !path.starts_with(&root) {
+            return text(StatusCode::FORBIDDEN, "X-Sendfile path is outside the root");
+        }
+
+        let relative = path.strip_prefix(&root).unwrap_or_else(|_| Path::new(""));
+        let mut uri = String::from("/");
+        uri.push_str(&relative.to_string_lossy());
+        let files = crate::files::Files::new(
+            root,
+            None,
+            Vec::new(),
+            false,
+            Vec::new(),
+            false,
+            self.inner.compression.enabled,
+            self.inner.compression.min_bytes,
+            entry.expires_secs,
+            entry.etag,
+        );
+        let mut request = match Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .body(empty())
+        {
+            Ok(request) => request,
+            Err(_) => return text(StatusCode::BAD_REQUEST, "bad X-Sendfile path"),
+        };
+        let mut headers = request_headers.clone();
+        headers.remove(CONTENT_LENGTH);
+        headers.remove(http::header::TRANSFER_ENCODING);
+        *request.headers_mut() = headers;
+        files.serve(&request, peer).await
     }
 }

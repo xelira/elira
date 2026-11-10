@@ -1059,6 +1059,14 @@ impl Config {
             }
         }
 
+        if route
+            .x_sendfile_root
+            .as_ref()
+            .is_some_and(|root| root.as_os_str().is_empty())
+        {
+            return Err(Error::BadSendfileRoot { index });
+        }
+
         for value in route.ip_allow.iter().chain(route.ip_deny.iter()) {
             value.parse::<ipnet::IpNet>().map_err(|_| Error::BadAcl {
                 index,

@@ -100,6 +100,10 @@ pub(crate) struct InternalRequest {
 /// Marks the internal subrequest made by `auth_request`.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct AuthSubrequest;
+
+/// Marks an internal redirect requested by `X-Accel-Redirect`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AccelRedirect;
 pub type Body = BoxBody<Bytes, BoxError>;
 
 #[derive(Clone)]
@@ -227,6 +231,7 @@ struct RouteEntry {
     auth_request: Option<String>,
     satisfy: Satisfy,
     secure_link: Option<SecureLink>,
+    x_sendfile_root: Option<PathBuf>,
     if_conditions: Vec<CompiledIf>,
     auth: Option<Arc<BasicAuth>>,
     acl: Option<Arc<IpAcl>>,

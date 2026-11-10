@@ -1225,6 +1225,151 @@ secure_link = { secret = "s3cret" }
     assert_eq!(status(&response), "HTTP/1.1 403 Forbidden", "{response}");
 }
 
+#[tokio::test]
+async fn x_accel_redirect_serves_an_internal_route() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind accel upstream");
+    let upstream = listener.local_addr().expect("accel addr");
+    tokio::spawn(async move {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            return;
+        };
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 4096];
+        while let Ok(read) = stream.read(&mut chunk).await {
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let _ = stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX-Accel-Redirect: /internal\r\nConnection: close\r\n\r\n",
+            )
+            .await;
+    });
+
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "*"
+path = "/app"
+upstream = "app"
+
+[[routes]]
+host = "*"
+path = "/internal"
+internal = true
+return = {{ status = 200, body = "secret" }}
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let response = roundtrip(
+        addr,
+        "GET /app HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&response), "HTTP/1.1 200 OK", "{response}");
+    assert!(response.ends_with("secret"), "{response}");
+}
+
+#[tokio::test]
+async fn x_sendfile_serves_files_under_the_configured_root() {
+    async fn sendfile_upstream(path: String) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind sendfile upstream");
+        let addr = listener.local_addr().expect("sendfile addr");
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while let Ok(read) = stream.read(&mut chunk).await {
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX-Sendfile: {path}\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+        addr
+    }
+
+    let root = temp_root("xsendfile");
+    std::fs::write(root.join("secret.txt"), "sendfile-ok").unwrap();
+    let file = root.join("secret.txt").display().to_string();
+    let upstream = sendfile_upstream(file).await;
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "*"
+path = "/app"
+upstream = "app"
+x_sendfile_root = "{}"
+"#,
+        root.display()
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let response = roundtrip(
+        addr,
+        "GET /app HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&response), "HTTP/1.1 200 OK", "{response}");
+    assert!(response.ends_with("sendfile-ok"), "{response}");
+
+    let outside = sendfile_upstream("/etc/passwd".to_owned()).await;
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[upstreams]]
+name = "app"
+servers = ["{outside}"]
+
+[[routes]]
+host = "*"
+path = "/app"
+upstream = "app"
+x_sendfile_root = "{}"
+"#,
+        root.display()
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+    let response = roundtrip(
+        addr,
+        "GET /app HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&response), "HTTP/1.1 403 Forbidden", "{response}");
+}
+
 fn temp_root(label: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static NEXT: AtomicUsize = AtomicUsize::new(0);

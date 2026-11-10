@@ -233,6 +233,7 @@ impl Proxy {
         if entry.internal && internal.is_none() {
             return Err(text(StatusCode::NOT_FOUND, "no route"));
         }
+        let internal_count = internal.as_ref().map_or(0, |internal| internal.count);
         if let Some(internal) = internal {
             req.extensions_mut().insert(InternalRequest {
                 name: None,
@@ -308,6 +309,7 @@ impl Proxy {
         };
 
         let auth_subrequest = req.extensions().get::<AuthSubrequest>().is_some();
+        let accel_redirect = req.extensions().get::<AccelRedirect>().is_some();
         let (parts, body) = req.into_parts();
         // Kept for Vary matching: the response parts shadow this name later.
         let request_headers = parts.headers.clone();
@@ -339,7 +341,7 @@ impl Proxy {
 
         let mut body = Some(body);
 
-        let cache_allowed = entry.cache != Some(false) && !auth_subrequest;
+        let cache_allowed = entry.cache != Some(false) && !auth_subrequest && !accel_redirect;
         let mut _cache_flight: Option<CacheFlightGuard> = None;
         if is_get && requested_upgrade.is_none() && cache_allowed {
             let (hit, flight) = self
@@ -435,6 +437,9 @@ impl Proxy {
             &cache_key,
             &request_headers,
             proxy_permit,
+            scheme,
+            listener,
+            internal_count,
         )
         .await
     }
@@ -863,6 +868,9 @@ impl Proxy {
         cache_key: &str,
         request_headers: &HeaderMap,
         proxy_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+        scheme: &'static str,
+        listener: &str,
+        internal_count: u8,
     ) -> Result<Response<Body>, Response<Body>> {
         // Same rule as the request side: hyper only unwraps `chunked`, so
         // anything else would reach the client still transfer-coded.
@@ -874,6 +882,67 @@ impl Proxy {
         }
 
         let (parts, body) = response.into_parts();
+
+        if let Some(location) = parts
+            .headers
+            .get("x-accel-redirect")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+        {
+            if !location.starts_with('/') {
+                return Err(text(StatusCode::BAD_GATEWAY, "bad X-Accel-Redirect"));
+            }
+            if internal_count >= 10 {
+                return Err(text(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal redirect loop",
+                ));
+            }
+            let mut headers = request_headers.clone();
+            headers.remove(CONTENT_LENGTH);
+            headers.remove(TRANSFER_ENCODING);
+            headers.remove(CONNECTION);
+            headers.remove(UPGRADE);
+            let mut request = Request::builder()
+                .method(Method::GET)
+                .uri(location)
+                .body(empty())
+                .map_err(|_| text(StatusCode::BAD_GATEWAY, "bad X-Accel-Redirect"))?;
+            *request.headers_mut() = headers;
+            request.extensions_mut().insert(InternalRequest {
+                name: None,
+                count: internal_count.saturating_add(1),
+            });
+            request.extensions_mut().insert(AccelRedirect);
+            return Box::pin(self.forward(request, peer, scheme, listener)).await;
+        }
+
+        if let Some(path) = parts
+            .headers
+            .get("x-sendfile")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+        {
+            let Some(root) = &entry.x_sendfile_root else {
+                return Err(text(
+                    StatusCode::FORBIDDEN,
+                    "X-Sendfile is not configured for this route",
+                ));
+            };
+            let mut response = self
+                .sendfile_response(&path, root, entry, request_headers, peer)
+                .await;
+            response.extensions_mut().insert(Labels {
+                route: entry.label.clone(),
+                upstream: Some(pool.name.clone()),
+                access_log: entry.access_log,
+                access_log_sample: entry.access_log_sample,
+            });
+            self.apply_error_page(&mut response, entry, vars, peer)
+                .await;
+            self.apply_route(&mut response, entry, vars, request_id);
+            return Ok(response);
+        }
 
         let upstream_len = parts
             .headers

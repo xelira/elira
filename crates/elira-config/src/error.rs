@@ -517,6 +517,9 @@ pub enum Error {
     #[error("route {index}: secure_link needs a non-empty secret and md5/expires together")]
     BadSecureLink { index: usize },
 
+    #[error("route {index}: x_sendfile_root is empty")]
+    BadSendfileRoot { index: usize },
+
     #[error("tls.min_version tls10/tls11 needs tls.backend = \"openssl\"")]
     LegacyTlsNeedsOpenssl,
 }

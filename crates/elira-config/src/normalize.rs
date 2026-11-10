@@ -161,6 +161,10 @@ fn inherit(parent: &Route, child: &mut Route) -> Result<(), Error> {
         .secure_link
         .clone()
         .or_else(|| parent.secure_link.clone());
+    child.x_sendfile_root = child
+        .x_sendfile_root
+        .clone()
+        .or_else(|| parent.x_sendfile_root.clone());
     inherit_vec(&mut child.fastcgi_param, &parent.fastcgi_param);
     inherit_vec(&mut child.cgi_param, &parent.cgi_param);
     inherit_vec(&mut child.scgi_param, &parent.scgi_param);
@@ -300,6 +304,7 @@ mod tests {
             auth_request: None,
             satisfy: None,
             secure_link: None,
+            x_sendfile_root: None,
         }
     }
 

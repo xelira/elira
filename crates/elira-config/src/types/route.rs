@@ -388,6 +388,10 @@ pub struct Route {
     /// MD5-signed link check.
     #[serde(default)]
     pub secure_link: Option<SecureLink>,
+
+    /// Only files under this root may be returned through `X-Sendfile`.
+    #[serde(default)]
+    pub x_sendfile_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
