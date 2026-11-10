@@ -233,59 +233,9 @@ impl Proxy {
             return Err(response);
         }
 
-        let body_limit = entry.body_limit.unwrap_or(self.inner.max_body_bytes);
-        let body_limit_hit = Arc::new(AtomicBool::new(false));
-        if body_limit > 0 {
-            let hit = body_limit_hit.clone();
-            req = req.map(|body| capped_request_body(body, body_limit, hit));
-        }
+        let (buffered, body_limit_hit) = self.prepare_body(&mut req, entry, &vars, peer).await?;
 
-        let mut buffered = None;
-        if (self.inner.request_buffer_bytes > 0 || self.inner.request_spool_bytes > 0)
-            && requested_upgrade.is_none()
-        {
-            let original = std::mem::replace(req.body_mut(), empty());
-            match buffer_request(
-                req.headers(),
-                original,
-                self.inner.request_buffer_bytes,
-                self.inner.request_spool_bytes,
-                &self.inner.spool_budget,
-            )
-            .await
-            {
-                Ok(RequestBuffer::Stream(body)) => *req.body_mut() = body,
-                Ok(RequestBuffer::Buffered(body)) => {
-                    *req.body_mut() = body.body();
-                    buffered = Some(body);
-                }
-                Err(()) => {
-                    if body_limit_hit.load(Ordering::Relaxed) {
-                        return Err(self.body_too_large(entry, &vars, peer).await);
-                    }
-                    return Err(text(StatusCode::BAD_REQUEST, "request body error"));
-                }
-            }
-        }
-
-        let proxy_permit = match &entry.proxy_permits {
-            Some(permits) => match permits.clone().try_acquire_owned() {
-                Ok(permit) => Some(permit),
-                Err(_) => {
-                    let mut response = text(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "too many concurrent requests",
-                    );
-                    response
-                        .headers_mut()
-                        .insert(http::header::RETRY_AFTER, HeaderValue::from_static("1"));
-                    self.apply_error_page(&mut response, entry, &vars, peer)
-                        .await;
-                    return Err(response);
-                }
-            },
-            None => None,
-        };
+        let proxy_permit = self.acquire_proxy_permit(entry, &vars, peer).await?;
 
         let pool = match &entry.target {
             Target::Proxy(pool) => pool,
@@ -589,6 +539,79 @@ impl Proxy {
         }
 
         template
+    }
+
+    async fn prepare_body(
+        &self,
+        req: &mut Request<Body>,
+        entry: &RouteEntry,
+        vars: &RequestVars,
+        peer: SocketAddr,
+    ) -> Result<(Option<BufferedBody>, Arc<AtomicBool>), Response<Body>> {
+        let body_limit = entry.body_limit.unwrap_or(self.inner.max_body_bytes);
+        let body_limit_hit = Arc::new(AtomicBool::new(false));
+        if body_limit > 0 {
+            let hit = body_limit_hit.clone();
+            let original = std::mem::replace(req.body_mut(), empty());
+            *req.body_mut() = capped_request_body(original, body_limit, hit);
+        }
+
+        let mut buffered = None;
+        if (self.inner.request_buffer_bytes > 0 || self.inner.request_spool_bytes > 0)
+            && wants_upgrade(req.headers()).is_none()
+        {
+            let original = std::mem::replace(req.body_mut(), empty());
+            match buffer_request(
+                req.headers(),
+                original,
+                self.inner.request_buffer_bytes,
+                self.inner.request_spool_bytes,
+                &self.inner.spool_budget,
+            )
+            .await
+            {
+                Ok(RequestBuffer::Stream(body)) => *req.body_mut() = body,
+                Ok(RequestBuffer::Buffered(body)) => {
+                    *req.body_mut() = body.body();
+                    buffered = Some(body);
+                }
+                Err(()) => {
+                    if body_limit_hit.load(Ordering::Relaxed) {
+                        return Err(self.body_too_large(entry, vars, peer).await);
+                    }
+                    return Err(text(StatusCode::BAD_REQUEST, "request body error"));
+                }
+            }
+        }
+
+        Ok((buffered, body_limit_hit))
+    }
+
+    async fn acquire_proxy_permit(
+        &self,
+        entry: &RouteEntry,
+        vars: &RequestVars,
+        peer: SocketAddr,
+    ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, Response<Body>> {
+        let permit = match &entry.proxy_permits {
+            Some(permits) => match permits.clone().try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    let mut response = text(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "too many concurrent requests",
+                    );
+                    response
+                        .headers_mut()
+                        .insert(http::header::RETRY_AFTER, HeaderValue::from_static("1"));
+                    self.apply_error_page(&mut response, entry, vars, peer)
+                        .await;
+                    return Err(response);
+                }
+            },
+            None => None,
+        };
+        Ok(permit)
     }
 
     /// Look up a cached representation, including the stale path. Returns the
