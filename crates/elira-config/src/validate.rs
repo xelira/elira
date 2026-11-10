@@ -1043,6 +1043,16 @@ impl Config {
             }
         }
 
+        if let Some(path) = &route.auth_request {
+            if !path.starts_with('/')
+                || path.len() < 2
+                || path.chars().any(char::is_control)
+                || path.chars().any(char::is_whitespace)
+            {
+                return Err(Error::BadAuthRequest { index });
+            }
+        }
+
         for value in route.ip_allow.iter().chain(route.ip_deny.iter()) {
             value.parse::<ipnet::IpNet>().map_err(|_| Error::BadAcl {
                 index,

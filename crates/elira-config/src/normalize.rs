@@ -152,6 +152,10 @@ fn inherit(parent: &Route, child: &mut Route) -> Result<(), Error> {
         &mut child.request_remove_headers,
         &parent.request_remove_headers,
     );
+    child.auth_request = child
+        .auth_request
+        .clone()
+        .or_else(|| parent.auth_request.clone());
     inherit_vec(&mut child.fastcgi_param, &parent.fastcgi_param);
     inherit_vec(&mut child.cgi_param, &parent.cgi_param);
     inherit_vec(&mut child.scgi_param, &parent.scgi_param);
@@ -288,6 +292,7 @@ mod tests {
             remove_headers: Vec::new(),
             request_headers: Vec::new(),
             request_remove_headers: Vec::new(),
+            auth_request: None,
         }
     }
 

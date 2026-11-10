@@ -148,7 +148,7 @@ Living list for the self-improvement loop. One item per session.
 - [x] AJP upstreams.
 - [x] FastCGI multiplexing.
 
-- [ ] `auth_request` subrequests.
+- [x] `auth_request` subrequests.
 - [ ] `satisfy any/all` for auth plus ACL combinations.
 - [ ] `secure_link`.
 - [ ] `X-Accel-Redirect` and `X-Sendfile` from upstream responses.

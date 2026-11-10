@@ -851,6 +851,7 @@ buckets = [{ percent = 10, value = "a" }, { percent = 90, value = "b" }]
 | `try_files` | массив строк | `[]` | кандидаты, если путь не найден; `$uri` подставляется |
 | `autoindex` | bool | `false` | генерировать листинг каталога |
 | `auth_file` | путь | нет | htpasswd с bcrypt-хешами |
+| `auth_request` | путь | нет | внутренний URI, 2xx которого разрешает запрос |
 | `client_auth` | bool | `false` | требовать проверенный клиентский сертификат |
 | `client_cn` | строка | нет | требуемый CN субъекта сертификата |
 | `client_issuer_cn` | строка | нет | требуемый CN издателя сертификата |
@@ -995,6 +996,11 @@ buckets = [{ percent = 10, value = "a" }, { percent = 90, value = "b" }]
   порция тела сразу, остальное — по GET_BODY_CHUNK. Ответ собирается из
   Send Headers / Send Body Chunk / End Response. `ajp_secret` передаётся
   атрибутом `secret`, если он задан. Соединение не переиспользуется.
+- `auth_request = "/auth"` делает внутренний GET-подзапрос с заголовками
+  исходного запроса. `2xx` разрешает запрос, `401`/`403` передаются клиенту
+  вместе с `WWW-Authenticate`, остальные статусы превращаются в `500`.
+  Целевой маршрут обычно помечают `internal = true`; подзапросы не кэшируются
+  и не пишутся в access log отдельно.
 - `alias` работает как `root`, но сначала отрезает литеральный `path` маршрута:
   `path = "/static"` и `alias = "/srv/assets"` отдают
   `/static/app.js` из `/srv/assets/app.js`. `alias` требует `path` и не

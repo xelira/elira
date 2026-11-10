@@ -5,7 +5,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use http::header::{AUTHORIZATION, CONTENT_LENGTH, LOCATION, WWW_AUTHENTICATE};
-use http::{HeaderValue, Request, Response, StatusCode};
+use http::{HeaderValue, Method, Request, Response, StatusCode};
 
 use elira_tls::ClientIdentity;
 
@@ -229,5 +229,65 @@ impl Proxy {
                 Ok(response)
             }
         }
+    }
+
+    /// Run the configured auth_request subrequest. A 2xx allows the request;
+    /// 401/403 are passed through; anything else becomes a 500.
+    pub(crate) async fn authorize(
+        &self,
+        req: &Request<Body>,
+        entry: &RouteEntry,
+        vars: &RequestVars,
+        peer: SocketAddr,
+        scheme: &'static str,
+        listener: &str,
+    ) -> Result<(), Response<Body>> {
+        let Some(path) = &entry.auth_request else {
+            return Ok(());
+        };
+
+        let mut headers = req.headers().clone();
+        headers.remove(CONTENT_LENGTH);
+        headers.remove(http::header::TRANSFER_ENCODING);
+        headers.remove(http::header::CONNECTION);
+        headers.remove(http::header::UPGRADE);
+        let mut subrequest = Request::builder()
+            .method(Method::GET)
+            .uri(path.as_str())
+            .body(empty())
+            .map_err(|_| text(StatusCode::INTERNAL_SERVER_ERROR, "bad auth_request URI"))?;
+        *subrequest.headers_mut() = headers;
+        subrequest.extensions_mut().insert(InternalRequest {
+            name: None,
+            count: 1,
+        });
+        subrequest.extensions_mut().insert(AuthSubrequest);
+
+        let response = match Box::pin(self.forward(subrequest, peer, scheme, listener)).await {
+            Ok(response) => response,
+            Err(response) => response,
+        };
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+
+        let status = if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+            status
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        let mut denied = text(status, "authorization failed");
+        if let Some(value) = response
+            .headers()
+            .get(http::header::WWW_AUTHENTICATE)
+            .cloned()
+        {
+            denied
+                .headers_mut()
+                .insert(http::header::WWW_AUTHENTICATE, value);
+        }
+        self.apply_error_page(&mut denied, entry, vars, peer).await;
+        Err(denied)
     }
 }

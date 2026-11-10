@@ -511,6 +511,9 @@ pub enum Error {
     #[error("route {index}: fastcgi_multiplex needs fastcgi_pass")]
     MultiplexWithoutFastCgi { index: usize },
 
+    #[error("route {index}: auth_request must be an internal path starting with /")]
+    BadAuthRequest { index: usize },
+
     #[error("tls.min_version tls10/tls11 needs tls.backend = \"openssl\"")]
     LegacyTlsNeedsOpenssl,
 }

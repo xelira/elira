@@ -208,6 +208,7 @@ pub(crate) fn build_route(
             .iter()
             .filter_map(|name| HeaderName::from_bytes(name.as_bytes()).ok())
             .collect(),
+        auth_request: route.auth_request.clone(),
         if_conditions,
         auth,
         acl,

@@ -249,6 +249,8 @@ impl Proxy {
         if let Some(response) = self.check_access(&req, entry, &vars, peer).await {
             return Err(response);
         }
+        self.authorize(&req, entry, &vars, peer, scheme, listener)
+            .await?;
 
         let (buffered, body_limit_hit) = self.prepare_body(&mut req, entry, &vars, peer).await?;
 
@@ -295,6 +297,7 @@ impl Proxy {
             path.clone()
         };
 
+        let auth_subrequest = req.extensions().get::<AuthSubrequest>().is_some();
         let (parts, body) = req.into_parts();
         // Kept for Vary matching: the response parts shadow this name later.
         let request_headers = parts.headers.clone();
@@ -326,7 +329,7 @@ impl Proxy {
 
         let mut body = Some(body);
 
-        let cache_allowed = entry.cache != Some(false);
+        let cache_allowed = entry.cache != Some(false) && !auth_subrequest;
         let mut _cache_flight: Option<CacheFlightGuard> = None;
         if is_get && requested_upgrade.is_none() && cache_allowed {
             let (hit, flight) = self

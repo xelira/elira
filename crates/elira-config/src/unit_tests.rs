@@ -1738,6 +1738,33 @@ return = { status = 200, body = "ok" }
 }
 
 #[test]
+fn auth_request_paths_are_validated() {
+    let base = r#"
+listen = "127.0.0.1:8080"
+
+[[routes]]
+host = "*"
+path = "/private"
+root = "/srv/private"
+auth_request = "/auth"
+"#;
+    let cfg = Config::parse(base).expect("valid");
+    assert_eq!(cfg.routes[0].auth_request.as_deref(), Some("/auth"));
+
+    let relative = base.replace("auth_request = \"/auth\"", "auth_request = \"auth\"");
+    assert!(matches!(
+        Config::parse(&relative),
+        Err(Error::BadAuthRequest { .. })
+    ));
+
+    let spaced = base.replace("auth_request = \"/auth\"", "auth_request = \"/a b\"");
+    assert!(matches!(
+        Config::parse(&spaced),
+        Err(Error::BadAuthRequest { .. })
+    ));
+}
+
+#[test]
 fn named_locations_are_validated() {
     let base = r#"
 listen = "127.0.0.1:8080"

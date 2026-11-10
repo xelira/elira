@@ -969,6 +969,108 @@ root = "{}"
     assert_eq!(common_name, "other.local");
 }
 
+#[tokio::test]
+async fn auth_request_allows_2xx_and_maps_failures() {
+    let upstream = upstream().await;
+    let allow = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "*"
+path = "/private"
+upstream = "app"
+auth_request = "/auth"
+
+[[routes]]
+host = "*"
+path = "/auth"
+internal = true
+return = {{ status = 200, body = "ok" }}
+"#
+    );
+    let (addr, _stop, _metrics) = start(&allow).await;
+    let allowed = roundtrip(
+        addr,
+        "GET /private HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&allowed), "HTTP/1.1 200 OK", "{allowed}");
+
+    let hidden = roundtrip(
+        addr,
+        "GET /auth HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&hidden), "HTTP/1.1 404 Not Found", "{hidden}");
+
+    let deny = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "*"
+path = "/private"
+upstream = "app"
+auth_request = "/auth"
+
+[[routes]]
+host = "*"
+path = "/auth"
+internal = true
+return = {{ status = 403, body = "no" }}
+"#
+    );
+    let (deny_addr, _stop, _metrics) = start(&deny).await;
+    let denied = roundtrip(
+        deny_addr,
+        "GET /private HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&denied), "HTTP/1.1 403 Forbidden", "{denied}");
+
+    let broken = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "*"
+path = "/private"
+upstream = "app"
+auth_request = "/auth"
+
+[[routes]]
+host = "*"
+path = "/auth"
+internal = true
+return = {{ status = 503, body = "broken" }}
+"#
+    );
+    let (broken_addr, _stop, _metrics) = start(&broken).await;
+    let failed = roundtrip(
+        broken_addr,
+        "GET /private HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(
+        status(&failed),
+        "HTTP/1.1 500 Internal Server Error",
+        "{failed}"
+    );
+}
+
 fn temp_root(label: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static NEXT: AtomicUsize = AtomicUsize::new(0);

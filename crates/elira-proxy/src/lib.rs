@@ -96,6 +96,10 @@ pub(crate) struct InternalRequest {
     pub(crate) name: Option<String>,
     pub(crate) count: u8,
 }
+
+/// Marks the internal subrequest made by `auth_request`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AuthSubrequest;
 pub type Body = BoxBody<Bytes, BoxError>;
 
 #[derive(Clone)]
@@ -220,6 +224,7 @@ struct RouteEntry {
     remove_headers: Vec<HeaderName>,
     request_headers: Vec<(HeaderName, String)>,
     request_remove_headers: Vec<HeaderName>,
+    auth_request: Option<String>,
     if_conditions: Vec<CompiledIf>,
     auth: Option<Arc<BasicAuth>>,
     acl: Option<Arc<IpAcl>>,

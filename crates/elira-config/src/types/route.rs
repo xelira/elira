@@ -354,6 +354,10 @@ pub struct Route {
     /// Request headers to drop before forwarding.
     #[serde(default)]
     pub request_remove_headers: Vec<String>,
+
+    /// Internal URI whose 2xx response authorises this route.
+    #[serde(default)]
+    pub auth_request: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
