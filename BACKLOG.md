@@ -128,7 +128,7 @@ Living list for the self-improvement loop. One item per session.
 - [x] `map` variables.
 - [x] `if`, `geo`, `split_clients`.
 - [x] `location =` and `^~` matching (`match = "exact"`, `no_regex`).
-- [ ] Nested locations.
+- [x] Nested locations.
 - [ ] Named locations and `internal`.
 - [x] `alias` (distinct from `root`).
 - [x] `expires` and `etag off` for static responses.

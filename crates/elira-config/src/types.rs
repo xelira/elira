@@ -645,16 +645,29 @@ pub enum Balance {
 #[serde(deny_unknown_fields)]
 pub struct Route {
     /// Host to match, case-insensitive. `*` catches everything else, and
-    /// `*.example.com` matches any subdomain.
+    /// `*.example.com` matches any subdomain. Nested locations inherit the
+    /// parent host when this is empty.
+    #[serde(default)]
     pub host: String,
 
     /// Restrict the route to named listeners. Empty means every listener.
     #[serde(default)]
     pub listeners: Vec<String>,
 
-    /// Path prefix. The longest matching prefix wins inside a host.
+    /// Path prefix. The longest matching prefix wins inside a host. A nested
+    /// location appends this to its parent path.
     #[serde(default)]
     pub path: Option<String>,
+
+    /// Nested locations, matched after the parent prefix. They inherit the
+    /// parent host, listeners, target and unset options.
+    #[serde(default)]
+    pub locations: Vec<Route>,
+
+    /// Literal prefix that a nested regex location must stay under. Set while
+    /// flattening nested locations; it is not part of the TOML syntax.
+    #[serde(skip)]
+    pub regex_prefix: Option<String>,
 
     /// `prefix` (default) or `exact`, like `location = /path`.
     #[serde(default, rename = "match")]
@@ -862,15 +875,15 @@ pub struct Route {
 }
 
 impl Route {
-    fn default_index() -> Vec<String> {
+    pub(crate) fn default_index() -> Vec<String> {
         vec!["index.html".to_owned()]
     }
 
-    fn default_fastcgi_index() -> String {
+    pub(crate) fn default_fastcgi_index() -> String {
         "index.php".to_owned()
     }
 
-    fn default_access_log() -> bool {
+    pub(crate) fn default_access_log() -> bool {
         true
     }
 }

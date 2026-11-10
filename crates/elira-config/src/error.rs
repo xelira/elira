@@ -483,4 +483,7 @@ pub enum Error {
 
     #[error("route {index}: host wildcard must look like `*.example.com`")]
     BadWildcardHost { index: usize },
+
+    #[error("nested location needs a path or path_regex under a literal parent prefix")]
+    BadNestedLocation,
 }

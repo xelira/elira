@@ -336,7 +336,11 @@ pub(crate) fn build_route(
                 .unwrap_or_default()
         ),
         host: route.host.trim().to_ascii_lowercase(),
-        prefix: route.path.clone().unwrap_or_default(),
+        prefix: route
+            .path
+            .clone()
+            .or_else(|| route.regex_prefix.clone())
+            .unwrap_or_default(),
         exact: route.match_type == elira_config::RouteMatch::Exact,
         no_regex: route.no_regex,
         regex: route

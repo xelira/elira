@@ -9,10 +9,12 @@ use serde::{Deserialize, Serialize};
 
 mod error;
 mod load;
+mod normalize;
 mod types;
 mod validate;
 pub use error::*;
 use load::load_value;
+use normalize::expand_locations;
 pub use types::*;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -152,7 +154,8 @@ impl Config {
 
     pub fn load(path: &Path) -> Result<Self, Error> {
         let value = load_value(path, 0)?;
-        let cfg: Config = value.try_into().map_err(Error::Toml)?;
+        let mut cfg: Config = value.try_into().map_err(Error::Toml)?;
+        expand_locations(&mut cfg)?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -160,7 +163,8 @@ impl Config {
     /// Parse a self-contained config without includes or environment
     /// substitution. `load` is the operator-facing path.
     pub fn parse(text: &str) -> Result<Self, Error> {
-        let cfg: Config = toml::from_str(text).map_err(Error::Toml)?;
+        let mut cfg: Config = toml::from_str(text).map_err(Error::Toml)?;
+        expand_locations(&mut cfg)?;
         cfg.validate()?;
         Ok(cfg)
     }

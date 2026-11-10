@@ -813,6 +813,7 @@ buckets = [{ percent = 10, value = "a" }, { percent = 90, value = "b" }]
 | `redirect` | таблица | нет | `{ to, status }`; вместо upstream и root |
 | `return` | таблица | нет | `{ status, body, content_type }` с переменными |
 | `if` | массив таблиц | `[]` | условие по переменной и `return` |
+| `locations` | массив таблиц | `[]` | вложенные location с путём от родителя |
 | `index` | массив строк | `["index.html"]` | файлы, которые ищутся для каталога |
 | `spa` | bool | `false` | отдавать index для несуществующих путей |
 | `strip_prefix` | bool | `false` | срезать `path` перед отправкой в upstream |
@@ -920,6 +921,27 @@ buckets = [{ percent = 10, value = "a" }, { percent = 90, value = "b" }]
   проверяет переменную до выбора цели маршрута. Нужно ровно одно из `equals`
   или `matches` (regex) и `return`. Условия вычисляются по порядку, первое
   совпадение отвечает и завершает запрос.
+- `[[routes.locations]]` вкладывает location в предыдущий маршрут. Путь
+  ребёнка складывается с путём родителя: `/app` и `/admin` дают
+  `/app/admin`. `host`, `listeners`, цель и незаданные опции наследуются.
+  Родитель без собственной цели работает только как группа и в итоговую
+  таблицу не попадает. Regex-ребёнок сохраняет префикс родителя и матчится
+  только под ним. Вложенность ограничена 16 уровнями.
+
+  ```toml
+  [[routes]]
+  host = "example.com"
+  path = "/app"
+  upstream = "app"
+
+  [[routes.locations]]
+  path = "/admin"
+  upstream = "admin"
+
+  [[routes.locations]]
+  path_regex = "\\.php$"
+  upstream = "php"
+  ```
 - `alias` работает как `root`, но сначала отрезает литеральный `path` маршрута:
   `path = "/static"` и `alias = "/srv/assets"` отдают
   `/static/app.js` из `/srv/assets/app.js`. `alias` требует `path` и не

@@ -287,10 +287,11 @@ impl Router {
                 }
             }
             if let Some(entry) = list.iter().find(|entry| {
-                entry
-                    .regex
-                    .as_ref()
-                    .is_some_and(|regex| regex.is_match(path))
+                path_matches(&entry.prefix, path)
+                    && entry
+                        .regex
+                        .as_ref()
+                        .is_some_and(|regex| regex.is_match(path))
             }) {
                 return Some(entry);
             }

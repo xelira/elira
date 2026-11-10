@@ -1522,6 +1522,60 @@ root = "/srv/www"
 }
 
 #[test]
+fn nested_locations_are_flattened_and_inherit() {
+    let text = r#"
+listen = "127.0.0.1:8080"
+
+[[routes]]
+host = "example.com"
+path = "/app"
+timeout_secs = 7
+return = { status = 200, body = "app" }
+
+[[routes.locations]]
+path = "/admin"
+
+[[routes.locations]]
+path_regex = "\\.php$"
+"#;
+    let cfg = Config::parse(text).expect("valid");
+    assert_eq!(cfg.routes.len(), 3);
+
+    let admin = &cfg.routes[1];
+    assert_eq!(admin.path.as_deref(), Some("/app/admin"));
+    assert_eq!(admin.host, "example.com");
+    assert_eq!(admin.timeout_secs, Some(7));
+    assert_eq!(
+        admin
+            .return_response
+            .as_ref()
+            .map(|ret| ret.body.as_deref()),
+        Some(Some("app"))
+    );
+
+    let php = &cfg.routes[2];
+    assert_eq!(php.path, None);
+    assert_eq!(php.regex_prefix.as_deref(), Some("/app"));
+    assert_eq!(php.path_regex.as_deref(), Some(r"\.php$"));
+}
+
+#[test]
+fn nested_location_without_a_path_is_rejected() {
+    let text = r#"
+listen = "127.0.0.1:8080"
+
+[[routes]]
+host = "example.com"
+path = "/app"
+return = { status = 200, body = "app" }
+
+[[routes.locations]]
+return = { status = 200, body = "child" }
+"#;
+    assert!(matches!(Config::parse(text), Err(Error::BadNestedLocation)));
+}
+
+#[test]
 fn route_match_modes_are_validated() {
     let base = r#"
 listen = "127.0.0.1:8080"

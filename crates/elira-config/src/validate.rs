@@ -669,6 +669,9 @@ impl Config {
                 .clone()
                 .or_else(|| route.path_regex.clone())
                 .unwrap_or_default();
+            if let Some(prefix) = &route.regex_prefix {
+                discriminator = format!("{prefix}|{discriminator}");
+            }
             if route.match_type == RouteMatch::Exact {
                 discriminator.push_str("|exact");
             }

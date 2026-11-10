@@ -1414,6 +1414,55 @@ if = [{{ variable = "$http_x_debug", equals = "1", return = {{ status = 503, bod
 }
 
 #[tokio::test]
+async fn nested_locations_match_under_the_parent_prefix() {
+    let config = r#"
+listen = "127.0.0.1:0"
+
+[[routes]]
+host = "example.com"
+path = "/app"
+return = { status = 200, body = "parent" }
+
+[[routes.locations]]
+path = "/admin"
+return = { status = 200, body = "admin" }
+
+[[routes.locations]]
+path_regex = "\\.php$"
+return = { status = 200, body = "php" }
+"#;
+    let (addr, _stop, _metrics) = start(config).await;
+
+    let parent = roundtrip(
+        addr,
+        "GET /app/other HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(parent.ends_with("parent"), "{parent}");
+
+    let child = roundtrip(
+        addr,
+        "GET /app/admin HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(child.ends_with("admin"), "{child}");
+
+    let regex = roundtrip(
+        addr,
+        "GET /app/index.php HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(regex.ends_with("php"), "{regex}");
+
+    let outside = roundtrip(
+        addr,
+        "GET /other.php HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&outside), "HTTP/1.1 404 Not Found", "{outside}");
+}
+
+#[tokio::test]
 async fn exact_and_no_regex_locations_pick_the_right_route() {
     let config = r#"
 listen = "127.0.0.1:0"
