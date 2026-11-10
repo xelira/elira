@@ -167,8 +167,9 @@ Living list for the self-improvement loop. One item per session.
 - [x] Separate connect/send/read timeouts.
 - [x] `proxy_protocol on` toward upstreams and `proxy_bind`.
 - [x] `proxy_redirect`, `proxy_cookie_domain/path`, `proxy_hide_header`.
-- [ ] Upstream keepalive tuning: `keepalive`, `keepalive_requests`, per-server
-  `max_conns`, `backup`, `down`, `slow_start`, `random`.
+- [x] `random` balancing and `keepalive`/`keepalive_secs`.
+- [ ] `keepalive_requests`, per-server `max_conns`, `backup`, `down`,
+  `slow_start`.
 - [ ] Configurable resolver with runtime DNS and TTL policy.
 
 ### Section 4 — limits and operations

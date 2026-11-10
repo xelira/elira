@@ -192,7 +192,25 @@ impl Pool {
                 };
                 self.pick_rendezvous(key, now)
             }
+            Balance::Random => self.pick_random(start as u64, now),
         }
+    }
+
+    fn pick_random(&self, seed: u64, now: u64) -> usize {
+        let count = self.servers.len();
+        let slot = splitmix64(seed);
+        let base = if self.weighted {
+            self.weighted_index(slot % self.total_weight)
+        } else {
+            (slot % count as u64) as usize
+        };
+        for offset in 0..count {
+            let index = (base + offset) % count;
+            if self.available(index, now) {
+                return index;
+            }
+        }
+        base
     }
 
     fn pick_round_robin(&self, start: usize, now: u64) -> usize {
@@ -307,6 +325,15 @@ impl Pool {
             tracing::warn!(upstream = %self.servers[index], healthy = up, "upstream health changed");
         }
     }
+}
+
+/// Deterministic 64-bit avalanche used to spread `random` picks without a
+/// full RNG dependency.
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
 }
 
 pub(crate) fn rendezvous(key: &str, server: &str) -> u64 {

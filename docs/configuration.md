@@ -693,7 +693,7 @@ advisory-lock `.elira-cache.lock`, а `max_bytes` считается по все
 | `name` | строка | нет, обязательна | имя, на которое ссылаются маршруты |
 | `servers` | массив строк | нет, обязателен и непуст | адреса бэкендов `host:port` или `unix:/path` |
 | `weights` | массив целых > 0 | `[]` (все 1) | относительные веса для `round_robin` и `least_conn` |
-| `balance` | `round_robin` \| `least_conn` \| `hash` | `round_robin` | как выбирать сервер |
+| `balance` | `round_robin` \| `least_conn` \| `hash` \| `random` | `round_robin` | как выбирать сервер |
 | `hash_key` | строка | `"ip"` | ключ для `balance = "hash"`: `ip`, `authorization`, `header:NAME`, `cookie:NAME`, `uri` |
 | `retries` | целое 0..5 | `0` | дополнительные попытки на ошибку соединения |
 | `retry_on` | массив строк | `["error","timeout"]` | условия повтора: `error`, `timeout`, коды 5xx |
@@ -709,6 +709,8 @@ advisory-lock `.elira-cache.lock`, а `max_bytes` считается по все
 | `bind` | IP | нет | локальный адрес для исходящих соединений |
 | `proxy_protocol` | bool | `false` | PROXY protocol v1 перед upstream-соединением |
 | `dns_ttl_secs` | целое > 0 | `30` | предел жизни соединения в пуле; имя резолвится заново при новом соединении |
+| `keepalive` | целое ≥ 0 | без предела | сколько idle-соединений держать на хост; `0` выключает переиспользование |
+| `keepalive_secs` | целое > 0 | `dns_ttl_secs` | сколько живёт простаивающее соединение |
 | `h2_pool` | bool | `false` | собственный HTTP/2-пул Elira; на plain TCP — h2c prior knowledge |
 | `h3_pool` | bool | `false` | собственный HTTP/3-пул; требует `tls = true` |
 | `failures_before_eject` | целое ≥ 0 | `0` | сколько транспортных ошибок подряд до пассивного отключения |
@@ -739,6 +741,10 @@ advisory-lock `.elira-cache.lock`, а `max_bytes` считается по все
   по весам, `least_conn` сравнивает `active / weight`. Веса должны совпадать по
   длине с `servers`, быть больше нуля, а сумма — не больше 10000. С
   `balance = "hash"` веса не сочетаются.
+- `balance = "random"` выбирает сервер псевдослучайно; веса учитываются.
+- `keepalive` ограничивает число простаивающих соединений на хост, а
+  `keepalive_secs` — время их жизни. Ноль в `keepalive` отключает
+  переиспользование; `keepalive_secs` по умолчанию берётся из `dns_ttl_secs`.
 - `balance = "hash"` использует rendezvous hashing: один и тот же `hash_key`
   остаётся на одном сервере, а добавление или удаление сервера перераспределяет
   только ключи, которые были на нём. `hash_key = "uri"` хеширует путь с query;

@@ -129,6 +129,8 @@
 - Клиентские сертификаты, CRL и cipher/curve policy для TLS-upstream'ов в
   `[upstream_tls]`.
 - `bind` и `proxy_protocol` для исходящих соединений к upstream'ам.
+- Балансировка `random` и настройка keepalive-пула (`keepalive`,
+  `keepalive_secs`).
 - `GET /config` на админском листенере: эффективный конфиг в JSON.
 - Тесты FastCGI/CGI на обрезанные заголовки, длину записи, padding и хвост
   после `END_REQUEST`.

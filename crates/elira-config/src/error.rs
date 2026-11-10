@@ -244,6 +244,9 @@ pub enum Error {
     #[error("upstream \"{name}\": dns_ttl_secs must be greater than zero")]
     BadDnsTtl { name: String },
 
+    #[error("upstream \"{name}\": keepalive_secs must be greater than zero")]
+    BadKeepaliveTtl { name: String },
+
     #[error("upstream \"{name}\": weights and balance = \"hash\" cannot be combined")]
     WeightsWithHash { name: String },
 

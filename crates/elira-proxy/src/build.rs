@@ -74,11 +74,15 @@ pub(crate) fn build_pools(cfg: &Config) -> Result<(Pools, Vec<Arc<Pool>>), Error
                     reason: err.to_string(),
                 })?,
             );
-        let client = Client::builder(TokioExecutor::new())
-            // Hyper resolves the name for each new connection, so the
-            // pool lifetime is the upper bound on DNS staleness.
-            .pool_idle_timeout(Some(Duration::from_secs(up.dns_ttl_secs.unwrap_or(30))))
-            .build(connector);
+        let idle = Duration::from_secs(up.keepalive_secs.or(up.dns_ttl_secs).unwrap_or(30));
+        let mut builder = Client::builder(TokioExecutor::new());
+        // Hyper resolves the name for each new connection, so the pool
+        // lifetime is the upper bound on DNS staleness.
+        builder.pool_idle_timeout(Some(idle));
+        if let Some(keepalive) = up.keepalive {
+            builder.pool_max_idle_per_host(keepalive);
+        }
+        let client = builder.build(connector);
 
         pools.insert(
             up.name.clone(),

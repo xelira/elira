@@ -220,15 +220,18 @@ Routing:
 
 Upstreams:
 
-- round robin, least connections and rendezvous hashing by IP, header, cookie,
-  Authorization or URI, with per-server weights for round robin and least
-  connections; active health checks with configurable method, expected status
+- round robin, least connections, rendezvous hashing by IP, header, cookie,
+  Authorization or URI, and random selection, with per-server weights for round
+  robin and least connections; active health checks with configurable method,
+  expected status
   and Host, passive ejection
   after repeated transport failures, retries for idempotent requests,
   including buffered `PUT`/`DELETE` bodies, with a configurable `retry_on`
   policy for errors, timeouts and 5xx statuses
 - separate upstream connect, send-idle and response-header deadlines, with
   per-route overrides
+- upstream keepalive pool sizing and idle lifetime (`keepalive`,
+  `keepalive_secs`)
 - streaming FastCGI over TCP (including DNS names) or unix sockets with an
   idle connection pool, streaming CGI scripts, and native `.so` modules
   (in-process or in a child runner) and sandboxed WebAssembly modules

@@ -110,6 +110,14 @@ impl Balancer {
                 (hash % count as u64) as usize
             }
             Balance::RoundRobin => start % count,
+            Balance::Random => {
+                let mut value = start as u64;
+                value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                value ^= value >> 31;
+                (value % count as u64) as usize
+            }
         }
     }
 

@@ -94,6 +94,14 @@ pub struct Upstream {
     #[serde(default)]
     pub dns_ttl_secs: Option<u64>,
 
+    /// Maximum idle connections kept per host. Zero disables idle reuse.
+    #[serde(default)]
+    pub keepalive: Option<usize>,
+
+    /// Idle lifetime of a pooled connection. Falls back to `dns_ttl_secs`.
+    #[serde(default)]
+    pub keepalive_secs: Option<u64>,
+
     /// Eject a server after this many consecutive transport failures. Zero
     /// disables passive ejection.
     #[serde(default)]
@@ -139,6 +147,7 @@ pub enum Balance {
     RoundRobin,
     LeastConn,
     Hash,
+    Random,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

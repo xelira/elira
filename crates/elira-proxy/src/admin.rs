@@ -61,6 +61,7 @@ impl Proxy {
                         Balance::RoundRobin => "round_robin",
                         Balance::LeastConn => "least_conn",
                         Balance::Hash => "hash",
+                        Balance::Random => "random",
                     },
                     "retries": pool.retries,
                     "http2": pool.h2.as_ref().map(|h2| {

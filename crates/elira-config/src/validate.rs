@@ -659,6 +659,11 @@ impl Config {
                     name: up.name.clone(),
                 });
             }
+            if up.keepalive_secs == Some(0) {
+                return Err(Error::BadKeepaliveTtl {
+                    name: up.name.clone(),
+                });
+            }
             if up.failures_before_eject > 0 && up.eject_secs == 0 {
                 return Err(Error::BadEjectTimeout {
                     name: up.name.clone(),

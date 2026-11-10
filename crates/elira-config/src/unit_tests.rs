@@ -257,7 +257,7 @@ fn parses_balance_and_retries() {
 fn rejects_unknown_balance() {
     let text = MINIMAL.replace(
         "servers = [\"127.0.0.1:3000\"]",
-        "servers = [\"127.0.0.1:3000\"]\nbalance = \"random\"",
+        "servers = [\"127.0.0.1:3000\"]\nbalance = \"shuffle\"",
     );
     assert!(matches!(Config::parse(&text), Err(Error::Toml(_))));
 }
@@ -2104,6 +2104,34 @@ upstream = "app"
     assert!(matches!(
         Config::parse(&unix),
         Err(Error::BadProxyProtocol { .. })
+    ));
+}
+
+#[test]
+fn keepalive_and_random_balance_are_validated() {
+    let base = r#"
+listen = "127.0.0.1:8080"
+
+[[upstreams]]
+name = "app"
+servers = ["127.0.0.1:9000", "127.0.0.1:9001"]
+balance = "random"
+keepalive = 0
+keepalive_secs = 12
+
+[[routes]]
+host = "*"
+upstream = "app"
+"#;
+    let cfg = Config::parse(base).expect("valid config");
+    assert_eq!(cfg.upstreams[0].balance, Balance::Random);
+    assert_eq!(cfg.upstreams[0].keepalive, Some(0));
+    assert_eq!(cfg.upstreams[0].keepalive_secs, Some(12));
+
+    let bad = base.replace("keepalive_secs = 12", "keepalive_secs = 0");
+    assert!(matches!(
+        Config::parse(&bad),
+        Err(Error::BadKeepaliveTtl { .. })
     ));
 }
 
