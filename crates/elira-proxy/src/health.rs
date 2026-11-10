@@ -18,6 +18,7 @@ pub(crate) struct Probe<'a> {
     pub(crate) timeout: Duration,
     pub(crate) tls: bool,
     pub(crate) options: &'a TlsOptions,
+    pub(crate) resolver: &'a elira_upstream::Resolver,
 }
 
 pub(crate) async fn probe_server(server: &ServerAddr, probe: &Probe<'_>) -> bool {
@@ -55,7 +56,12 @@ pub(crate) async fn probe_server(server: &ServerAddr, probe: &Probe<'_>) -> bool
 
     let stream = match tokio::time::timeout(
         probe.timeout,
-        elira_upstream::tcp_connect(host, port, probe.options.local_address),
+        elira_upstream::tcp_connect(
+            host,
+            port,
+            probe.options.local_address,
+            Some(probe.resolver),
+        ),
     )
     .await
     {

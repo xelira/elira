@@ -133,6 +133,8 @@
   `keepalive_secs`).
 - Опции сервера в `servers`: `backup`, `down`, `max_conns` и
   `slow_start_secs`.
+- Общий DNS-резолвер с TTL, negative TTL и статическими записями
+  `[[resolver.hosts]]`.
 - `GET /config` на админском листенере: эффективный конфиг в JSON.
 - Тесты FastCGI/CGI на обрезанные заголовки, длину записи, padding и хвост
   после `END_REQUEST`.

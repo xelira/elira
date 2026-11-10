@@ -4401,6 +4401,38 @@ upstream = "app"
     assert!(response.ends_with("backup"), "{response}");
 }
 
+#[tokio::test]
+async fn resolver_hosts_override_dns() {
+    let upstream = fixed_upstream("resolved").await;
+    let port = upstream.port();
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[resolver.hosts]]
+name = "backend.test"
+addresses = ["127.0.0.1"]
+
+[[upstreams]]
+name = "app"
+servers = ["backend.test:{port}"]
+
+[[routes]]
+host = "*"
+upstream = "app"
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let response = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&response), "HTTP/1.1 200 OK", "{response}");
+    assert!(response.ends_with("resolved"), "{response}");
+}
+
 /// An upstream that varies its answer by Accept-Language and says so.
 async fn vary_upstream() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0")

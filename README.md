@@ -233,6 +233,8 @@ Upstreams:
   per-route overrides
 - upstream keepalive pool sizing and idle lifetime (`keepalive`,
   `keepalive_secs`)
+- a shared DNS cache with positive/negative TTLs and static host overrides for
+  every upstream transport
 - streaming FastCGI over TCP (including DNS names) or unix sockets with an
   idle connection pool, streaming CGI scripts, and native `.so` modules
   (in-process or in a child runner) and sandboxed WebAssembly modules

@@ -10,9 +10,33 @@ use crate::*;
 impl Config {
     pub(crate) fn validate(&self) -> Result<(), Error> {
         let listener_names = self.validate_server()?;
+        self.validate_resolver()?;
         self.validate_tls()?;
         let upstream_names = self.validate_upstreams()?;
         self.validate_routes(&listener_names, &upstream_names)?;
+        Ok(())
+    }
+
+    fn validate_resolver(&self) -> Result<(), Error> {
+        let mut names = HashSet::new();
+        for host in &self.resolver.hosts {
+            let name = host.name.trim();
+            if name.is_empty() || name.chars().any(char::is_whitespace) {
+                return Err(Error::BadResolverHost {
+                    name: host.name.clone(),
+                });
+            }
+            if host.addresses.is_empty() {
+                return Err(Error::EmptyResolverHost {
+                    name: host.name.clone(),
+                });
+            }
+            if !names.insert(name.to_ascii_lowercase()) {
+                return Err(Error::DuplicateResolverHost {
+                    name: host.name.clone(),
+                });
+            }
+        }
         Ok(())
     }
 

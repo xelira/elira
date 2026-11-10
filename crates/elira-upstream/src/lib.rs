@@ -1,4 +1,8 @@
-//! Upstream TLS connector.
+//! Upstream TLS connector and DNS resolver.
+
+mod resolver;
+
+pub use resolver::{Resolver, ResolverOptions};
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -50,12 +54,15 @@ pub struct TlsOptions {
 /// HTTP/2 is offered only when asked for: an upstream that negotiates `h2`
 /// while the caller expects HTTP/1.1 breaks in a way that is hard to read at
 /// the proxy layer.
-pub fn https_connector(options: &TlsOptions) -> anyhow::Result<HttpsConnector<HttpConnector>> {
+pub fn https_connector(
+    options: &TlsOptions,
+    resolver: Resolver,
+) -> anyhow::Result<HttpsConnector<HttpConnector<Resolver>>> {
     let config = client_config(options)?;
 
     // Build the low-level connector explicitly so the handshake can be
     // bounded without shortening the time allowed for the response.
-    let mut http = HttpConnector::new();
+    let mut http = HttpConnector::new_with_resolver(resolver);
     http.enforce_http(false);
     if let Some(timeout) = options.connect_timeout {
         http.set_connect_timeout(Some(timeout));
@@ -238,13 +245,32 @@ pub async fn tcp_connect(
     host: &str,
     port: u16,
     bind: Option<std::net::IpAddr>,
+    resolver: Option<&Resolver>,
 ) -> std::io::Result<tokio::net::TcpStream> {
-    let Some(bind) = bind else {
+    if bind.is_none() && resolver.is_none() {
         return tokio::net::TcpStream::connect((host, port)).await;
+    }
+
+    let addrs = match resolver {
+        Some(resolver) => resolver.lookup(host, port).await?,
+        None => tokio::net::lookup_host((host, port)).await?.collect(),
+    };
+
+    let Some(bind) = bind else {
+        let mut last = None;
+        for addr in addrs {
+            match tokio::net::TcpStream::connect(addr).await {
+                Ok(stream) => return Ok(stream),
+                Err(err) => last = Some(err),
+            }
+        }
+        return Err(last.unwrap_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "no usable address")
+        }));
     };
 
     let mut last = None;
-    for addr in tokio::net::lookup_host((host, port)).await? {
+    for addr in addrs {
         let socket = if addr.is_ipv4() {
             tokio::net::TcpSocket::new_v4()?
         } else {
@@ -376,7 +402,7 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio_rustls::TlsAcceptor;
 
-    use super::{client_config, https_connector, TlsOptions};
+    use super::{client_config, https_connector, Resolver, ResolverOptions, TlsOptions};
 
     struct TestServer {
         addr: SocketAddr,
@@ -468,7 +494,7 @@ mod tests {
         options: &TlsOptions,
         uri: Uri,
     ) -> Result<StatusCode, hyper_util::client::legacy::Error> {
-        let connector = https_connector(options).expect("build connector");
+        let connector = https_connector(options, Resolver::default()).expect("build connector");
         let client: Client<_, Empty<Bytes>> =
             Client::builder(TokioExecutor::new()).build(connector);
         client.get(uri).await.map(|response| response.status())
@@ -534,10 +560,13 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
 
-        let error = https_connector(&TlsOptions {
-            ca: Some(path.clone()),
-            ..TlsOptions::default()
-        })
+        let error = https_connector(
+            &TlsOptions {
+                ca: Some(path.clone()),
+                ..TlsOptions::default()
+            },
+            Resolver::default(),
+        )
         .expect_err("missing CA file must fail");
 
         let message = format!("{error:#}");
@@ -582,6 +611,29 @@ mod tests {
         assert!(
             format!("{error:#}").contains("X9999"),
             "error should mention the curve: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn static_resolver_hosts_win_over_system_dns() {
+        let mut hosts = std::collections::HashMap::new();
+        hosts.insert(
+            "backend.test".to_owned(),
+            vec![std::net::IpAddr::from([127, 0, 0, 1])],
+        );
+        let resolver = Resolver::new(ResolverOptions {
+            ttl: std::time::Duration::from_secs(30),
+            negative_ttl: std::time::Duration::from_secs(5),
+            hosts,
+        });
+
+        let addrs = resolver
+            .lookup("BACKEND.test.", 8080)
+            .await
+            .expect("static host");
+        assert_eq!(
+            addrs,
+            vec![std::net::SocketAddr::from(([127, 0, 0, 1], 8080))]
         );
     }
 

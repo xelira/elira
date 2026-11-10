@@ -411,6 +411,7 @@ impl Proxy {
                     server,
                     connect_timeout,
                     pool.tls.local_address,
+                    &pool.resolver,
                     pool.proxy_protocol,
                     peer,
                     route_timeout,

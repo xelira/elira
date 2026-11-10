@@ -953,6 +953,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-rustls",
+ "tower-service",
 ]
 
 [[package]]

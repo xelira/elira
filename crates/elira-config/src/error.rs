@@ -123,6 +123,15 @@ pub enum Error {
     #[error("limits.upstream_connect_timeout_secs must be greater than zero")]
     UpstreamConnectTimeoutZero,
 
+    #[error("resolver: host name must not be empty or contain whitespace")]
+    BadResolverHost { name: String },
+
+    #[error("resolver: host \"{name}\" has no addresses")]
+    EmptyResolverHost { name: String },
+
+    #[error("resolver: host \"{name}\" is defined twice")]
+    DuplicateResolverHost { name: String },
+
     #[error("workers must be between 1 and 64")]
     BadWorkers,
 

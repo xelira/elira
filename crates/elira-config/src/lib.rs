@@ -100,6 +100,8 @@ pub struct Config {
     #[serde(default)]
     pub cache: Cache,
     #[serde(default)]
+    pub resolver: Resolver,
+    #[serde(default)]
     pub upstream_tls: UpstreamTls,
     #[serde(default)]
     pub acme: Option<Acme>,

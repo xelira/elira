@@ -1,8 +1,53 @@
 //! Cache and access-log settings.
 
+use std::net::IpAddr;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Resolver {
+    /// How long a successful lookup is reused.
+    #[serde(default = "Resolver::default_ttl_secs")]
+    pub ttl_secs: u64,
+
+    /// How long a failed or empty lookup is reused. Zero disables negative
+    /// caching.
+    #[serde(default = "Resolver::default_negative_ttl_secs")]
+    pub negative_ttl_secs: u64,
+
+    /// Static names that bypass the system resolver.
+    #[serde(default)]
+    pub hosts: Vec<ResolverHost>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolverHost {
+    pub name: String,
+    pub addresses: Vec<IpAddr>,
+}
+
+impl Default for Resolver {
+    fn default() -> Self {
+        Self {
+            ttl_secs: Self::default_ttl_secs(),
+            negative_ttl_secs: Self::default_negative_ttl_secs(),
+            hosts: Vec::new(),
+        }
+    }
+}
+
+impl Resolver {
+    fn default_ttl_secs() -> u64 {
+        30
+    }
+
+    fn default_negative_ttl_secs() -> u64 {
+        5
+    }
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

@@ -143,6 +143,7 @@ struct Inner {
     limiter: Option<Arc<RateLimiter>>,
     trusted_proxies: Vec<ipnet::IpNet>,
     timeout: Duration,
+    resolver: elira_upstream::Resolver,
     connect_timeout: Duration,
     send_timeout: Option<Duration>,
     body_timeout: Option<Duration>,
@@ -422,7 +423,8 @@ fn sort_routes(list: &mut [RouteEntry]) {
 
 impl Proxy {
     pub fn new(cfg: &Config) -> Result<Self, Error> {
-        let (pools, all_pools) = build_pools(cfg)?;
+        let resolver = build_resolver(cfg);
+        let (pools, all_pools) = build_pools(cfg, resolver.clone())?;
 
         let mut entries: Vec<(RouteEntry, Vec<String>)> = Vec::new();
         for route in &cfg.routes {
@@ -494,6 +496,7 @@ impl Proxy {
                 limiter,
                 trusted_proxies,
                 timeout: Duration::from_secs(cfg.limits.upstream_timeout_secs),
+                resolver: resolver.clone(),
                 connect_timeout: Duration::from_secs(cfg.limits.upstream_connect_timeout_secs),
                 send_timeout: match cfg.limits.upstream_send_timeout_secs {
                     0 => None,
@@ -655,6 +658,7 @@ impl Proxy {
                 timeout,
                 tls: pool.scheme == "https",
                 options: &pool.tls,
+                resolver: &self.inner.resolver,
             };
             for (index, server) in pool.servers.iter().enumerate() {
                 let up = probe_server(server, &probe).await;

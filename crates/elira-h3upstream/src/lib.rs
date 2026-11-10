@@ -90,6 +90,8 @@ pub struct PoolConfig {
     pub tls: TlsOptions,
     /// Local IP address to bind the QUIC endpoint to.
     pub bind: Option<IpAddr>,
+    /// Shared DNS resolver with caching and static overrides.
+    pub resolver: elira_upstream::Resolver,
 }
 
 impl Default for PoolConfig {
@@ -99,6 +101,7 @@ impl Default for PoolConfig {
             connect_timeout: Duration::from_secs(10),
             tls: TlsOptions::default(),
             bind: None,
+            resolver: elira_upstream::Resolver::default(),
         }
     }
 }
@@ -458,14 +461,16 @@ impl Inner {
     }
 
     async fn resolve(&self, origin: &Origin) -> Result<Vec<SocketAddr>, Error> {
-        let resolved = tokio::net::lookup_host((origin.host.as_str(), origin.port))
+        let addresses = self
+            .config
+            .resolver
+            .lookup(origin.host.as_str(), origin.port)
             .await
             .map_err(|source| Error::Resolve {
                 origin: origin.to_string(),
                 source,
             })?;
 
-        let addresses: Vec<SocketAddr> = resolved.collect();
         if addresses.is_empty() {
             return Err(Error::NoAddresses {
                 origin: origin.to_string(),

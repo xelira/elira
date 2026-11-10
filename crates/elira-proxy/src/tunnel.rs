@@ -129,6 +129,7 @@ impl Proxy {
         server: ServerAddr,
         connect_timeout: Duration,
         bind: Option<std::net::IpAddr>,
+        resolver: &elira_upstream::Resolver,
         proxy_protocol: bool,
         peer: SocketAddr,
         timeout: Duration,
@@ -142,7 +143,7 @@ impl Proxy {
             Err(_) => return Err(text(StatusCode::SERVICE_UNAVAILABLE, "too many tunnels")),
         };
 
-        let mut stream = match connect_server(&server, connect_timeout, bind).await {
+        let mut stream = match connect_server(&server, connect_timeout, bind, resolver).await {
             Some(stream) => stream,
             None => return Err(text(StatusCode::BAD_GATEWAY, "bad gateway")),
         };
@@ -363,6 +364,7 @@ async fn connect_server(
     server: &ServerAddr,
     timeout: Duration,
     bind: Option<std::net::IpAddr>,
+    resolver: &elira_upstream::Resolver,
 ) -> Option<EitherStream> {
     match server {
         ServerAddr::Tcp(authority) => {
@@ -371,7 +373,11 @@ async fn connect_server(
                 .trim_start_matches('[')
                 .trim_end_matches(']');
             let port = authority.port_u16().unwrap_or(80);
-            match tokio::time::timeout(timeout, elira_upstream::tcp_connect(host, port, bind)).await
+            match tokio::time::timeout(
+                timeout,
+                elira_upstream::tcp_connect(host, port, bind, Some(resolver)),
+            )
+            .await
             {
                 Ok(Ok(stream)) => Some(EitherStream::Tcp(stream)),
                 _ => None,

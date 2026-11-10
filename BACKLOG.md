@@ -170,7 +170,7 @@ Living list for the self-improvement loop. One item per session.
 - [x] `random` balancing and `keepalive`/`keepalive_secs`.
 - [x] Per-server `max_conns`, `backup`, `down`, `slow_start`.
 - [ ] `keepalive_requests`.
-- [ ] Configurable resolver with runtime DNS and TTL policy.
+- [x] Configurable resolver with runtime DNS and TTL policy.
 
 ### Section 4 — limits and operations
 

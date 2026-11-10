@@ -121,8 +121,8 @@ fn only_plain_chunked_is_accepted() {
 #[test]
 fn least_conn_prefers_the_idle_server() {
     let tls = TlsOptions::default();
-    let client =
-        Client::builder(TokioExecutor::new()).build(https_connector(&tls).expect("connector"));
+    let client = Client::builder(TokioExecutor::new())
+        .build(https_connector(&tls, elira_upstream::Resolver::default()).expect("connector"));
     let pool = Pool {
         name: "test".to_owned(),
         servers: vec![
@@ -162,6 +162,7 @@ fn least_conn_prefers_the_idle_server() {
         tls_config: std::sync::Arc::new(
             elira_upstream::client_config(&TlsOptions::default()).expect("tls config"),
         ),
+        resolver: elira_upstream::Resolver::default(),
         proxy_protocol: false,
         health_path: None,
         health_method: None,
@@ -179,8 +180,8 @@ fn least_conn_prefers_the_idle_server() {
 #[test]
 fn weighted_least_conn_compares_active_over_weight() {
     let tls = TlsOptions::default();
-    let client =
-        Client::builder(TokioExecutor::new()).build(https_connector(&tls).expect("connector"));
+    let client = Client::builder(TokioExecutor::new())
+        .build(https_connector(&tls, elira_upstream::Resolver::default()).expect("connector"));
     let pool = Pool {
         name: "test".to_owned(),
         servers: vec![
@@ -220,6 +221,7 @@ fn weighted_least_conn_compares_active_over_weight() {
         tls_config: std::sync::Arc::new(
             elira_upstream::client_config(&TlsOptions::default()).expect("tls config"),
         ),
+        resolver: elira_upstream::Resolver::default(),
         proxy_protocol: false,
         health_path: None,
         health_method: None,
@@ -267,6 +269,7 @@ async fn health_probe_honours_method_host_and_expected_status() {
 
     let server = ServerAddr::Tcp(format!("{addr}").parse().expect("authority"));
     let tls = TlsOptions::default();
+    let resolver = elira_upstream::Resolver::default();
     let probe = |path: &'static str, expect: &'static [u16]| Probe {
         path,
         method: "HEAD",
@@ -275,6 +278,7 @@ async fn health_probe_honours_method_host_and_expected_status() {
         timeout: Duration::from_secs(2),
         tls: false,
         options: &tls,
+        resolver: &resolver,
     };
 
     assert!(probe_server(&server, &probe("/ready", &[204])).await);
@@ -286,8 +290,8 @@ async fn health_probe_honours_method_host_and_expected_status() {
 #[test]
 fn passive_ejection_skips_a_failing_server_until_the_cooldown() {
     let tls = TlsOptions::default();
-    let client =
-        Client::builder(TokioExecutor::new()).build(https_connector(&tls).expect("connector"));
+    let client = Client::builder(TokioExecutor::new())
+        .build(https_connector(&tls, elira_upstream::Resolver::default()).expect("connector"));
     let pool = Pool {
         name: "test".to_owned(),
         servers: vec![
@@ -327,6 +331,7 @@ fn passive_ejection_skips_a_failing_server_until_the_cooldown() {
         tls_config: std::sync::Arc::new(
             elira_upstream::client_config(&TlsOptions::default()).expect("tls config"),
         ),
+        resolver: elira_upstream::Resolver::default(),
         proxy_protocol: false,
         health_path: None,
         health_method: None,

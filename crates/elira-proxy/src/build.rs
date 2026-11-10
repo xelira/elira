@@ -19,7 +19,28 @@ use crate::*;
 
 type Pools = HashMap<String, Arc<Pool>>;
 
-pub(crate) fn build_pools(cfg: &Config) -> Result<(Pools, Vec<Arc<Pool>>), Error> {
+pub(crate) fn build_resolver(cfg: &Config) -> elira_upstream::Resolver {
+    elira_upstream::Resolver::new(elira_upstream::ResolverOptions {
+        ttl: Duration::from_secs(cfg.resolver.ttl_secs),
+        negative_ttl: Duration::from_secs(cfg.resolver.negative_ttl_secs),
+        hosts: cfg
+            .resolver
+            .hosts
+            .iter()
+            .map(|host| {
+                (
+                    host.name.trim_end_matches('.').to_ascii_lowercase(),
+                    host.addresses.clone(),
+                )
+            })
+            .collect(),
+    })
+}
+
+pub(crate) fn build_pools(
+    cfg: &Config,
+    resolver: elira_upstream::Resolver,
+) -> Result<(Pools, Vec<Arc<Pool>>), Error> {
     let mut pools: HashMap<String, Arc<Pool>> = HashMap::new();
     for up in &cfg.upstreams {
         let mut servers = Vec::with_capacity(up.servers.len());
@@ -72,9 +93,10 @@ pub(crate) fn build_pools(cfg: &Config) -> Result<(Pools, Vec<Arc<Pool>>), Error
             )),
             local_address: up.bind,
         };
-        let connector = https_connector(&tls).map_err(|err| Error::UpstreamTls {
-            reason: err.to_string(),
-        })?;
+        let connector =
+            https_connector(&tls, resolver.clone()).map_err(|err| Error::UpstreamTls {
+                reason: err.to_string(),
+            })?;
         let tls_config =
             Arc::new(
                 elira_upstream::client_config(&tls).map_err(|err| Error::UpstreamTls {
@@ -118,6 +140,7 @@ pub(crate) fn build_pools(cfg: &Config) -> Result<(Pools, Vec<Arc<Pool>>), Error
                 client,
                 tls: tls.clone(),
                 tls_config,
+                resolver: resolver.clone(),
                 proxy_protocol: up.proxy_protocol,
                 health_path: up.health_path.clone(),
                 health_method: up.health_method.clone(),
@@ -131,6 +154,7 @@ pub(crate) fn build_pools(cfg: &Config) -> Result<(Pools, Vec<Arc<Pool>>), Error
                         ),
                         tls: tls.clone(),
                         bind: up.bind,
+                        resolver: resolver.clone(),
                     })
                 }),
                 h2: up.h2_pool.then(|| {
@@ -140,6 +164,7 @@ pub(crate) fn build_pools(cfg: &Config) -> Result<(Pools, Vec<Arc<Pool>>), Error
                         tls.clone(),
                     );
                     config.bind = up.bind;
+                    config.resolver = resolver.clone();
                     elira_h2::Pool::new(config)
                 }),
             }),

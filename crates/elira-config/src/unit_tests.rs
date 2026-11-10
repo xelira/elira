@@ -2175,6 +2175,42 @@ upstream = "app"
 }
 
 #[test]
+fn resolver_hosts_are_validated() {
+    let base = r#"
+listen = "127.0.0.1:8080"
+
+[[resolver.hosts]]
+name = "backend.test"
+addresses = ["127.0.0.1", "::1"]
+
+[[upstreams]]
+name = "app"
+servers = ["backend.test:9000"]
+
+[[routes]]
+host = "*"
+upstream = "app"
+"#;
+    let cfg = Config::parse(base).expect("valid config");
+    assert_eq!(cfg.resolver.hosts.len(), 1);
+    assert_eq!(cfg.resolver.hosts[0].addresses.len(), 2);
+
+    let empty = base.replace("addresses = [\"127.0.0.1\", \"::1\"]", "addresses = []");
+    assert!(matches!(
+        Config::parse(&empty),
+        Err(Error::EmptyResolverHost { .. })
+    ));
+
+    let duplicate = format!(
+        "{base}\n[[resolver.hosts]]\nname = \"BACKEND.test\"\naddresses = [\"127.0.0.1\"]\n"
+    );
+    assert!(matches!(
+        Config::parse(&duplicate),
+        Err(Error::DuplicateResolverHost { .. })
+    ));
+}
+
+#[test]
 fn named_locations_are_validated() {
     let base = r#"
 listen = "127.0.0.1:8080"

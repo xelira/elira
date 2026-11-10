@@ -19,7 +19,7 @@ use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::TlsConnector;
 
 use elira_config::Balance;
-use elira_upstream::TlsOptions;
+use elira_upstream::{Resolver, TlsOptions};
 
 use crate::variables::RequestKey;
 use crate::{Body, BoxError};
@@ -85,9 +85,10 @@ pub(crate) struct Pool {
     pub(crate) balance: Balance,
     pub(crate) retries: u32,
     pub(crate) scheme: &'static str,
-    pub(crate) client: Client<HttpsConnector<HttpConnector>, Body>,
+    pub(crate) client: Client<HttpsConnector<HttpConnector<Resolver>>, Body>,
     pub(crate) tls: TlsOptions,
     pub(crate) tls_config: Arc<tokio_rustls::rustls::ClientConfig>,
+    pub(crate) resolver: Resolver,
     pub(crate) proxy_protocol: bool,
     pub(crate) health_path: Option<String>,
     pub(crate) health_method: Option<String>,
@@ -473,9 +474,10 @@ async fn send_direct(
         .unwrap_or(if pool.scheme == "https" { 443 } else { 80 });
 
     let connect = async {
-        let mut stream = elira_upstream::tcp_connect(&host, port, pool.tls.local_address)
-            .await
-            .map_err(|err| SendError::Failed(err.to_string()))?;
+        let mut stream =
+            elira_upstream::tcp_connect(&host, port, pool.tls.local_address, Some(&pool.resolver))
+                .await
+                .map_err(|err| SendError::Failed(err.to_string()))?;
         let _ = stream.set_nodelay(true);
         let dest = stream
             .peer_addr()

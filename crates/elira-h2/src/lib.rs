@@ -79,6 +79,8 @@ pub struct PoolConfig {
     pub connect_timeout: Duration,
     /// Local IP address to bind before connecting.
     pub bind: Option<std::net::IpAddr>,
+    /// Shared DNS resolver with caching and static overrides.
+    pub resolver: elira_upstream::Resolver,
     /// Trust settings for `https://` origins.
     ///
     /// [`TlsOptions::http2`] is ignored: this pool always offers `h2` and
@@ -100,6 +102,7 @@ impl Default for PoolConfig {
             max_connections: 4,
             connect_timeout: Duration::from_secs(10),
             bind: None,
+            resolver: elira_upstream::Resolver::default(),
             tls: TlsOptions::default(),
             max_concurrent_streams: None,
         }
@@ -376,13 +379,17 @@ impl Inner {
         let origin_name = origin.to_string();
 
         let established = tokio::time::timeout(timeout, async {
-            let tcp =
-                elira_upstream::tcp_connect(origin.host.as_str(), origin.port, self.config.bind)
-                    .await
-                    .map_err(|source| Error::Connect {
-                        origin: origin_name.clone(),
-                        source,
-                    })?;
+            let tcp = elira_upstream::tcp_connect(
+                origin.host.as_str(),
+                origin.port,
+                self.config.bind,
+                Some(&self.config.resolver),
+            )
+            .await
+            .map_err(|source| Error::Connect {
+                origin: origin_name.clone(),
+                source,
+            })?;
             let _ = tcp.set_nodelay(true);
 
             let io: BoxedIo = match origin.scheme {
