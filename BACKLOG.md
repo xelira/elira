@@ -138,7 +138,10 @@ Living list for the self-improvement loop. One item per session.
 - [x] `CONNECT` over HTTP/2.
 - [x] WebSocket over HTTP/2 (RFC 8441), translated to an HTTP/1.1 upstream.
 - [x] `CONNECT` over HTTP/3.
-- [ ] WebTransport and application HTTP/3 datagrams.
+- [x] Reject WebTransport/WebSocket extended CONNECT over HTTP/3 with `501`.
+- [ ] WebTransport gateway: needs an upstream WebTransport protocol, not a
+  generic HTTP or TCP target.
+- [ ] WebSocket over HTTP/3 (`:protocol = websocket`).
 - [ ] h2c via `Upgrade: h2c` (hyper cannot inject the upgraded stream 1).
 - [x] SCGI upstreams.
 - [x] uWSGI upstreams.

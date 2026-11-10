@@ -269,6 +269,16 @@ where
     B: Buf + From<Bytes> + Send + 'static,
 {
     let started = Instant::now();
+    if req.extensions().get::<h3::ext::Protocol>().is_some() {
+        // WebTransport and WebSocket over HTTP/3 need a defined backend
+        // protocol; they are not raw CONNECT tunnels.
+        let response = Response::builder()
+            .status(http::StatusCode::NOT_IMPLEMENTED)
+            .body(())?;
+        stream.send_response(response).await?;
+        stream.finish().await?;
+        return Ok(());
+    }
     let target = match proxy().connect_target(&req) {
         Ok(target) => target,
         Err(error) => {

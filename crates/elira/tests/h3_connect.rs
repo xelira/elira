@@ -133,6 +133,26 @@ return = {{ status = 404, body = "no route" }}
     assert_eq!(&echoed.copy_to_bytes(echoed.remaining())[..], b"ping");
 
     stream.finish().await.expect("finish");
+
+    let mut request = http::Request::builder()
+        .method(http::Method::CONNECT)
+        .uri("https://example.com/wt")
+        .body(())
+        .expect("WebTransport request");
+    request.extensions_mut().insert(
+        "webtransport"
+            .parse::<h3::ext::Protocol>()
+            .ok()
+            .expect("protocol"),
+    );
+    let mut stream = send_request
+        .send_request(request)
+        .await
+        .expect("send WebTransport");
+    let response = stream.recv_response().await.expect("response");
+    assert_eq!(response.status(), http::StatusCode::NOT_IMPLEMENTED);
+    stream.finish().await.expect("finish");
+
     drop(h3);
 
     endpoint.close(0u32.into(), b"done");

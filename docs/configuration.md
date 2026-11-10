@@ -563,6 +563,8 @@ HTTP/3 живёт на отдельном UDP-порту и не делит со
   `upstream_timeout_secs` на установку соединения.
 - `CONNECT` работает по HTTP/1.1, HTTP/2 и HTTP/3. Для HTTP/2 нужен TLS с
   ALPN `h2` или `h2c = true`; HTTP/3 использует QUIC-поток напрямую.
+- Extended `CONNECT` с `:protocol` (WebTransport, WebSocket over HTTP/3) не
+  является обычным TCP-туннелем и отвечает `501 Not Implemented`.
 - WebSocket over HTTP/2 (RFC 8441) принимается как extended `CONNECT` с
   `:protocol = websocket` и проксируется в upstream как обычный HTTP/1.1
   `Upgrade`. Исходные `Sec-WebSocket-*` заголовки сохраняются.
