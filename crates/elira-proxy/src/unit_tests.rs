@@ -1,5 +1,5 @@
 use super::*;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use http::header::{CONNECTION, TRANSFER_ENCODING, UPGRADE};
@@ -157,7 +157,11 @@ fn least_conn_prefers_the_idle_server() {
         balance: Balance::LeastConn,
         retries: 0,
         scheme: "http",
-        client,
+        client: std::sync::RwLock::new(client),
+        served: AtomicU64::new(0),
+        keepalive_requests: 0,
+        idle_timeout: Duration::from_secs(30),
+        max_idle: None,
         tls,
         tls_config: std::sync::Arc::new(
             elira_upstream::client_config(&TlsOptions::default()).expect("tls config"),
@@ -216,7 +220,11 @@ fn weighted_least_conn_compares_active_over_weight() {
         balance: Balance::LeastConn,
         retries: 0,
         scheme: "http",
-        client,
+        client: std::sync::RwLock::new(client),
+        served: AtomicU64::new(0),
+        keepalive_requests: 0,
+        idle_timeout: Duration::from_secs(30),
+        max_idle: None,
         tls,
         tls_config: std::sync::Arc::new(
             elira_upstream::client_config(&TlsOptions::default()).expect("tls config"),
@@ -326,7 +334,11 @@ fn passive_ejection_skips_a_failing_server_until_the_cooldown() {
         balance: Balance::RoundRobin,
         retries: 0,
         scheme: "http",
-        client,
+        client: std::sync::RwLock::new(client),
+        served: AtomicU64::new(0),
+        keepalive_requests: 0,
+        idle_timeout: Duration::from_secs(30),
+        max_idle: None,
         tls,
         tls_config: std::sync::Arc::new(
             elira_upstream::client_config(&TlsOptions::default()).expect("tls config"),

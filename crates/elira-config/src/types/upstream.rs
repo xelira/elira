@@ -168,6 +168,11 @@ pub struct Upstream {
     #[serde(default)]
     pub keepalive_secs: Option<u64>,
 
+    /// Retire the pooled client after this many requests, closing its idle
+    /// connections. Zero disables rotation.
+    #[serde(default)]
+    pub keepalive_requests: Option<u32>,
+
     /// Eject a server after this many consecutive transport failures. Zero
     /// disables passive ejection.
     #[serde(default)]

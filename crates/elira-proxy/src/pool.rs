@@ -3,7 +3,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use http::uri::Authority;
@@ -12,14 +12,14 @@ use http_body_util::BodyExt;
 use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::TlsConnector;
 
 use elira_config::Balance;
-use elira_upstream::{Resolver, TlsOptions};
+use elira_upstream::{https_connector, Resolver, TlsOptions};
 
 use crate::variables::RequestKey;
 use crate::{Body, BoxError};
@@ -85,7 +85,11 @@ pub(crate) struct Pool {
     pub(crate) balance: Balance,
     pub(crate) retries: u32,
     pub(crate) scheme: &'static str,
-    pub(crate) client: Client<HttpsConnector<HttpConnector<Resolver>>, Body>,
+    pub(crate) client: RwLock<Client<HttpsConnector<HttpConnector<Resolver>>, Body>>,
+    pub(crate) served: AtomicU64,
+    pub(crate) keepalive_requests: u64,
+    pub(crate) idle_timeout: Duration,
+    pub(crate) max_idle: Option<usize>,
     pub(crate) tls: TlsOptions,
     pub(crate) tls_config: Arc<tokio_rustls::rustls::ClientConfig>,
     pub(crate) resolver: Resolver,
@@ -303,6 +307,32 @@ impl Pool {
         self.started.elapsed().as_millis() as u64
     }
 
+    /// Retire the pooled client after `keepalive_requests` requests. Hyper's
+    /// legacy client does not expose a per-connection request count, so this
+    /// closes the whole idle pool at the same cadence instead.
+    pub(crate) fn maybe_rotate(&self) {
+        if self.keepalive_requests == 0 {
+            return;
+        }
+        let served = self.served.fetch_add(1, Ordering::Relaxed) + 1;
+        if !served.is_multiple_of(self.keepalive_requests) {
+            return;
+        }
+        let Ok(connector) = https_connector(&self.tls, self.resolver.clone()) else {
+            return;
+        };
+        let mut builder = Client::builder(TokioExecutor::new());
+        builder.pool_idle_timeout(Some(self.idle_timeout));
+        if let Some(max) = self.max_idle {
+            builder.pool_max_idle_per_host(max);
+        }
+        let client = builder.build(connector);
+        *self
+            .client
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = client;
+    }
+
     pub(crate) fn record_success(&self, index: usize) {
         let passive = &self.passive[index];
         passive.failures.store(0, Ordering::Relaxed);
@@ -413,7 +443,13 @@ pub(crate) async fn send_request(
                 Err(_) => Err(SendError::Timeout),
             };
         }
-        return match tokio::time::timeout(timeout, pool.client.request(request)).await {
+        pool.maybe_rotate();
+        let client = pool
+            .client
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        return match tokio::time::timeout(timeout, client.request(request)).await {
             Ok(Ok(response)) => Ok(response
                 .map(|body| BodyExt::map_err(body, |err| -> BoxError { Box::new(err) }).boxed())),
             Ok(Err(err)) => Err(SendError::Failed(err.to_string())),

@@ -2118,6 +2118,7 @@ servers = ["127.0.0.1:9000", "127.0.0.1:9001"]
 balance = "random"
 keepalive = 0
 keepalive_secs = 12
+keepalive_requests = 10
 
 [[routes]]
 host = "*"
@@ -2127,6 +2128,7 @@ upstream = "app"
     assert_eq!(cfg.upstreams[0].balance, Balance::Random);
     assert_eq!(cfg.upstreams[0].keepalive, Some(0));
     assert_eq!(cfg.upstreams[0].keepalive_secs, Some(12));
+    assert_eq!(cfg.upstreams[0].keepalive_requests, Some(10));
 
     let bad = base.replace("keepalive_secs = 12", "keepalive_secs = 0");
     assert!(matches!(

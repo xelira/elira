@@ -239,7 +239,7 @@ Upstreams:
   connection limits
 - an open-file metadata cache for static files (`open_file_cache`)
 - upstream keepalive pool sizing and idle lifetime (`keepalive`,
-  `keepalive_secs`)
+  `keepalive_secs`) plus periodic pool recycling (`keepalive_requests`)
 - a shared DNS cache with positive/negative TTLs and static host overrides for
   every upstream transport
 - streaming FastCGI over TCP (including DNS names) or unix sockets with an

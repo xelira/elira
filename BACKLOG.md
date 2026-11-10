@@ -169,8 +169,8 @@ Living list for the self-improvement loop. One item per session.
 - [x] `proxy_redirect`, `proxy_cookie_domain/path`, `proxy_hide_header`.
 - [x] `random` balancing and `keepalive`/`keepalive_secs`.
 - [x] Per-server `max_conns`, `backup`, `down`, `slow_start`.
-- [ ] Upstream `keepalive_requests` (hyper's legacy client does not expose a
-  per-connection request count).
+- [x] Upstream `keepalive_requests` by recycling the legacy client's idle
+  pool at that cadence (hyper has no per-connection request counter).
 - [x] Configurable resolver with runtime DNS and TTL policy.
 
 ### Section 4 — limits and operations
