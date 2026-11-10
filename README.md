@@ -274,6 +274,7 @@ TLS:
 HTTP:
 
 - HTTP/1.1, HTTP/2 (TLS or h2c with prior knowledge), HTTP/3 over QUIC
+  with configurable HTTP/2 windows/stream limits and QUIC transport windows
 - RFC 8441 WebSocket over HTTP/2, translated to an HTTP/1.1 `Upgrade` when the
   upstream does not speak extended CONNECT
 - response trailers (gRPC `grpc-status`) forwarded end to end

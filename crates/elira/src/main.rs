@@ -670,6 +670,10 @@ fn spawn_h3(
                 .collect(),
             idle_timeout_secs: http3.idle_timeout_secs,
             early_data: http3.early_data,
+            max_concurrent_bidi_streams: http3.max_concurrent_bidi_streams,
+            stream_receive_window: http3.stream_receive_window,
+            receive_window: http3.receive_window,
+            send_window: http3.send_window,
             proxy_protocol,
         };
         if let Err(err) = elira_h3::serve(cfg, proxy, metrics, body_timeout, log, stop).await {

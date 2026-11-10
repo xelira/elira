@@ -10,11 +10,37 @@ use crate::*;
 impl Config {
     pub(crate) fn validate(&self) -> Result<(), Error> {
         let listener_names = self.validate_server()?;
+        self.validate_http2()?;
         self.validate_cache()?;
         self.validate_resolver()?;
         self.validate_tls()?;
         let upstream_names = self.validate_upstreams()?;
         self.validate_routes(&listener_names, &upstream_names)?;
+        Ok(())
+    }
+
+    fn validate_http2(&self) -> Result<(), Error> {
+        let h2 = &self.http2;
+        if let Some(size) = h2.max_frame_size {
+            if !(16_384..=16_777_215).contains(&size) {
+                return Err(Error::BadHttp2Setting {
+                    field: "max_frame_size".to_owned(),
+                });
+            }
+        }
+        for (field, value) in [
+            ("initial_stream_window_size", h2.initial_stream_window_size),
+            (
+                "initial_connection_window_size",
+                h2.initial_connection_window_size,
+            ),
+        ] {
+            if value.is_some_and(|size| size < 1024) {
+                return Err(Error::BadHttp2Setting {
+                    field: field.to_owned(),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -422,6 +448,21 @@ impl Config {
             }
             if http3.idle_timeout_secs == 0 {
                 return Err(Error::Http3IdleTimeoutZero);
+            }
+            for (field, value) in [
+                (
+                    "max_concurrent_bidi_streams",
+                    http3.max_concurrent_bidi_streams,
+                ),
+                ("stream_receive_window", http3.stream_receive_window),
+                ("receive_window", http3.receive_window),
+                ("send_window", http3.send_window),
+            ] {
+                if value.is_some_and(|value| value == 0 || value > (1u64 << 62) - 1) {
+                    return Err(Error::BadHttp3Transport {
+                        field: field.to_owned(),
+                    });
+                }
             }
             validate_tls_list("http3.cipher_suites", &http3.cipher_suites)?;
             validate_tls_list("http3.curves", &http3.curves)?;

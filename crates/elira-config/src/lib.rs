@@ -123,6 +123,8 @@ pub struct Config {
     pub chroot: Option<PathBuf>,
     #[serde(default)]
     pub limits: Limits,
+    #[serde(default)]
+    pub http2: Http2,
     /// Send our `Server: elira` header and keep the upstream one.
     #[serde(default = "Config::default_server_header")]
     pub server_header: bool,

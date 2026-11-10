@@ -2314,6 +2314,66 @@ root = "/srv"
 }
 
 #[test]
+fn http2_tuning_is_validated() {
+    let base = r#"
+listen = "127.0.0.1:8080"
+
+[http2]
+max_concurrent_streams = 128
+initial_stream_window_size = 65536
+initial_connection_window_size = 1048576
+max_frame_size = 32768
+keep_alive_interval_secs = 10
+keep_alive_timeout_secs = 5
+
+[[routes]]
+host = "*"
+root = "/srv"
+"#;
+    let cfg = Config::parse(base).expect("valid http2 config");
+    assert_eq!(cfg.http2.max_concurrent_streams, Some(128));
+    assert_eq!(cfg.http2.max_frame_size, Some(32768));
+
+    let bad = base.replace("max_frame_size = 32768", "max_frame_size = 1024");
+    assert!(matches!(
+        Config::parse(&bad),
+        Err(Error::BadHttp2Setting { .. })
+    ));
+}
+
+#[test]
+fn http3_transport_is_validated() {
+    let base = r#"
+listen = "127.0.0.1:8080"
+
+[http3]
+listen = "127.0.0.1:4433"
+cert = "cert.pem"
+key = "key.pem"
+max_concurrent_bidi_streams = 128
+stream_receive_window = 1048576
+receive_window = 8388608
+send_window = 8388608
+
+[[routes]]
+host = "*"
+root = "/srv"
+"#;
+    let cfg = Config::parse(base).expect("valid http3 config");
+    let http3 = cfg.http3.as_ref().expect("http3");
+    assert_eq!(http3.max_concurrent_bidi_streams, Some(128));
+
+    let bad = base.replace(
+        "stream_receive_window = 1048576",
+        "stream_receive_window = 0",
+    );
+    assert!(matches!(
+        Config::parse(&bad),
+        Err(Error::BadHttp3Transport { .. })
+    ));
+}
+
+#[test]
 fn named_locations_are_validated() {
     let base = r#"
 listen = "127.0.0.1:8080"

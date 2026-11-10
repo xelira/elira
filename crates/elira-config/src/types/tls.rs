@@ -196,6 +196,22 @@ pub struct Http3 {
     #[serde(default = "Http3::default_idle_timeout_secs")]
     pub idle_timeout_secs: u64,
 
+    /// Maximum concurrent bidirectional streams per QUIC connection.
+    #[serde(default)]
+    pub max_concurrent_bidi_streams: Option<u64>,
+
+    /// Per-stream receive window in bytes.
+    #[serde(default)]
+    pub stream_receive_window: Option<u64>,
+
+    /// Connection-level receive window in bytes.
+    #[serde(default)]
+    pub receive_window: Option<u64>,
+
+    /// Connection-level send window in bytes.
+    #[serde(default)]
+    pub send_window: Option<u64>,
+
     /// Allow 0-RTT early data on QUIC.
     #[serde(default)]
     pub early_data: bool,

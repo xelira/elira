@@ -147,6 +147,7 @@
 - `rate_delay` для задержки запросов сверх `requests_per_second`.
 - `workers = "auto"` для числа воркеров по доступным CPU.
 - `$upstream_addr`, `$upstream_status` и `$upstream_response_time` в access-логе.
+- Секция `[http2]` для потоков и окон, поля QUIC-транспорта в `[http3]`.
 - `GET /config` на админском листенере: эффективный конфиг в JSON.
 - Тесты FastCGI/CGI на обрезанные заголовки, длину записи, padding и хвост
   после `END_REQUEST`.

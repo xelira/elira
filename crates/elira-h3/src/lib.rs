@@ -40,6 +40,10 @@ pub struct Config {
     pub proxy_protocol: bool,
     pub idle_timeout_secs: u64,
     pub early_data: bool,
+    pub max_concurrent_bidi_streams: Option<u64>,
+    pub stream_receive_window: Option<u64>,
+    pub receive_window: Option<u64>,
+    pub send_window: Option<u64>,
 }
 
 pub async fn serve(
@@ -68,6 +72,18 @@ pub async fn serve(
         quinn::IdleTimeout::try_from(std::time::Duration::from_secs(cfg.idle_timeout_secs))
             .map_err(|_| anyhow::anyhow!("invalid QUIC idle timeout"))?,
     ));
+    if let Some(value) = cfg.max_concurrent_bidi_streams {
+        transport.max_concurrent_bidi_streams(quic_varint(value)?);
+    }
+    if let Some(value) = cfg.stream_receive_window {
+        transport.stream_receive_window(quic_varint(value)?);
+    }
+    if let Some(value) = cfg.receive_window {
+        transport.receive_window(quic_varint(value)?);
+    }
+    if let Some(value) = cfg.send_window {
+        transport.send_window(value);
+    }
     let mut server = quinn::ServerConfig::with_crypto(Arc::new(crypto));
     server.transport_config(Arc::new(transport));
 
@@ -548,4 +564,9 @@ where
     }
 
     Ok(())
+}
+
+fn quic_varint(value: u64) -> anyhow::Result<quinn::VarInt> {
+    quinn::VarInt::from_u64(value)
+        .map_err(|_| anyhow::anyhow!("QUIC value {value} exceeds the varint range"))
 }

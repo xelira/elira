@@ -218,6 +218,57 @@ pub struct Connect {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct Http2 {
+    /// Maximum concurrent streams accepted from one client.
+    #[serde(default)]
+    pub max_concurrent_streams: Option<u32>,
+
+    /// Per-stream flow-control window in bytes.
+    #[serde(default)]
+    pub initial_stream_window_size: Option<u32>,
+
+    /// Connection-level flow-control window in bytes.
+    #[serde(default)]
+    pub initial_connection_window_size: Option<u32>,
+
+    /// Maximum frame payload. HTTP/2 allows 16384..=16777215.
+    #[serde(default)]
+    pub max_frame_size: Option<u32>,
+
+    /// Send a PING after this many seconds of silence. Zero disables.
+    #[serde(default = "Http2::default_keep_alive_interval_secs")]
+    pub keep_alive_interval_secs: u64,
+
+    /// Close the connection when a keep-alive PING is not answered.
+    #[serde(default = "Http2::default_keep_alive_timeout_secs")]
+    pub keep_alive_timeout_secs: u64,
+}
+
+impl Default for Http2 {
+    fn default() -> Self {
+        Self {
+            max_concurrent_streams: None,
+            initial_stream_window_size: None,
+            initial_connection_window_size: None,
+            max_frame_size: None,
+            keep_alive_interval_secs: Self::default_keep_alive_interval_secs(),
+            keep_alive_timeout_secs: Self::default_keep_alive_timeout_secs(),
+        }
+    }
+}
+
+impl Http2 {
+    fn default_keep_alive_interval_secs() -> u64 {
+        30
+    }
+
+    fn default_keep_alive_timeout_secs() -> u64 {
+        20
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct MetricsConfig {
     /// Bind loopback here unless you really mean to expose the counters.
     pub listen: SocketAddr,

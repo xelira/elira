@@ -123,6 +123,9 @@ pub enum Error {
     #[error("limits.upstream_connect_timeout_secs must be greater than zero")]
     UpstreamConnectTimeoutZero,
 
+    #[error("[http2] {field} is out of range")]
+    BadHttp2Setting { field: String },
+
     #[error("resolver: host name must not be empty or contain whitespace")]
     BadResolverHost { name: String },
 
@@ -179,6 +182,9 @@ pub enum Error {
 
     #[error("http3.idle_timeout_secs must be greater than zero")]
     Http3IdleTimeoutZero,
+
+    #[error("http3.{field} is out of range")]
+    BadHttp3Transport { field: String },
 
     #[error("http3.cert must not be empty")]
     Http3MissingCert,

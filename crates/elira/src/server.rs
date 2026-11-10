@@ -23,7 +23,9 @@ use tokio::sync::{watch, Semaphore};
 use elira_accesslog::{request_id, Entry};
 use elira_metrics::{CacheResult, Metrics};
 
-use crate::config::{ClientAuthMode, Config, Health, Http3, LogFormat, TlsBackend, TlsVersion};
+use crate::config::{
+    ClientAuthMode, Config, Health, Http2, Http3, LogFormat, TlsBackend, TlsVersion,
+};
 use crate::proxy::{BoxError, Proxy};
 
 /// Everything that can change on SIGHUP. A connection keeps the runtime it
@@ -251,6 +253,7 @@ pub struct Options {
     pub max_connections: usize,
     pub limit_conn_per_ip: usize,
     pub(crate) conn_limiter: Option<Arc<ConnLimiter>>,
+    pub http2: Http2,
     pub max_headers: usize,
     pub max_buf_size: usize,
     pub idle_timeout: Duration,
@@ -277,6 +280,7 @@ impl Options {
             limit_conn_per_ip: cfg.limits.limit_conn_per_ip,
             conn_limiter: (cfg.limits.limit_conn_per_ip > 0)
                 .then(|| Arc::new(ConnLimiter::new(cfg.limits.limit_conn_per_ip))),
+            http2: cfg.http2.clone(),
             max_headers: cfg.limits.max_headers,
             max_buf_size: cfg.limits.max_header_bytes,
             idle_timeout: Duration::from_secs(cfg.limits.idle_timeout_secs),
@@ -464,6 +468,7 @@ pub async fn serve_unix(
                     idle_timeout: options.idle_timeout,
                     keepalive_requests: options.keepalive_requests,
                     client_header_timeout: options.client_header_timeout,
+                    http2: options.http2.clone(),
                     body_timeout: options.body_timeout,
                     drain_timeout: options.drain_timeout,
                     h2: false,
@@ -505,7 +510,7 @@ pub async fn serve_unix(
                             let conn = ConnOptions {
                                 h2,
                                 secure: true,
-                                ..conn
+                                ..conn.clone()
                             };
                             serve_conn(
                                 stream,
@@ -592,13 +597,14 @@ pub fn spawn_health_loop(
     });
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ConnOptions {
     max_headers: usize,
     max_buf_size: usize,
     idle_timeout: Duration,
     keepalive_requests: usize,
     client_header_timeout: Option<Duration>,
+    http2: Http2,
     body_timeout: Option<Duration>,
     drain_timeout: Duration,
     h2: bool,
@@ -640,6 +646,7 @@ async fn serve_stream(
         idle_timeout: options.idle_timeout,
         keepalive_requests: options.keepalive_requests,
         client_header_timeout: options.client_header_timeout,
+        http2: options.http2.clone(),
         body_timeout: options.body_timeout,
         drain_timeout: options.drain_timeout,
         h2: false,
@@ -651,7 +658,7 @@ async fn serve_stream(
         if acme.uses_http01() {
             let conn = ConnOptions {
                 secure: false,
-                ..conn
+                ..conn.clone()
             };
             serve_conn(
                 stream,
@@ -673,7 +680,7 @@ async fn serve_stream(
                 let conn = ConnOptions {
                     h2,
                     secure: true,
-                    ..conn
+                    ..conn.clone()
                 };
                 serve_conn(
                     io,
@@ -715,7 +722,7 @@ async fn serve_stream(
                 let conn = ConnOptions {
                     h2: true,
                     secure: false,
-                    ..conn
+                    ..conn.clone()
                 };
                 serve_conn(
                     stream,
@@ -745,7 +752,10 @@ async fn serve_stream(
         return;
     }
 
-    let conn = ConnOptions { secure, ..conn };
+    let conn = ConnOptions {
+        secure,
+        ..conn.clone()
+    };
 
     match tls {
         Some(config) => {
@@ -760,7 +770,7 @@ async fn serve_stream(
                     let identity = stream
                         .peer_certificate_der()
                         .and_then(|leaf| elira_tls::ClientIdentity::parse(&leaf));
-                    let conn = ConnOptions { h2, ..conn };
+                    let conn = ConnOptions { h2, ..conn.clone() };
                     serve_conn(
                         stream,
                         peer,
@@ -976,13 +986,31 @@ async fn serve_conn<I>(
     });
 
     if opts.h2 {
-        let conn = http2::Builder::new(TokioExecutor::new())
+        let mut builder = http2::Builder::new(TokioExecutor::new());
+        builder
             .timer(TokioTimer::new())
             .enable_connect_protocol()
-            .keep_alive_interval(Some(Duration::from_secs(30)))
-            .keep_alive_timeout(Duration::from_secs(20))
-            .max_header_list_size(opts.max_buf_size as u32)
-            .serve_connection(TokioIo::new(io), service);
+            .keep_alive_interval(
+                (opts.http2.keep_alive_interval_secs > 0)
+                    .then(|| Duration::from_secs(opts.http2.keep_alive_interval_secs)),
+            )
+            .keep_alive_timeout(Duration::from_secs(
+                opts.http2.keep_alive_timeout_secs.max(1),
+            ))
+            .max_header_list_size(opts.max_buf_size as u32);
+        if let Some(streams) = opts.http2.max_concurrent_streams {
+            builder.max_concurrent_streams(streams);
+        }
+        if let Some(size) = opts.http2.initial_stream_window_size {
+            builder.initial_stream_window_size(size);
+        }
+        if let Some(size) = opts.http2.initial_connection_window_size {
+            builder.initial_connection_window_size(size);
+        }
+        if let Some(size) = opts.http2.max_frame_size {
+            builder.max_frame_size(size);
+        }
+        let conn = builder.serve_connection(TokioIo::new(io), service);
         let mut conn = std::pin::pin!(conn);
 
         tokio::select! {
