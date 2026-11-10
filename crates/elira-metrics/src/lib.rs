@@ -689,6 +689,16 @@ impl Metrics {
     pub fn render(&self) -> String {
         let mut out = String::with_capacity(2048);
 
+        self.render_requests(&mut out);
+        self.render_routes(&mut out);
+        self.render_traffic(&mut out);
+        self.render_pools(&mut out);
+        self.render_reloads(&mut out);
+
+        out
+    }
+
+    fn render_requests(&self, out: &mut String) {
         out.push_str("# HELP elira_requests_total Completed requests by status class.\n");
         out.push_str("# TYPE elira_requests_total counter\n");
         for (class, counter) in STATUS_CLASSES.iter().zip(&self.requests) {
@@ -720,7 +730,9 @@ impl Metrics {
             format_seconds(self.duration_sum_nanos.load(Ordering::Relaxed))
         );
         let _ = writeln!(out, "elira_request_duration_seconds_count {count}");
+    }
 
+    fn render_routes(&self, out: &mut String) {
         out.push_str("# HELP elira_connections_in_flight Client connections currently open.\n");
         out.push_str("# TYPE elira_connections_in_flight gauge\n");
         let _ = writeln!(
@@ -749,7 +761,7 @@ impl Metrics {
         out.push_str("# HELP elira_route_duration_seconds Time spent handling requests per configured route.\n");
         out.push_str("# TYPE elira_route_duration_seconds summary\n");
         render_labeled(
-            &mut out,
+            out,
             &lock(&self.routes),
             "elira_route_requests_total",
             "elira_route_duration_seconds",
@@ -788,7 +800,7 @@ impl Metrics {
         );
         out.push_str("# TYPE elira_upstream_duration_seconds summary\n");
         render_labeled(
-            &mut out,
+            out,
             &lock(&self.upstreams),
             "elira_upstream_requests_total",
             "elira_upstream_duration_seconds",
@@ -825,7 +837,9 @@ impl Metrics {
             "elira_health_checks_total{{result=\"failed\"}} {}",
             self.health_checks_failed.load(Ordering::Relaxed)
         );
+    }
 
+    fn render_traffic(&self, out: &mut String) {
         out.push_str("# HELP elira_request_bytes_total Request body bytes read from clients.\n");
         out.push_str("# TYPE elira_request_bytes_total counter\n");
         let _ = writeln!(
@@ -877,6 +891,9 @@ impl Metrics {
                 );
             }
         }
+    }
+
+    fn render_pools(&self, out: &mut String) {
         out.push_str("# HELP elira_upstream_active_requests Active requests per upstream pool.\n");
         out.push_str("# TYPE elira_upstream_active_requests gauge\n");
         {
@@ -948,6 +965,9 @@ impl Metrics {
                 );
             }
         }
+    }
+
+    fn render_reloads(&self, out: &mut String) {
         out.push_str("# HELP elira_reloads_total Configuration reload attempts by result.\n");
         out.push_str("# TYPE elira_reloads_total counter\n");
         let _ = writeln!(
@@ -960,8 +980,6 @@ impl Metrics {
             "elira_reloads_total{{result=\"failed\"}} {}",
             self.reloads_failed.load(Ordering::Relaxed)
         );
-
-        out
     }
 }
 
