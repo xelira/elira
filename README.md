@@ -222,7 +222,8 @@ Upstreams:
 
 - round robin, least connections, rendezvous hashing by IP, header, cookie,
   Authorization or URI, and random selection, with per-server weights for round
-  robin and least connections; active health checks with configurable method,
+  robin and least connections, `backup`/`down` flags, `max_conns` caps and slow
+  start after recovery; active health checks with configurable method,
   expected status
   and Host, passive ejection
   after repeated transport failures, retries for idempotent requests,

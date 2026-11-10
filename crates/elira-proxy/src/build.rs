@@ -11,7 +11,7 @@ use hyper_util::rt::TokioExecutor;
 use tokio::sync::Semaphore;
 
 use elira_auth::{BasicAuth, IpAcl};
-use elira_config::Config;
+use elira_config::{Config, ServerConfig};
 use elira_limit::RateLimiter;
 use elira_upstream::{https_connector, TlsOptions};
 
@@ -23,15 +23,23 @@ pub(crate) fn build_pools(cfg: &Config) -> Result<(Pools, Vec<Arc<Pool>>), Error
     let mut pools: HashMap<String, Arc<Pool>> = HashMap::new();
     for up in &cfg.upstreams {
         let mut servers = Vec::with_capacity(up.servers.len());
-        for addr in &up.servers {
-            let server = ServerAddr::parse(addr).ok_or_else(|| Error::BadServer {
+        for entry in &up.servers {
+            let server = ServerAddr::parse(entry.address()).ok_or_else(|| Error::BadServer {
                 upstream: up.name.clone(),
-                addr: addr.clone(),
+                addr: entry.address().to_owned(),
             })?;
             servers.push(server);
         }
         let health = (0..servers.len()).map(|_| AtomicBool::new(true)).collect();
         let active = (0..servers.len()).map(|_| AtomicUsize::new(0)).collect();
+        let backup = up.servers.iter().map(ServerConfig::backup).collect();
+        let down = up.servers.iter().map(ServerConfig::down).collect();
+        let max_conns = up.servers.iter().map(ServerConfig::max_conns).collect();
+        let slow_start = up
+            .servers
+            .iter()
+            .map(|server| Duration::from_secs(server.slow_start_secs()))
+            .collect();
         let passive = (0..servers.len())
             .map(|_| Passive {
                 failures: AtomicU32::new(0),
@@ -39,13 +47,12 @@ pub(crate) fn build_pools(cfg: &Config) -> Result<(Pools, Vec<Arc<Pool>>), Error
             })
             .collect();
         let server_labels = servers.iter().map(ToString::to_string).collect();
+        let recover_at = (0..servers.len()).map(|_| AtomicU64::new(0)).collect();
         let weights = if up.weights.is_empty() {
             vec![1; servers.len()]
         } else {
             up.weights.clone()
         };
-        let total_weight: u64 = weights.iter().map(|weight| u64::from(*weight)).sum();
-        let weighted = weights.iter().any(|weight| *weight != 1);
 
         // Each pool gets its own connector: trust and ALPN may differ
         // between upstreams.
@@ -91,6 +98,11 @@ pub(crate) fn build_pools(cfg: &Config) -> Result<(Pools, Vec<Arc<Pool>>), Error
                 servers,
                 health,
                 active,
+                backup,
+                down,
+                max_conns,
+                slow_start,
+                recover_at,
                 passive,
                 failures_before_eject: up.failures_before_eject,
                 eject_for: Duration::from_secs(up.eject_secs),
@@ -98,8 +110,6 @@ pub(crate) fn build_pools(cfg: &Config) -> Result<(Pools, Vec<Arc<Pool>>), Error
                 hash_key: parse_request_key(up.hash_key.as_deref()),
                 server_labels,
                 weights,
-                total_weight,
-                weighted,
                 retry_on: RetryOn::parse(&up.retry_on),
                 next: AtomicUsize::new(0),
                 balance: up.balance,

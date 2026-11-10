@@ -7,11 +7,77 @@ use serde::{Deserialize, Serialize};
 
 use super::TlsVersion;
 
+/// A backend entry. A bare string is the common form; a table adds per-server
+/// options without introducing parallel arrays.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ServerConfig {
+    Address(String),
+    Detailed(ServerOptions),
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerOptions {
+    pub address: String,
+
+    /// Use this server only when no primary server is usable.
+    #[serde(default)]
+    pub backup: bool,
+
+    /// Never send traffic here until the operator removes the flag.
+    #[serde(default)]
+    pub down: bool,
+
+    /// Maximum concurrent requests to this server. Zero means no limit.
+    #[serde(default)]
+    pub max_conns: usize,
+
+    /// Ramp traffic up over this many seconds after the server recovers.
+    #[serde(default)]
+    pub slow_start_secs: u64,
+}
+
+impl ServerConfig {
+    pub fn address(&self) -> &str {
+        match self {
+            Self::Address(address) => address,
+            Self::Detailed(options) => &options.address,
+        }
+    }
+
+    pub fn backup(&self) -> bool {
+        matches!(self, Self::Detailed(options) if options.backup)
+    }
+
+    pub fn down(&self) -> bool {
+        matches!(self, Self::Detailed(options) if options.down)
+    }
+
+    pub fn max_conns(&self) -> usize {
+        match self {
+            Self::Address(_) => 0,
+            Self::Detailed(options) => options.max_conns,
+        }
+    }
+
+    pub fn slow_start_secs(&self) -> u64 {
+        match self {
+            Self::Address(_) => 0,
+            Self::Detailed(options) => options.slow_start_secs,
+        }
+    }
+
+    pub fn is_unix(&self) -> bool {
+        self.address().starts_with("unix:")
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Upstream {
     pub name: String,
-    pub servers: Vec<String>,
+    pub servers: Vec<ServerConfig>,
 
     /// Relative weights for `servers`. Empty means every server weighs one.
     #[serde(default)]

@@ -68,6 +68,11 @@ pub(crate) struct Pool {
     pub(crate) servers: Vec<ServerAddr>,
     pub(crate) health: Vec<AtomicBool>,
     pub(crate) active: Vec<AtomicUsize>,
+    pub(crate) backup: Vec<bool>,
+    pub(crate) down: Vec<bool>,
+    pub(crate) max_conns: Vec<usize>,
+    pub(crate) slow_start: Vec<Duration>,
+    pub(crate) recover_at: Vec<AtomicU64>,
     pub(crate) passive: Vec<Passive>,
     pub(crate) failures_before_eject: u32,
     pub(crate) eject_for: Duration,
@@ -75,8 +80,6 @@ pub(crate) struct Pool {
     pub(crate) hash_key: RequestKey,
     pub(crate) server_labels: Vec<String>,
     pub(crate) weights: Vec<u32>,
-    pub(crate) total_weight: u64,
-    pub(crate) weighted: bool,
     pub(crate) retry_on: RetryOn,
     pub(crate) next: AtomicUsize,
     pub(crate) balance: Balance,
@@ -151,132 +154,148 @@ impl Drop for ActiveGuard<'_> {
 }
 
 impl Pool {
-    pub(crate) fn pick(&self) -> usize {
+    pub(crate) fn pick(&self) -> Option<usize> {
         self.pick_key(None)
     }
 
-    pub(crate) fn pick_key(&self, key: Option<&str>) -> usize {
-        let count = self.servers.len();
+    pub(crate) fn pick_key(&self, key: Option<&str>) -> Option<usize> {
         let start = self.next.fetch_add(1, Ordering::Relaxed);
         let now = self.now_ms();
 
         match self.balance {
-            Balance::RoundRobin => self.pick_round_robin(start, now),
-            Balance::LeastConn => {
-                let mut best: Option<(usize, usize, u32)> = None;
+            Balance::RoundRobin => self.pick_round_robin(start as u64, now),
+            Balance::LeastConn => self.pick_least_conn(start, now),
+            Balance::Hash => match key {
+                Some(key) => self.pick_rendezvous(key, now),
+                None => self.pick_round_robin(start as u64, now),
+            },
+            Balance::Random => self.pick_round_robin(splitmix64(start as u64), now),
+        }
+    }
 
-                for offset in 0..count {
-                    let index = (start + offset) % count;
-                    if !self.available(index, now) {
-                        continue;
-                    }
-                    let active = self.active[index].load(Ordering::Relaxed);
-                    let weight = self.weights[index];
-                    let better = match best {
-                        None => true,
-                        Some((_, best_active, best_weight)) => {
-                            (active as u128) * u128::from(best_weight)
-                                < (best_active as u128) * u128::from(weight)
-                        }
-                    };
-                    if better {
-                        best = Some((index, active, weight));
-                    }
+    /// Try healthy servers first, then fall back to any server that is not
+    /// explicitly `down`. A failed health probe or a stale ejection must not
+    /// turn into an outage, but an operator's `down` flag is respected.
+    fn candidate(&self, index: usize, now: u64, fallback: bool) -> bool {
+        let backup_ready =
+            (0..self.servers.len()).any(|other| !self.backup[other] && self.selectable(other, now));
+        if self.down[index] || (self.backup[index] && backup_ready) {
+            return false;
+        }
+        if fallback {
+            return true;
+        }
+        self.selectable(index, now)
+    }
+
+    fn selectable(&self, index: usize, now: u64) -> bool {
+        if self.down[index]
+            || !self.health[index].load(Ordering::Relaxed)
+            || self.passive[index].ejected_until_ms.load(Ordering::Relaxed) > now
+        {
+            return false;
+        }
+        let max = self.max_conns[index];
+        max == 0 || self.active[index].load(Ordering::Relaxed) < max
+    }
+
+    fn pick_least_conn(&self, start: usize, now: u64) -> Option<usize> {
+        let count = self.servers.len();
+        for fallback in [false, true] {
+            let mut best: Option<(usize, usize, u64)> = None;
+            for offset in 0..count {
+                let index = (start + offset) % count;
+                if !self.candidate(index, now, fallback) {
+                    continue;
                 }
-
-                best.map(|(index, _, _)| index).unwrap_or(start % count)
-            }
-            Balance::Hash => {
-                let Some(key) = key else {
-                    return self.pick_round_robin(start, now);
+                let active = self.active[index].load(Ordering::Relaxed);
+                let weight = self.effective_weight(index, now);
+                let better = match best {
+                    None => true,
+                    Some((_, best_active, best_weight)) => {
+                        (active as u128) * u128::from(best_weight)
+                            < (best_active as u128) * u128::from(weight)
+                    }
                 };
-                self.pick_rendezvous(key, now)
+                if better {
+                    best = Some((index, active, weight));
+                }
             }
-            Balance::Random => self.pick_random(start as u64, now),
+            if let Some((index, _, _)) = best {
+                return Some(index);
+            }
         }
+        None
     }
 
-    fn pick_random(&self, seed: u64, now: u64) -> usize {
+    fn pick_round_robin(&self, start: u64, now: u64) -> Option<usize> {
+        for fallback in [false, true] {
+            if let Some(index) = self.pick_weighted(start, now, fallback) {
+                return Some(index);
+            }
+        }
+        None
+    }
+
+    fn pick_weighted(&self, start: u64, now: u64, fallback: bool) -> Option<usize> {
         let count = self.servers.len();
-        let slot = splitmix64(seed);
-        let base = if self.weighted {
-            self.weighted_index(slot % self.total_weight)
-        } else {
-            (slot % count as u64) as usize
-        };
-        for offset in 0..count {
-            let index = (base + offset) % count;
-            if self.available(index, now) {
-                return index;
-            }
+        let total: u64 = (0..count)
+            .filter(|&index| self.candidate(index, now, fallback))
+            .map(|index| self.effective_weight(index, now))
+            .sum();
+        if total == 0 {
+            return None;
         }
-        base
-    }
-
-    fn pick_round_robin(&self, start: usize, now: u64) -> usize {
-        let count = self.servers.len();
-        let base = if self.weighted {
-            self.weighted_index((start as u64) % self.total_weight)
-        } else {
-            start % count
-        };
-        for offset in 0..count {
-            let index = (base + offset) % count;
-            if self.available(index, now) {
-                return index;
+        let mut slot = start % total;
+        for index in 0..count {
+            if !self.candidate(index, now, fallback) {
+                continue;
             }
-        }
-        // Everything looks down. Send traffic anyway: a broken probe or a
-        // stale ejection must not turn into an outage.
-        base
-    }
-
-    fn weighted_index(&self, mut slot: u64) -> usize {
-        for (index, weight) in self.weights.iter().enumerate() {
-            let weight = u64::from(*weight);
+            let weight = self.effective_weight(index, now);
             if slot < weight {
-                return index;
+                return Some(index);
             }
             slot -= weight;
         }
-        0
+        None
     }
 
-    fn pick_rendezvous(&self, key: &str, now: u64) -> usize {
-        let mut best = None;
-        let mut best_score = 0;
-        for index in 0..self.servers.len() {
-            if !self.available(index, now) {
-                continue;
-            }
-            let score = rendezvous(key, &self.server_labels[index]);
-            if best.is_none() || score > best_score {
-                best = Some(index);
-                best_score = score;
-            }
+    /// Weight scaled by an in-progress slow start. A server that just came
+    /// back receives a fraction of its configured weight, and the fraction
+    /// grows until the ramp window closes.
+    fn effective_weight(&self, index: usize, now: u64) -> u64 {
+        let base = u64::from(self.weights[index]);
+        let until = self.recover_at[index].load(Ordering::Relaxed);
+        if until <= now {
+            return base;
         }
-
-        if let Some(index) = best {
-            return index;
+        let window = self.slow_start[index].as_millis() as u64;
+        if window == 0 {
+            return base;
         }
-
-        // All servers are unavailable. Pick the same rendezvous winner anyway
-        // instead of dropping the affinity completely.
-        let mut fallback = 0;
-        let mut fallback_score = 0;
-        for (index, label) in self.server_labels.iter().enumerate() {
-            let score = rendezvous(key, label);
-            if index == 0 || score > fallback_score {
-                fallback = index;
-                fallback_score = score;
-            }
-        }
-        fallback
+        let elapsed = window.saturating_sub(until - now);
+        (base.saturating_mul(elapsed) / window).max(1)
     }
 
-    fn available(&self, index: usize, now_ms: u64) -> bool {
-        self.health[index].load(Ordering::Relaxed)
-            && self.passive[index].ejected_until_ms.load(Ordering::Relaxed) <= now_ms
+    fn pick_rendezvous(&self, key: &str, now: u64) -> Option<usize> {
+        for fallback in [false, true] {
+            let mut best = None;
+            let mut best_score = 0;
+            for index in 0..self.servers.len() {
+                if !self.candidate(index, now, fallback) {
+                    continue;
+                }
+                let score = rendezvous(key, &self.server_labels[index]);
+                if best.is_none() || score > best_score {
+                    best = Some(index);
+                    best_score = score;
+                }
+            }
+            if let Some(index) = best {
+                return Some(index);
+            }
+        }
+        None
     }
 
     pub(crate) fn now_ms(&self) -> u64 {
@@ -287,7 +306,15 @@ impl Pool {
         let passive = &self.passive[index];
         passive.failures.store(0, Ordering::Relaxed);
         if passive.ejected_until_ms.swap(0, Ordering::Relaxed) != 0 {
+            self.start_slow_start(index);
             tracing::info!(upstream = %self.servers[index], "upstream restored after ejection");
+        }
+    }
+
+    fn start_slow_start(&self, index: usize) {
+        let window = self.slow_start[index].as_millis() as u64;
+        if window > 0 {
+            self.recover_at[index].store(self.now_ms().saturating_add(window), Ordering::Relaxed);
         }
     }
 
@@ -306,6 +333,7 @@ impl Pool {
             .now_ms()
             .saturating_add(self.eject_for.as_millis() as u64);
         passive.ejected_until_ms.store(until, Ordering::Relaxed);
+        self.recover_at[index].store(0, Ordering::Relaxed);
         tracing::warn!(
             upstream = %self.servers[index],
             seconds = self.eject_for.as_secs(),
@@ -322,6 +350,9 @@ impl Pool {
 
     pub(crate) fn set_health(&self, index: usize, up: bool) {
         if self.health[index].swap(up, Ordering::Relaxed) != up {
+            if up {
+                self.start_slow_start(index);
+            }
             tracing::warn!(upstream = %self.servers[index], healthy = up, "upstream health changed");
         }
     }

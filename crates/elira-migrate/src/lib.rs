@@ -1564,7 +1564,10 @@ server {
         let config = parse(&migration);
 
         assert_eq!(config.upstreams[0].name, "backend.example:443");
-        assert_eq!(config.upstreams[0].servers, vec!["backend.example:443"]);
+        assert_eq!(
+            config.upstreams[0].servers[0].address(),
+            "backend.example:443"
+        );
         assert!(config.upstreams[0].tls);
         assert!(config.routes[0].strip_prefix);
     }

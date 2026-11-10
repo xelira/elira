@@ -422,6 +422,44 @@ async fn start_full(
 }
 
 /// Send a request with `Connection: close` and read until the server hangs up.
+/// An upstream that answers every request with the same body.
+async fn fixed_upstream(body: &'static str) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fixed upstream");
+    let addr = listener.local_addr().expect("fixed upstream addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let Ok(read) = stream.read(&mut chunk).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        return;
+                    }
+                    head.extend_from_slice(&chunk[..read]);
+                    if head.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    addr
+}
+
 async fn roundtrip(addr: SocketAddr, request: &str) -> String {
     let mut stream = TcpStream::connect(addr).await.expect("connect");
     stream
@@ -4317,6 +4355,50 @@ upstream = "app"
         response.contains("PROXY TCP4 127.0.0.1 127.0.0.1"),
         "PROXY header missing: {response}"
     );
+}
+
+#[tokio::test]
+async fn down_and_backup_servers_are_respected() {
+    let primary = fixed_upstream("primary").await;
+    let backup = fixed_upstream("backup").await;
+    let request = "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
+
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[upstreams]]
+name = "app"
+servers = ["{primary}", {{ address = "{backup}", down = true }}]
+
+[[routes]]
+host = "*"
+upstream = "app"
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+    let response = roundtrip(addr, request).await;
+    assert!(response.ends_with("primary"), "{response}");
+
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[upstreams]]
+name = "app"
+servers = [
+    {{ address = "{primary}", down = true }},
+    {{ address = "{backup}", backup = true }},
+]
+
+[[routes]]
+host = "*"
+upstream = "app"
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+    let response = roundtrip(addr, request).await;
+    assert!(response.ends_with("backup"), "{response}");
 }
 
 /// An upstream that varies its answer by Accept-Language and says so.

@@ -241,6 +241,9 @@ pub enum Error {
     )]
     BadProxyProtocol { name: String },
 
+    #[error("upstream \"{name}\": every server is marked down")]
+    AllServersDown { name: String },
+
     #[error("upstream \"{name}\": dns_ttl_secs must be greater than zero")]
     BadDnsTtl { name: String },
 

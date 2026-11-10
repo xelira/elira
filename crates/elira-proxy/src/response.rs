@@ -206,7 +206,13 @@ impl Proxy {
         let inflight = self.inner.refreshing.clone();
         let max_item = self.inner.cache_max_item;
         tokio::spawn(async move {
-            let index = pool.pick();
+            let Some(index) = pool.pick() else {
+                inflight
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&key);
+                return;
+            };
             let server = pool.servers[index].clone();
             let _active = pool.enter(index);
             let uri = match upstream_uri(&server, &path, pool.scheme) {

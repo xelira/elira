@@ -2136,6 +2136,45 @@ upstream = "app"
 }
 
 #[test]
+fn server_options_are_validated() {
+    let base = r#"
+listen = "127.0.0.1:8080"
+
+[[upstreams]]
+name = "app"
+servers = [
+    "127.0.0.1:9000",
+    { address = "127.0.0.1:9001", backup = true, max_conns = 20, slow_start_secs = 5 },
+]
+
+[[routes]]
+host = "*"
+upstream = "app"
+"#;
+    let cfg = Config::parse(base).expect("valid config");
+    let servers = &cfg.upstreams[0].servers;
+    assert_eq!(servers[0].address(), "127.0.0.1:9000");
+    assert!(!servers[0].backup());
+    assert_eq!(servers[1].address(), "127.0.0.1:9001");
+    assert!(servers[1].backup());
+    assert_eq!(servers[1].max_conns(), 20);
+    assert_eq!(servers[1].slow_start_secs(), 5);
+
+    let all_down = base.replace(
+        "{ address = \"127.0.0.1:9001\", backup = true, max_conns = 20, slow_start_secs = 5 }",
+        "{ address = \"127.0.0.1:9001\", down = true }",
+    );
+    let all_down = all_down.replace(
+        "\"127.0.0.1:9000\",",
+        "{ address = \"127.0.0.1:9000\", down = true },",
+    );
+    assert!(matches!(
+        Config::parse(&all_down),
+        Err(Error::AllServersDown { .. })
+    ));
+}
+
+#[test]
 fn named_locations_are_validated() {
     let base = r#"
 listen = "127.0.0.1:8080"

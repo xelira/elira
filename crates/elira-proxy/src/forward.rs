@@ -383,7 +383,9 @@ impl Proxy {
 
         if let Some(upgrade) = requested_upgrade.clone() {
             let client = client_upgrade.expect("created together with requested_upgrade");
-            let index = pool.pick_key(hash_key.as_deref());
+            let index = pool
+                .pick_key(hash_key.as_deref())
+                .ok_or_else(|| text(StatusCode::BAD_GATEWAY, "no upstream available"))?;
             let server = pool.servers[index].clone();
             let _active = pool.enter(index);
             let uri = upstream_uri(&server, &upstream_path, pool.scheme)
@@ -818,7 +820,9 @@ impl Proxy {
         let mut response = None;
 
         for attempt in 0..attempts {
-            let index = pool.pick_key(hash_key);
+            let index = pool
+                .pick_key(hash_key)
+                .ok_or_else(|| text(StatusCode::BAD_GATEWAY, "no upstream available"))?;
             let server = pool.servers[index].clone();
             let _active = pool.enter(index);
 

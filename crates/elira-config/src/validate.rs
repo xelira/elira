@@ -647,9 +647,7 @@ impl Config {
                     name: up.name.clone(),
                 });
             }
-            if up.proxy_protocol
-                && (up.h3_pool || up.servers.iter().any(|server| server.starts_with("unix:")))
-            {
+            if up.proxy_protocol && (up.h3_pool || up.servers.iter().any(ServerConfig::is_unix)) {
                 return Err(Error::BadProxyProtocol {
                     name: up.name.clone(),
                 });
@@ -682,7 +680,7 @@ impl Config {
                     });
                 }
             }
-            if up.tls && up.servers.iter().any(|addr| addr.starts_with("unix:")) {
+            if up.tls && up.servers.iter().any(ServerConfig::is_unix) {
                 return Err(Error::TlsOverUnix {
                     name: up.name.clone(),
                 });
@@ -711,11 +709,16 @@ impl Config {
                     return Err(Error::BadHealthHost);
                 }
             }
-            for addr in &up.servers {
-                check_server(addr).map_err(|_| Error::BadServer {
+            for server in &up.servers {
+                check_server(server.address()).map_err(|_| Error::BadServer {
                     upstream: up.name.clone(),
-                    addr: addr.clone(),
+                    addr: server.address().to_owned(),
                 })?;
+            }
+            if up.servers.iter().all(ServerConfig::down) {
+                return Err(Error::AllServersDown {
+                    name: up.name.clone(),
+                });
             }
         }
 

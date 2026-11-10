@@ -131,6 +131,8 @@
 - `bind` и `proxy_protocol` для исходящих соединений к upstream'ам.
 - Балансировка `random` и настройка keepalive-пула (`keepalive`,
   `keepalive_secs`).
+- Опции сервера в `servers`: `backup`, `down`, `max_conns` и
+  `slow_start_secs`.
 - `GET /config` на админском листенере: эффективный конфиг в JSON.
 - Тесты FastCGI/CGI на обрезанные заголовки, длину записи, padding и хвост
   после `END_REQUEST`.

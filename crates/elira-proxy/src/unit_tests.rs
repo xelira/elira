@@ -131,6 +131,11 @@ fn least_conn_prefers_the_idle_server() {
         ],
         health: vec![AtomicBool::new(true), AtomicBool::new(true)],
         active: vec![AtomicUsize::new(0), AtomicUsize::new(5)],
+        backup: vec![false, false],
+        down: vec![false, false],
+        max_conns: vec![0, 0],
+        slow_start: vec![Duration::ZERO, Duration::ZERO],
+        recover_at: vec![AtomicU64::new(0), AtomicU64::new(0)],
         passive: vec![
             Passive {
                 failures: AtomicU32::new(0),
@@ -147,8 +152,6 @@ fn least_conn_prefers_the_idle_server() {
         hash_key: RequestKey::Ip,
         server_labels: vec!["127.0.0.1:1".to_owned(), "127.0.0.1:2".to_owned()],
         weights: vec![1, 1],
-        total_weight: 2,
-        weighted: false,
         retry_on: RetryOn::parse(&[]),
         next: AtomicUsize::new(0),
         balance: Balance::LeastConn,
@@ -168,9 +171,9 @@ fn least_conn_prefers_the_idle_server() {
         h3: None,
     };
 
-    assert_eq!(pool.pick(), 0);
+    assert_eq!(pool.pick().expect("server"), 0);
     pool.active[0].store(10, Ordering::Relaxed);
-    assert_eq!(pool.pick(), 1);
+    assert_eq!(pool.pick().expect("server"), 1);
 }
 
 #[test]
@@ -186,6 +189,11 @@ fn weighted_least_conn_compares_active_over_weight() {
         ],
         health: vec![AtomicBool::new(true), AtomicBool::new(true)],
         active: vec![AtomicUsize::new(3), AtomicUsize::new(3)],
+        backup: vec![false, false],
+        down: vec![false, false],
+        max_conns: vec![0, 0],
+        slow_start: vec![Duration::ZERO, Duration::ZERO],
+        recover_at: vec![AtomicU64::new(0), AtomicU64::new(0)],
         passive: vec![
             Passive {
                 failures: AtomicU32::new(0),
@@ -202,8 +210,6 @@ fn weighted_least_conn_compares_active_over_weight() {
         hash_key: RequestKey::Ip,
         server_labels: vec!["127.0.0.1:1".to_owned(), "127.0.0.1:2".to_owned()],
         weights: vec![1, 3],
-        total_weight: 4,
-        weighted: true,
         retry_on: RetryOn::parse(&[]),
         next: AtomicUsize::new(0),
         balance: Balance::LeastConn,
@@ -223,11 +229,11 @@ fn weighted_least_conn_compares_active_over_weight() {
         h3: None,
     };
 
-    assert_eq!(pool.pick(), 1, "3/3 beats 3/1");
+    assert_eq!(pool.pick().expect("server"), 1, "3/3 beats 3/1");
     pool.active[0].store(0, Ordering::Relaxed);
     pool.active[1].store(0, Ordering::Relaxed);
     pool.next.store(0, Ordering::Relaxed);
-    assert_eq!(pool.pick(), 0);
+    assert_eq!(pool.pick().expect("server"), 0);
 }
 
 #[tokio::test]
@@ -290,6 +296,11 @@ fn passive_ejection_skips_a_failing_server_until_the_cooldown() {
         ],
         health: vec![AtomicBool::new(true), AtomicBool::new(true)],
         active: vec![AtomicUsize::new(0), AtomicUsize::new(0)],
+        backup: vec![false, false],
+        down: vec![false, false],
+        max_conns: vec![0, 0],
+        slow_start: vec![Duration::ZERO, Duration::ZERO],
+        recover_at: vec![AtomicU64::new(0), AtomicU64::new(0)],
         passive: vec![
             Passive {
                 failures: AtomicU32::new(0),
@@ -306,8 +317,6 @@ fn passive_ejection_skips_a_failing_server_until_the_cooldown() {
         hash_key: RequestKey::Ip,
         server_labels: vec!["127.0.0.1:1".to_owned(), "127.0.0.1:2".to_owned()],
         weights: vec![1, 1],
-        total_weight: 2,
-        weighted: false,
         retry_on: RetryOn::parse(&[]),
         next: AtomicUsize::new(0),
         balance: Balance::RoundRobin,
@@ -329,16 +338,24 @@ fn passive_ejection_skips_a_failing_server_until_the_cooldown() {
 
     pool.record_failure(0);
     pool.next.store(0, Ordering::Relaxed);
-    assert_eq!(pool.pick(), 0, "one failure must not eject the server");
+    assert_eq!(
+        pool.pick().expect("server"),
+        0,
+        "one failure must not eject the server"
+    );
 
     pool.record_failure(0);
     pool.next.store(0, Ordering::Relaxed);
-    assert_eq!(pool.pick(), 1, "the ejected server is skipped");
+    assert_eq!(
+        pool.pick().expect("server"),
+        1,
+        "the ejected server is skipped"
+    );
 
     // A successful request clears both the counter and the ejection.
     pool.record_success(0);
     pool.next.store(0, Ordering::Relaxed);
-    assert_eq!(pool.pick(), 0);
+    assert_eq!(pool.pick().expect("server"), 0);
 }
 
 #[test]
