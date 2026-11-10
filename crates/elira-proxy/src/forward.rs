@@ -223,53 +223,10 @@ impl Proxy {
             });
         }
 
-        let request_uri = req
-            .uri()
-            .path_and_query()
-            .map(|value| value.as_str().to_owned())
-            .unwrap_or_else(|| "/".to_owned());
-        let request_port = forward_host
-            .rsplit_once(':')
-            .and_then(|(_, port)| port.parse::<u16>().ok())
-            .unwrap_or(if scheme == "https" { 443 } else { 80 });
-        let mut vars = RequestVars {
-            remote_addr: peer.ip(),
-            host: key.clone(),
-            path: req.uri().path().to_owned(),
-            query: req.uri().query().unwrap_or_default().to_owned(),
-            uri: request_uri,
-            method: req.method().to_string(),
-            scheme,
-            port: request_port,
-            request_id: request_id.clone(),
-            headers: req.headers().clone(),
-            mapped: HashMap::new(),
-        };
-        vars.apply_derived(&self.inner.maps, &self.inner.geos, &self.inner.splits);
+        let vars = self.request_vars(&req, &key, &forward_host, scheme, peer, &request_id);
 
-        for condition in &entry.if_conditions {
-            let value = vars
-                .value(&condition.variable)
-                .map(|value| value.into_owned())
-                .unwrap_or_default();
-            let matched = condition
-                .equals
-                .as_ref()
-                .is_some_and(|expected| value == *expected)
-                || condition
-                    .regex
-                    .as_ref()
-                    .is_some_and(|regex| regex.is_match(&value));
-            if matched {
-                return Ok(self.fixed_response(
-                    condition.status,
-                    &condition.body,
-                    condition.content_type.as_deref(),
-                    &vars,
-                    entry,
-                    &request_id,
-                ));
-            }
+        if let Some(response) = self.if_response(entry, &vars, &request_id) {
+            return Ok(response);
         }
 
         if let Some(response) = self.check_access(&req, entry, &vars, peer).await {
@@ -386,57 +343,17 @@ impl Proxy {
                 Method::PUT | Method::DELETE => buffered.is_some(),
                 _ => false,
             };
-        let mut template = HeaderMap::new();
-        let drop = connection_tokens(&parts.headers);
-        for (name, value) in parts.headers.iter() {
-            if hop_by_hop(name, value) || drop.contains(name) || is_client_forwarding(name) {
-                continue;
-            }
-            template.append(name, value.clone());
-        }
-
-        // Everything below is set by us. A client that sent its own copies
-        // had them dropped above.
-        let forwarded_port = forward_host
-            .rsplit_once(':')
-            .and_then(|(_, port)| port.parse::<u16>().ok())
-            .unwrap_or(if scheme == "https" { 443 } else { 80 });
-        let forwarded_for_value = match peer.ip() {
-            std::net::IpAddr::V6(ip) => format!("\"[{ip}]\""),
-            std::net::IpAddr::V4(ip) => ip.to_string(),
-        };
-        let forwarded = format!("for={forwarded_for_value};proto={scheme};host=\"{forward_host}\"");
-        template.insert(HOST, header(&forward_host));
-        template.insert("x-forwarded-for", header(&forwarded_for));
-        template.insert("x-forwarded-proto", HeaderValue::from_static(scheme));
-        template.insert("x-forwarded-host", header(&forward_host));
-        template.insert(
-            "x-forwarded-port",
-            HeaderValue::from_str(&forwarded_port.to_string())
-                .unwrap_or_else(|_| HeaderValue::from_static("80")),
+        let template = self.upstream_template(
+            &parts.headers,
+            entry,
+            &vars,
+            &forward_host,
+            &forwarded_for,
+            scheme,
+            &request_id,
+            peer,
+            requested_upgrade.as_ref(),
         );
-        if let Ok(value) = HeaderValue::from_str(&forwarded) {
-            template.insert("forwarded", value);
-        }
-        template.insert("via", HeaderValue::from_static("1.1 elira"));
-        if let Ok(value) = HeaderValue::from_str(&request_id) {
-            template.insert("x-request-id", value);
-        }
-
-        // Upgrade is hop-by-hop, but dropping it would break websockets.
-        if let Some(upgrade) = &requested_upgrade {
-            template.insert(CONNECTION, HeaderValue::from_static("upgrade"));
-            template.insert(UPGRADE, upgrade.clone());
-        }
-
-        for name in &entry.request_remove_headers {
-            template.remove(name);
-        }
-        for (name, value) in &entry.request_headers {
-            if let Ok(value) = HeaderValue::from_str(&vars.render(value)) {
-                template.insert(name.clone(), value);
-            }
-        }
 
         let route_timeout = entry.timeout.unwrap_or(self.inner.timeout);
 
@@ -534,6 +451,144 @@ impl Proxy {
             proxy_permit,
         )
         .await
+    }
+
+    fn request_vars(
+        &self,
+        req: &Request<Body>,
+        key: &str,
+        forward_host: &str,
+        scheme: &'static str,
+        peer: SocketAddr,
+        request_id: &str,
+    ) -> RequestVars {
+        let request_uri = req
+            .uri()
+            .path_and_query()
+            .map(|value| value.as_str().to_owned())
+            .unwrap_or_else(|| "/".to_owned());
+        let request_port = forward_host
+            .rsplit_once(':')
+            .and_then(|(_, port)| port.parse::<u16>().ok())
+            .unwrap_or(if scheme == "https" { 443 } else { 80 });
+        let mut vars = RequestVars {
+            remote_addr: peer.ip(),
+            host: key.to_owned(),
+            path: req.uri().path().to_owned(),
+            query: req.uri().query().unwrap_or_default().to_owned(),
+            uri: request_uri,
+            method: req.method().to_string(),
+            scheme,
+            port: request_port,
+            request_id: request_id.to_owned(),
+            headers: req.headers().clone(),
+            mapped: HashMap::new(),
+        };
+        vars.apply_derived(&self.inner.maps, &self.inner.geos, &self.inner.splits);
+
+        vars
+    }
+
+    fn if_response(
+        &self,
+        entry: &RouteEntry,
+        vars: &RequestVars,
+        request_id: &str,
+    ) -> Option<Response<Body>> {
+        for condition in &entry.if_conditions {
+            let value = vars
+                .value(&condition.variable)
+                .map(|value| value.into_owned())
+                .unwrap_or_default();
+            let matched = condition
+                .equals
+                .as_ref()
+                .is_some_and(|expected| value == *expected)
+                || condition
+                    .regex
+                    .as_ref()
+                    .is_some_and(|regex| regex.is_match(&value));
+            if matched {
+                return Some(self.fixed_response(
+                    condition.status,
+                    &condition.body,
+                    condition.content_type.as_deref(),
+                    vars,
+                    entry,
+                    request_id,
+                ));
+            }
+        }
+
+        None
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn upstream_template(
+        &self,
+        headers: &HeaderMap,
+        entry: &RouteEntry,
+        vars: &RequestVars,
+        forward_host: &str,
+        forwarded_for: &str,
+        scheme: &'static str,
+        request_id: &str,
+        peer: SocketAddr,
+        requested_upgrade: Option<&HeaderValue>,
+    ) -> HeaderMap {
+        let mut template = HeaderMap::new();
+        let drop = connection_tokens(headers);
+        for (name, value) in headers.iter() {
+            if hop_by_hop(name, value) || drop.contains(name) || is_client_forwarding(name) {
+                continue;
+            }
+            template.append(name, value.clone());
+        }
+
+        // Everything below is set by us. A client that sent its own copies
+        // had them dropped above.
+        let forwarded_port = forward_host
+            .rsplit_once(':')
+            .and_then(|(_, port)| port.parse::<u16>().ok())
+            .unwrap_or(if scheme == "https" { 443 } else { 80 });
+        let forwarded_for_value = match peer.ip() {
+            std::net::IpAddr::V6(ip) => format!("\"[{ip}]\""),
+            std::net::IpAddr::V4(ip) => ip.to_string(),
+        };
+        let forwarded = format!("for={forwarded_for_value};proto={scheme};host=\"{forward_host}\"");
+        template.insert(HOST, header(forward_host));
+        template.insert("x-forwarded-for", header(forwarded_for));
+        template.insert("x-forwarded-proto", HeaderValue::from_static(scheme));
+        template.insert("x-forwarded-host", header(forward_host));
+        template.insert(
+            "x-forwarded-port",
+            HeaderValue::from_str(&forwarded_port.to_string())
+                .unwrap_or_else(|_| HeaderValue::from_static("80")),
+        );
+        if let Ok(value) = HeaderValue::from_str(&forwarded) {
+            template.insert("forwarded", value);
+        }
+        template.insert("via", HeaderValue::from_static("1.1 elira"));
+        if let Ok(value) = HeaderValue::from_str(request_id) {
+            template.insert("x-request-id", value);
+        }
+
+        // Upgrade is hop-by-hop, but dropping it would break websockets.
+        if let Some(upgrade) = &requested_upgrade {
+            template.insert(CONNECTION, HeaderValue::from_static("upgrade"));
+            template.insert(UPGRADE, (*upgrade).clone());
+        }
+
+        for name in &entry.request_remove_headers {
+            template.remove(name);
+        }
+        for (name, value) in &entry.request_headers {
+            if let Ok(value) = HeaderValue::from_str(&vars.render(value)) {
+                template.insert(name.clone(), value);
+            }
+        }
+
+        template
     }
 
     /// Look up a cached representation, including the stale path. Returns the
