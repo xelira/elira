@@ -646,6 +646,57 @@ fn temp_root(label: &str) -> std::path::PathBuf {
 }
 
 #[tokio::test]
+async fn try_files_reaches_a_named_location_and_internal_stays_hidden() {
+    let root = temp_root("named");
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[routes]]
+host = "example.com"
+path = "/app"
+root = "{}"
+try_files = ["$uri", "@fallback"]
+
+[[routes]]
+host = "example.com"
+name = "@fallback"
+return = {{ status = 200, body = "fallback" }}
+
+[[routes]]
+host = "example.com"
+path = "/internal"
+internal = true
+return = {{ status = 200, body = "secret" }}
+"#,
+        root.display()
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let fallback = roundtrip(
+        addr,
+        "GET /app/missing HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&fallback), "HTTP/1.1 200 OK", "{fallback}");
+    assert!(fallback.ends_with("fallback"), "{fallback}");
+
+    let hidden = roundtrip(
+        addr,
+        "GET /internal HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&hidden), "HTTP/1.1 404 Not Found", "{hidden}");
+
+    let by_name = roundtrip(
+        addr,
+        "GET /@fallback HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&by_name), "HTTP/1.1 404 Not Found", "{by_name}");
+}
+
+#[tokio::test]
 async fn serves_files_with_ranges_and_conditionals() {
     let root = temp_root("files");
     std::fs::write(root.join("index.html"), "<h1>index</h1>").unwrap();

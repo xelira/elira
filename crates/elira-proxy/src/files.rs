@@ -30,6 +30,7 @@ pub(crate) struct Files {
     index: Vec<String>,
     spa: bool,
     try_files: Vec<String>,
+    fallback_name: Option<String>,
     autoindex: bool,
     compress: bool,
     min_bytes: u64,
@@ -51,12 +52,19 @@ impl Files {
         expires: Option<u64>,
         etag: bool,
     ) -> Self {
+        let mut try_files = try_files;
+        let fallback_name = if try_files.last().is_some_and(|name| name.starts_with('@')) {
+            try_files.pop()
+        } else {
+            None
+        };
         Self {
             root,
             prefix,
             index,
             spa,
             try_files,
+            fallback_name,
             autoindex,
             compress,
             min_bytes: min_bytes as u64,
@@ -138,6 +146,13 @@ impl Files {
         }
 
         let Some(meta) = meta else {
+            if let Some(name) = &self.fallback_name {
+                let mut response = text(StatusCode::NOT_FOUND, "internal redirect");
+                response
+                    .extensions_mut()
+                    .insert(crate::InternalTarget(name.clone()));
+                return response;
+            }
             return self.fallback(&root, req).await;
         };
 

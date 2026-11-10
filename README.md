@@ -195,6 +195,8 @@ Routing:
   `match = "exact"`, `no_regex` and `path_regex` with nginx ordering
 - nested `[[routes.locations]]` with combined paths, inherited targets and
   regex children gated by the parent prefix
+- named `@locations` reached from `try_files`, plus `internal` routes hidden
+  from direct requests
 - `strip_prefix`, redirect routes, fixed `return` responses, regex `rewrites`,
   `map`/`geo`/`split` variables, conditional `if` returns, `try_files`,
   SPA fallback, directory listings

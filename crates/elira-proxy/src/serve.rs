@@ -104,11 +104,12 @@ impl Proxy {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn serve_non_proxy(
         &self,
-        req: Request<Body>,
+        mut req: Request<Body>,
         entry: &RouteEntry,
         vars: &RequestVars,
         peer: SocketAddr,
         scheme: &'static str,
+        listener: &str,
         request_id: &str,
         body_limit_hit: &AtomicBool,
     ) -> Result<Response<Body>, Response<Body>> {
@@ -116,6 +117,18 @@ impl Proxy {
             Target::Proxy(_) => unreachable!("proxy targets are served by forward"),
             Target::Files(files) => {
                 let mut response = files.serve(&req, peer).await;
+                if let Some(target) = response.extensions_mut().remove::<InternalTarget>() {
+                    let count = req
+                        .extensions()
+                        .get::<InternalRequest>()
+                        .map(|internal| internal.count)
+                        .unwrap_or(0);
+                    req.extensions_mut().insert(InternalRequest {
+                        name: Some(target.0),
+                        count: count.saturating_add(1),
+                    });
+                    return Box::pin(self.forward(req, peer, scheme, listener)).await;
+                }
                 response.extensions_mut().insert(Labels {
                     route: entry.label.clone(),
                     upstream: None,

@@ -326,16 +326,21 @@ pub(crate) fn build_route(
         .collect::<Result<Vec<_>, Error>>()?;
 
     let entry = RouteEntry {
-        label: format!(
-            "{}{}",
-            route.host,
-            route
-                .path
-                .as_deref()
-                .or(route.path_regex.as_deref())
-                .unwrap_or_default()
-        ),
+        label: match &route.name {
+            Some(name) => format!("{}{name}", route.host),
+            None => format!(
+                "{}{}",
+                route.host,
+                route
+                    .path
+                    .as_deref()
+                    .or(route.path_regex.as_deref())
+                    .unwrap_or_default()
+            ),
+        },
         host: route.host.trim().to_ascii_lowercase(),
+        name: route.name.clone(),
+        internal: route.internal,
         prefix: route
             .path
             .clone()

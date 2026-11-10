@@ -79,6 +79,17 @@ pub struct Labels {
 /// Marks a response whose body already came from an error page.
 #[derive(Clone, Copy)]
 struct ErrorPageApplied;
+
+/// A static response asking the proxy to route to a named location.
+#[derive(Clone, Debug)]
+pub(crate) struct InternalTarget(pub(crate) String);
+
+/// Present on a request that is already inside an internal redirect.
+#[derive(Clone, Debug)]
+pub(crate) struct InternalRequest {
+    pub(crate) name: Option<String>,
+    pub(crate) count: u8,
+}
 pub type Body = BoxBody<Bytes, BoxError>;
 
 #[derive(Clone)]
@@ -179,6 +190,8 @@ struct RouteEntry {
     label: String,
     host: String,
     prefix: String,
+    name: Option<String>,
+    internal: bool,
     exact: bool,
     no_regex: bool,
     regex: Option<regex::Regex>,
@@ -274,20 +287,21 @@ impl Router {
         for list in lists {
             if let Some(entry) = list
                 .iter()
-                .find(|entry| entry.exact && entry.prefix == path)
+                .find(|entry| entry.name.is_none() && entry.exact && entry.prefix == path)
             {
                 return Some(entry);
             }
-            let prefix = list
-                .iter()
-                .find(|entry| entry.regex.is_none() && path_matches(&entry.prefix, path));
+            let prefix = list.iter().find(|entry| {
+                entry.name.is_none() && entry.regex.is_none() && path_matches(&entry.prefix, path)
+            });
             if let Some(entry) = prefix {
                 if entry.no_regex {
                     return Some(entry);
                 }
             }
             if let Some(entry) = list.iter().find(|entry| {
-                path_matches(&entry.prefix, path)
+                entry.name.is_none()
+                    && path_matches(&entry.prefix, path)
                     && entry
                         .regex
                         .as_ref()
@@ -301,6 +315,26 @@ impl Router {
         }
 
         None
+    }
+
+    fn pick_named(&self, host: &str, name: &str) -> Option<&RouteEntry> {
+        let mut lists: Vec<&Vec<RouteEntry>> = Vec::with_capacity(3);
+        if let Some(list) = self.exact.get(host) {
+            lists.push(list);
+        }
+        if let Some((_, list)) = self
+            .wildcard
+            .iter()
+            .find(|(suffix, _)| host.ends_with(suffix.as_str()))
+        {
+            lists.push(list);
+        }
+        lists.push(&self.default);
+
+        lists
+            .into_iter()
+            .flatten()
+            .find(|entry| entry.name.as_deref() == Some(name))
     }
 }
 

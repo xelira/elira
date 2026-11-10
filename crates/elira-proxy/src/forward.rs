@@ -195,10 +195,33 @@ impl Proxy {
             self.apply_rewrites(&mut req)?;
         }
 
-        let entry = self
-            .router(listener)
-            .pick(&key, req.uri().path())
-            .ok_or_else(|| text(StatusCode::NOT_FOUND, "no route"))?;
+        let internal = req.extensions_mut().remove::<InternalRequest>();
+        if internal
+            .as_ref()
+            .is_some_and(|internal| internal.count > 10)
+        {
+            return Err(text(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal redirect loop",
+            ));
+        }
+        let entry = match internal
+            .as_ref()
+            .and_then(|internal| internal.name.as_deref())
+        {
+            Some(name) => self.router(listener).pick_named(&key, name),
+            None => self.router(listener).pick(&key, req.uri().path()),
+        }
+        .ok_or_else(|| text(StatusCode::NOT_FOUND, "no route"))?;
+        if entry.internal && internal.is_none() {
+            return Err(text(StatusCode::NOT_FOUND, "no route"));
+        }
+        if let Some(internal) = internal {
+            req.extensions_mut().insert(InternalRequest {
+                name: None,
+                count: internal.count,
+            });
+        }
 
         let request_uri = req
             .uri()
@@ -317,6 +340,7 @@ impl Proxy {
                         &vars,
                         peer,
                         scheme,
+                        listener,
                         &request_id,
                         &body_limit_hit,
                     )

@@ -165,6 +165,7 @@
 - `[[geos]]`, `[[splits]]` и route-level `if` с `return`.
 - `match = "exact"` и `no_regex` (`location =` и `^~`).
 - `[[routes.locations]]`: вложенные location с наследованием цели и пути.
+- `name = "@fallback"` и `internal` для внутренних переходов из `try_files`.
 - `Cache-Control: must-revalidate` запрещает stale-выдачу; `Expires`/`Date`
   задают TTL, если `max-age` нет. Запросы с `no-cache`/`no-store` обходят кэш.
 - Заголовки `Forwarded` и `X-Forwarded-Port` к upstream.

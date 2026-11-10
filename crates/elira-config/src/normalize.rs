@@ -213,6 +213,8 @@ mod tests {
             path: Some(path.to_owned()),
             locations: Vec::new(),
             regex_prefix: None,
+            name: None,
+            internal: false,
             match_type: RouteMatch::Prefix,
             no_regex: false,
             path_regex: None,

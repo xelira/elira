@@ -647,11 +647,24 @@ impl Config {
             }
         }
 
+        let named_names: HashSet<&str> = self
+            .routes
+            .iter()
+            .filter_map(|route| route.name.as_deref())
+            .collect();
         let mut seen = HashSet::new();
         for (index, route) in self.routes.iter().enumerate() {
             let host = route.host.trim().to_ascii_lowercase();
             if host.is_empty() {
                 return Err(Error::EmptyRouteHost { index });
+            }
+            if let Some(name) = &route.name {
+                if !is_location_name(name) {
+                    return Err(Error::BadLocationName { index });
+                }
+                if route.path.is_some() || route.path_regex.is_some() {
+                    return Err(Error::NamedLocationPath { index });
+                }
             }
             for name in &route.listeners {
                 if !listener_names.contains(name) {
@@ -664,11 +677,14 @@ impl Config {
 
             // The same host may appear several times with different paths;
             // only an identical pair is ambiguous.
-            let mut discriminator = route
-                .path
-                .clone()
-                .or_else(|| route.path_regex.clone())
-                .unwrap_or_default();
+            let mut discriminator = match &route.name {
+                Some(name) => format!("name|{name}"),
+                None => route
+                    .path
+                    .clone()
+                    .or_else(|| route.path_regex.clone())
+                    .unwrap_or_default(),
+            };
             if let Some(prefix) = &route.regex_prefix {
                 discriminator = format!("{prefix}|{discriminator}");
             }
@@ -940,6 +956,14 @@ impl Config {
                     });
                 }
             }
+            if let Some(name) = route.try_files.last().filter(|name| name.starts_with('@')) {
+                if !named_names.contains(name.as_str()) {
+                    return Err(Error::UnknownNamedLocation {
+                        index,
+                        name: name.clone(),
+                    });
+                }
+            }
 
             if let Some(upstream) = &route.upstream {
                 if !names.contains(upstream.as_str()) {
@@ -1074,6 +1098,15 @@ fn parse_param(value: &str) -> Option<(String, String)> {
         return None;
     }
     Some((name.to_owned(), value.trim().to_owned()))
+}
+
+fn is_location_name(name: &str) -> bool {
+    name.strip_prefix('@').is_some_and(|rest| {
+        !rest.is_empty()
+            && rest
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+    })
 }
 
 /// Host name without wildcards: letters, digits, dots, hyphens, underscores.

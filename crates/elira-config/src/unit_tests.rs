@@ -1576,6 +1576,54 @@ return = { status = 200, body = "child" }
 }
 
 #[test]
+fn named_locations_are_validated() {
+    let base = r#"
+listen = "127.0.0.1:8080"
+
+[[routes]]
+host = "example.com"
+path = "/app"
+root = "/srv/app"
+try_files = ["$uri", "@fallback"]
+
+[[routes]]
+host = "example.com"
+name = "@fallback"
+return = { status = 200, body = "fallback" }
+"#;
+    let cfg = Config::parse(base).expect("valid");
+    assert_eq!(cfg.routes[1].name.as_deref(), Some("@fallback"));
+
+    let with_path = base.replace(
+        "name = \"@fallback\"",
+        "name = \"@fallback\"\npath = \"/other\"",
+    );
+    assert!(matches!(
+        Config::parse(&with_path),
+        Err(Error::NamedLocationPath { .. })
+    ));
+
+    let bad_name = r#"
+listen = "127.0.0.1:8080"
+
+[[routes]]
+host = "example.com"
+name = "fallback"
+return = { status = 200, body = "bad" }
+"#;
+    assert!(matches!(
+        Config::parse(bad_name),
+        Err(Error::BadLocationName { .. })
+    ));
+
+    let unknown = base.replace("@fallback\"]", "@missing\"]");
+    assert!(matches!(
+        Config::parse(&unknown),
+        Err(Error::UnknownNamedLocation { .. })
+    ));
+}
+
+#[test]
 fn route_match_modes_are_validated() {
     let base = r#"
 listen = "127.0.0.1:8080"

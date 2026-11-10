@@ -486,4 +486,13 @@ pub enum Error {
 
     #[error("nested location needs a path or path_regex under a literal parent prefix")]
     BadNestedLocation,
+
+    #[error("route {index}: named location must look like `@name`")]
+    BadLocationName { index: usize },
+
+    #[error("route {index}: a named location cannot have path or path_regex")]
+    NamedLocationPath { index: usize },
+
+    #[error("route {index}: try_files refers to unknown named location {name:?}")]
+    UnknownNamedLocation { index: usize, name: String },
 }

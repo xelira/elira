@@ -669,6 +669,16 @@ pub struct Route {
     #[serde(skip)]
     pub regex_prefix: Option<String>,
 
+    /// Named location such as `@fallback`. Named locations are never matched
+    /// by URL; `try_files` reaches them through an internal redirect.
+    #[serde(default)]
+    pub name: Option<String>,
+
+    /// Only serve this route after an internal redirect. Direct requests get
+    /// a 404.
+    #[serde(default)]
+    pub internal: bool,
+
     /// `prefix` (default) or `exact`, like `location = /path`.
     #[serde(default, rename = "match")]
     pub match_type: RouteMatch,
