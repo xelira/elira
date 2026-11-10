@@ -180,8 +180,8 @@ Living list for the self-improvement loop. One item per session.
 - [ ] Per-route `limit_conn` zones.
 - [ ] `limit_req` delay/nodelay semantics on top of the token bucket.
 - [x] `keepalive_requests` per connection.
-- [ ] Configurable `client_header_timeout`, `lingering_close`,
-  `reset_timedout_connection`.
+- [x] Configurable `client_header_timeout`.
+- [ ] `lingering_close` and `reset_timedout_connection`.
 - [x] Log reopen on SIGUSR1 for external rotation.
 - [ ] `open_file_cache`.
 - [ ] `worker_rlimit_nofile` propagation tuning and `worker_processes auto`.

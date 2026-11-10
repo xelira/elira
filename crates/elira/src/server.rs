@@ -255,6 +255,7 @@ pub struct Options {
     pub max_buf_size: usize,
     pub idle_timeout: Duration,
     pub keepalive_requests: usize,
+    pub client_header_timeout: Option<Duration>,
     pub proxy_protocol: bool,
     pub sendfile: bool,
     pub h2c: bool,
@@ -280,6 +281,10 @@ impl Options {
             max_buf_size: cfg.limits.max_header_bytes,
             idle_timeout: Duration::from_secs(cfg.limits.idle_timeout_secs),
             keepalive_requests: cfg.limits.keepalive_requests,
+            client_header_timeout: match cfg.limits.client_header_timeout_secs {
+                0 => None,
+                secs => Some(Duration::from_secs(secs)),
+            },
             proxy_protocol: cfg.proxy_protocol,
             sendfile: cfg.sendfile,
             h2c: cfg.h2c,
@@ -458,6 +463,7 @@ pub async fn serve_unix(
                     max_buf_size: options.max_buf_size,
                     idle_timeout: options.idle_timeout,
                     keepalive_requests: options.keepalive_requests,
+                    client_header_timeout: options.client_header_timeout,
                     body_timeout: options.body_timeout,
                     drain_timeout: options.drain_timeout,
                     h2: false,
@@ -592,6 +598,7 @@ struct ConnOptions {
     max_buf_size: usize,
     idle_timeout: Duration,
     keepalive_requests: usize,
+    client_header_timeout: Option<Duration>,
     body_timeout: Option<Duration>,
     drain_timeout: Duration,
     h2: bool,
@@ -632,6 +639,7 @@ async fn serve_stream(
         max_buf_size: options.max_buf_size,
         idle_timeout: options.idle_timeout,
         keepalive_requests: options.keepalive_requests,
+        client_header_timeout: options.client_header_timeout,
         body_timeout: options.body_timeout,
         drain_timeout: options.drain_timeout,
         h2: false,
@@ -984,7 +992,7 @@ async fn serve_conn<I>(
     } else {
         let conn = http1::Builder::new()
             .timer(TokioTimer::new())
-            .header_read_timeout(Some(Duration::from_secs(30)))
+            .header_read_timeout(opts.client_header_timeout)
             .max_headers(opts.max_headers)
             .max_buf_size(opts.max_buf_size)
             .serve_connection(TokioIo::new(io), service)

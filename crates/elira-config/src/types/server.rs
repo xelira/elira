@@ -115,6 +115,11 @@ pub struct Limits {
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
 
+    /// Abort a client that stops sending request headers for this long. Zero
+    /// disables the check.
+    #[serde(default = "Limits::default_client_header_timeout_secs")]
+    pub client_header_timeout_secs: u64,
+
     /// Abort a client that stops sending a request body for this long. Zero
     /// disables the check.
     #[serde(default = "Limits::default_body_timeout_secs")]
@@ -243,6 +248,7 @@ impl Default for Limits {
             burst: 0,
             trusted_proxies: Vec::new(),
             request_body_timeout_secs: Self::default_body_timeout_secs(),
+            client_header_timeout_secs: Self::default_client_header_timeout_secs(),
             upstream_body_timeout_secs: Self::default_body_timeout_secs(),
             websocket_idle_secs: Self::default_websocket_idle_secs(),
             connection_drain_secs: Self::default_drain_timeout_secs(),
@@ -290,6 +296,10 @@ impl Limits {
     }
 
     fn default_body_timeout_secs() -> u64 {
+        30
+    }
+
+    fn default_client_header_timeout_secs() -> u64 {
         30
     }
 

@@ -191,6 +191,7 @@ upstream. Нужен `error_root`; задавать их можно только
 | `burst` | целое ≥ 0 | `0` | запас токенов; `0` — равен `requests_per_second` |
 | `trusted_proxies` | список CIDR | `[]` | кому разрешено дополнять `X-Forwarded-For` |
 | `request_body_timeout_secs` | целое, секунды | `30` | закрыть клиента, который перестал присылать тело; `0` выключает |
+| `client_header_timeout_secs` | целое, секунды | `30` | закрыть клиента, который не прислал заголовки; `0` выключает |
 | `upstream_body_timeout_secs` | целое, секунды | `30` | прервать upstream, который перестал отдавать тело |
 | `websocket_idle_secs` | целое, секунды | `3600` | закрыть websocket/CONNECT после простоя; `0` выключает |
 | `max_response_bytes` | целое > 0 | `67108864` | предел потокового ответа FastCGI/CGI |
