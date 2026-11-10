@@ -848,6 +848,73 @@ root = "{}"
     assert!(response.1.contains("legacy-ok"), "{response:?}");
 }
 
+#[tokio::test]
+async fn openssl_backend_selects_sni_certificates() {
+    use openssl::nid::Nid;
+    use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
+    use rcgen::{CertificateParams, DnType, KeyPair};
+
+    let fixtures =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../elira-tls/tests/fixtures");
+    let root = temp_root("openssl-sni");
+    std::fs::write(root.join("index.html"), "sni-ok").unwrap();
+
+    let key = KeyPair::generate().expect("key");
+    let mut params = CertificateParams::new(vec!["other.local".to_owned()]).expect("params");
+    params
+        .distinguished_name
+        .push(DnType::CommonName, "other.local");
+    let cert = params.self_signed(&key).expect("cert");
+    std::fs::write(root.join("other.pem"), cert.pem()).unwrap();
+    std::fs::write(root.join("other.key"), key.serialize_pem()).unwrap();
+
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[tls]
+cert = "{}"
+key = "{}"
+backend = "openssl"
+
+[[tls.certificates]]
+cert = "{}"
+key = "{}"
+names = ["other.local"]
+
+[[routes]]
+host = "*"
+root = "{}"
+"#,
+        fixtures.join("cert.pem").display(),
+        fixtures.join("key.pem").display(),
+        root.join("other.pem").display(),
+        root.join("other.key").display(),
+        root.display()
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let common_name = tokio::task::spawn_blocking(move || {
+        let mut builder = SslConnector::builder(SslMethod::tls_client()).expect("client");
+        builder.set_verify(SslVerifyMode::NONE);
+        let connector = builder.build();
+        let tcp = std::net::TcpStream::connect(addr).expect("connect");
+        let mut stream = connector.connect("other.local", tcp).expect("handshake");
+        let certificate = stream.ssl().peer_certificate().expect("peer cert");
+        certificate
+            .subject_name()
+            .entries_by_nid(Nid::COMMONNAME)
+            .next()
+            .and_then(|entry| entry.data().as_utf8().ok())
+            .map(|value| value.to_string())
+            .unwrap_or_default()
+    })
+    .await
+    .expect("client task");
+
+    assert_eq!(common_name, "other.local");
+}
+
 fn temp_root(label: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static NEXT: AtomicUsize = AtomicUsize::new(0);
