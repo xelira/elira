@@ -82,6 +82,8 @@ pub struct Labels {
     pub upstream: Option<String>,
     pub access_log: bool,
     pub access_log_sample: f64,
+    /// Values from `map`/`geo`/`split_clients`, for access-log templates.
+    pub mapped: HashMap<String, String>,
 }
 
 /// Per-request upstream details for access logs and admin output.

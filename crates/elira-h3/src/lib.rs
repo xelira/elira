@@ -484,6 +484,7 @@ where
         .unwrap_or(true);
     let mut upstream = None;
     let mut log_sample = 1.0;
+    let mut log_vars = std::collections::HashMap::new();
     if let Some(labels) = response.extensions().get::<elira_proxy::Labels>().cloned() {
         metrics.record_route(&labels.route, status_code, elapsed);
         if let Some(name) = &labels.upstream {
@@ -491,6 +492,7 @@ where
         }
         upstream = labels.upstream;
         log_sample = labels.access_log_sample;
+        log_vars = labels.mapped;
     }
     let (upstream_addr, upstream_status, upstream_time) = match response
         .extensions()
@@ -560,6 +562,7 @@ where
         upstream_addr,
         upstream_status,
         upstream_time,
+        variables: log_vars,
     };
     if write_log {
         log(&entry);

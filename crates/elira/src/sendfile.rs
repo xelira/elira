@@ -265,6 +265,7 @@ pub(crate) async fn try_serve(
         upstream_addr: None,
         upstream_status: None,
         upstream_time: None,
+        variables: std::collections::HashMap::new(),
     };
 
     metrics.observe(status.as_u16(), started.elapsed());

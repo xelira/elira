@@ -797,6 +797,7 @@ impl Proxy {
                         upstream: Some(pool.name.clone()),
                         access_log: entry.access_log,
                         access_log_sample: entry.access_log_sample,
+                        mapped: vars.mapped.clone(),
                     });
                     if stale {
                         self.refresh(
@@ -1051,6 +1052,7 @@ impl Proxy {
                 upstream: Some(pool.name.clone()),
                 access_log: entry.access_log,
                 access_log_sample: entry.access_log_sample,
+                mapped: vars.mapped.clone(),
             });
             if let Some(info) = upstream_info.clone() {
                 response.extensions_mut().insert(info);
@@ -1272,6 +1274,7 @@ impl Proxy {
             upstream: Some(pool.name.clone()),
             access_log: entry.access_log,
             access_log_sample: entry.access_log_sample,
+            mapped: vars.mapped.clone(),
         });
         if let Some(info) = upstream_info {
             response.extensions_mut().insert(info);

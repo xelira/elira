@@ -567,7 +567,8 @@ HTTP/3 живёт на отдельном UDP-порту и не делит со
 `$http_user_agent`, `$http_referer`, `$request_time`, `$request_id`,
 `$upstream`, `$upstream_addr`, `$upstream_status`, `$upstream_response_time`,
 `$time_iso8601` и `$time_local`. Неизвестная переменная — ошибка загрузки,
-литеральный доллар пишется как `$$`. Время сейчас всегда UTC.
+литеральный доллар пишется как `$$`. Время сейчас всегда UTC. Имена из
+`[[maps]]`, `[[geos]]` и `[[splits]]` тоже доступны как `$name`.
 
 ## `[health]`
 

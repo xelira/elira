@@ -15,6 +15,7 @@
 //! convert to the machine's local time zone. Log consumers that need local
 //! time can convert the UTC timestamp themselves.
 
+use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Write};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -41,6 +42,8 @@ pub struct Entry {
     pub upstream_status: Option<u16>,
     /// Time spent waiting for that attempt.
     pub upstream_time: Option<Duration>,
+    /// Values produced by `map`, `geo` and `split_clients` for this request.
+    pub variables: HashMap<String, String>,
 }
 
 impl Entry {
@@ -181,7 +184,7 @@ enum Part {
     Variable(Variable),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Variable {
     RemoteAddr,
     RemotePort,
@@ -202,9 +205,14 @@ enum Variable {
     RequestId,
     TimeIso8601,
     TimeLocal,
+    Extra(String),
 }
 
 impl Variable {
+    fn from_name_with(name: &str, extra: &HashSet<String>) -> Option<Self> {
+        Self::from_name(name).or_else(|| extra.contains(name).then(|| Self::Extra(name.to_owned())))
+    }
+
     fn from_name(name: &str) -> Option<Self> {
         Some(match name {
             "remote_addr" => Self::RemoteAddr,
@@ -230,7 +238,7 @@ impl Variable {
         })
     }
 
-    fn render(self, entry: &Entry, now: SystemTime, out: &mut String) {
+    fn render(&self, entry: &Entry, now: SystemTime, out: &mut String) {
         match self {
             Self::RemoteAddr => {
                 let _ = write!(out, "{}", entry.peer);
@@ -296,6 +304,10 @@ impl Variable {
             Self::RequestId => escape_line(&entry.request_id, out),
             Self::TimeIso8601 => out.push_str(&format_time_iso8601(now)),
             Self::TimeLocal => out.push_str(&format_time_local(now)),
+            Self::Extra(name) => match entry.variables.get(name) {
+                Some(value) => escape_line(value, out),
+                None => out.push('-'),
+            },
         }
     }
 }
@@ -312,6 +324,13 @@ impl Format {
     /// places. `$time_iso8601` and `$time_local` use UTC; see the crate
     /// documentation for why `$time_local` is not actually local.
     pub fn parse(template: &str) -> Result<Self, Error> {
+        Self::parse_with(template, &HashSet::new())
+    }
+
+    /// Parse a template that may also reference names produced by
+    /// `map`/`geo`/`split_clients`. Those values are read from
+    /// [`Entry::variables`].
+    pub fn parse_with(template: &str, extra: &HashSet<String>) -> Result<Self, Error> {
         let mut parts = Vec::new();
         let mut literal = String::new();
         let mut rest = template;
@@ -331,8 +350,8 @@ impl Format {
                 .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
                 .unwrap_or(after.len());
             let name = &after[..end];
-            let variable =
-                Variable::from_name(name).ok_or_else(|| Error::UnknownVariable(name.to_owned()))?;
+            let variable = Variable::from_name_with(name, extra)
+                .ok_or_else(|| Error::UnknownVariable(name.to_owned()))?;
 
             if !literal.is_empty() {
                 parts.push(Part::Literal(std::mem::take(&mut literal)));
@@ -601,7 +620,20 @@ mod tests {
             upstream_addr: None,
             upstream_status: None,
             upstream_time: None,
+            variables: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn format_renders_mapped_variables() {
+        let mut entry = entry();
+        entry
+            .variables
+            .insert("canary".to_owned(), "blue".to_owned());
+        let extra = HashSet::from(["canary".to_owned(), "other".to_owned()]);
+        let format = Format::parse_with("$canary $other", &extra).expect("template");
+        assert_eq!(format.render(&entry), "blue -");
+        assert!(Format::parse("$canary").is_err());
     }
 
     #[test]

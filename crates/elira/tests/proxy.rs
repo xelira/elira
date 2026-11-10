@@ -4706,6 +4706,49 @@ limit_conn = 1
     assert_eq!(status(&first), "HTTP/1.1 200 OK");
 }
 
+#[tokio::test]
+async fn access_log_renders_map_variables() {
+    let upstream = fixed_upstream("ok").await;
+    let root = temp_root("mapped-log");
+    let log = root.join("access.log");
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[log]
+file = "{log}"
+max_bytes = 1048576
+template = "$tenant"
+
+[[maps]]
+name = "tenant"
+source = "$host"
+default = "guest"
+values = {{ "example.com" = "gold" }}
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "*"
+upstream = "app"
+"#,
+        log = log.display()
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let response = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&response), "HTTP/1.1 200 OK", "{response}");
+
+    let line = std::fs::read_to_string(&log).expect("access log");
+    assert_eq!(line.trim(), "gold");
+}
+
 /// An upstream that varies its answer by Accept-Language and says so.
 async fn vary_upstream() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0")

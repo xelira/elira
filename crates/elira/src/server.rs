@@ -120,10 +120,16 @@ impl Runtime {
             },
             access_log_sample: cfg.log.sample,
             template: match &cfg.log.template {
-                Some(template) => Some(
-                    elira_accesslog::Format::parse(template)
-                        .map_err(|err| anyhow::anyhow!("log.template: {err}"))?,
-                ),
+                Some(template) => {
+                    let mut extra = std::collections::HashSet::new();
+                    extra.extend(cfg.maps.iter().map(|map| map.name.clone()));
+                    extra.extend(cfg.geos.iter().map(|geo| geo.name.clone()));
+                    extra.extend(cfg.splits.iter().map(|split| split.name.clone()));
+                    Some(
+                        elira_accesslog::Format::parse_with(template, &extra)
+                            .map_err(|err| anyhow::anyhow!("log.template: {err}"))?,
+                    )
+                }
                 None => None,
             },
             syslog: match &cfg.log.syslog {
@@ -911,6 +917,7 @@ async fn serve_conn<I>(
             let mut route_label = None;
             let mut access_log = true;
             let mut access_log_sample = current.access_log_sample();
+            let mut log_vars = HashMap::new();
             if let Some(labels) = response.extensions().get::<elira_proxy::Labels>().cloned() {
                 metrics.record_route(&labels.route, status, elapsed);
                 if let Some(name) = &labels.upstream {
@@ -920,6 +927,7 @@ async fn serve_conn<I>(
                 route_label = Some(labels.route);
                 access_log = labels.access_log;
                 access_log_sample = labels.access_log_sample;
+                log_vars = labels.mapped;
             }
             let (upstream_addr, upstream_status, upstream_time) = match response
                 .extensions()
@@ -967,6 +975,7 @@ async fn serve_conn<I>(
                 upstream_addr,
                 upstream_status,
                 upstream_time,
+                variables: log_vars,
             };
 
             if write_log {

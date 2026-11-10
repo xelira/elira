@@ -151,6 +151,7 @@
 - `reject_unknown_sni` для TCP/QUIC: отказ при неизвестном SNI.
 - `verify_ocsp` для проверки stapled OCSP при загрузке.
 - `limit_conn` для ограничения одновременных запросов на маршруте.
+- Переменные `map`/`geo`/`split_clients` в шаблоне access-лога.
 - `GET /config` на админском листенере: эффективный конфиг в JSON.
 - Тесты FastCGI/CGI на обрезанные заголовки, длину записи, padding и хвост
   после `END_REQUEST`.

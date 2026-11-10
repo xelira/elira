@@ -140,6 +140,7 @@ impl Proxy {
             upstream: None,
             access_log: entry.access_log,
             access_log_sample: entry.access_log_sample,
+            mapped: vars.mapped.clone(),
         });
         self.apply_route(&mut response, entry, vars, request_id);
         response
