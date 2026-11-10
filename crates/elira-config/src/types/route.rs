@@ -1,0 +1,366 @@
+//! Routing, rewrites and named variables.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Rewrite {
+    pub pattern: String,
+    pub replacement: String,
+    #[serde(default)]
+    pub flag: RewriteFlag,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RewriteFlag {
+    #[default]
+    Last,
+    Break,
+    Redirect,
+    Permanent,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Map {
+    pub name: String,
+    /// Source variable including the leading `$`.
+    pub source: String,
+    #[serde(default)]
+    pub default: Option<String>,
+    #[serde(default)]
+    pub values: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Geo {
+    pub name: String,
+    #[serde(default)]
+    pub default: Option<String>,
+    /// Network or address to value.
+    pub values: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Split {
+    pub name: String,
+    /// Source variable including the leading `$`.
+    pub source: String,
+    pub buckets: Vec<SplitBucket>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SplitBucket {
+    /// Percentage of the hash space, 1..100.
+    pub percent: u8,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteMatch {
+    #[default]
+    Prefix,
+    Exact,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Route {
+    /// Host to match, case-insensitive. `*` catches everything else, and
+    /// `*.example.com` matches any subdomain. Nested locations inherit the
+    /// parent host when this is empty.
+    #[serde(default)]
+    pub host: String,
+
+    /// Restrict the route to named listeners. Empty means every listener.
+    #[serde(default)]
+    pub listeners: Vec<String>,
+
+    /// Path prefix. The longest matching prefix wins inside a host. A nested
+    /// location appends this to its parent path.
+    #[serde(default)]
+    pub path: Option<String>,
+
+    /// Nested locations, matched after the parent prefix. They inherit the
+    /// parent host, listeners, target and unset options.
+    #[serde(default)]
+    pub locations: Vec<Route>,
+
+    /// Literal prefix that a nested regex location must stay under. Set while
+    /// flattening nested locations; it is not part of the TOML syntax.
+    #[serde(skip)]
+    pub regex_prefix: Option<String>,
+
+    /// Named location such as `@fallback`. Named locations are never matched
+    /// by URL; `try_files` reaches them through an internal redirect.
+    #[serde(default)]
+    pub name: Option<String>,
+
+    /// Only serve this route after an internal redirect. Direct requests get
+    /// a 404.
+    #[serde(default)]
+    pub internal: bool,
+
+    /// `prefix` (default) or `exact`, like `location = /path`.
+    #[serde(default, rename = "match")]
+    pub match_type: RouteMatch,
+
+    /// Skip regex routes when this prefix matches, like `location ^~`.
+    #[serde(default)]
+    pub no_regex: bool,
+
+    /// Regular expression matched against the path after prefix routes.
+    #[serde(default)]
+    pub path_regex: Option<String>,
+
+    /// Name of an upstream to proxy to. Exactly one target.
+    #[serde(default)]
+    pub upstream: Option<String>,
+
+    /// Directory to serve files from. Exactly one target.
+    #[serde(default)]
+    pub root: Option<PathBuf>,
+
+    /// Serve files from this directory by stripping `path`, nginx-style.
+    #[serde(default)]
+    pub alias: Option<PathBuf>,
+
+    /// Add `Cache-Control`/`Expires` for static responses.
+    #[serde(default)]
+    pub expires_secs: Option<u64>,
+
+    /// Emit an `ETag` for static responses. Defaults to true.
+    #[serde(default)]
+    pub etag: Option<bool>,
+
+    /// Redirect instead of proxying or serving. Exactly one target.
+    #[serde(default)]
+    pub redirect: Option<Redirect>,
+
+    /// Return a fixed status and body, with variable expansion. Exactly one
+    /// target.
+    #[serde(default, rename = "return")]
+    pub return_response: Option<RouteReturn>,
+
+    /// Conditional returns evaluated before the route target.
+    #[serde(default, rename = "if")]
+    pub if_conditions: Vec<RouteIf>,
+
+    /// FastCGI target: `host:port` or `unix:/path`.
+    #[serde(default)]
+    pub fastcgi_pass: Option<String>,
+
+    /// Document root used to build `SCRIPT_FILENAME`.
+    #[serde(default)]
+    pub fastcgi_root: Option<PathBuf>,
+
+    /// Script appended when the request path ends with `/`.
+    #[serde(default = "Route::default_fastcgi_index")]
+    pub fastcgi_index: String,
+
+    /// Extra FastCGI params as `NAME: value`.
+    #[serde(default)]
+    pub fastcgi_param: Vec<String>,
+
+    /// Extra CGI environment variables as `NAME: value`.
+    #[serde(default)]
+    pub cgi_param: Vec<String>,
+
+    /// CGI script to execute for this route.
+    #[serde(default)]
+    pub cgi_pass: Option<PathBuf>,
+
+    /// Native dynamic module (`.so`) handling this route.
+    #[serde(default)]
+    pub module: Option<PathBuf>,
+
+    /// Run the module in a child process instead of in the server process.
+    #[serde(default)]
+    pub module_sandbox: bool,
+
+    /// WebAssembly module handling this route.
+    #[serde(default)]
+    pub wasm: Option<PathBuf>,
+
+    /// Concurrent FastCGI/CGI/module requests allowed for this route. Defaults
+    /// to 16 for application targets and is ignored for static/proxy routes.
+    #[serde(default)]
+    pub max_concurrent: Option<usize>,
+
+    /// Files tried for a directory request, in order.
+    #[serde(default = "Route::default_index")]
+    pub index: Vec<String>,
+
+    /// Serve the first index file for missing paths. For client-side routers.
+    #[serde(default)]
+    pub spa: bool,
+
+    /// Remove the matched path prefix before forwarding to the upstream.
+    #[serde(default)]
+    pub strip_prefix: bool,
+
+    /// Candidates tried, in order, when the path does not exist. `$uri` is
+    /// replaced with the request path.
+    #[serde(default)]
+    pub try_files: Vec<String>,
+
+    /// Generate a directory listing when no index file exists.
+    #[serde(default)]
+    pub autoindex: bool,
+
+    /// htpasswd file with bcrypt hashes. Empty means no authentication.
+    #[serde(default)]
+    pub auth_file: Option<PathBuf>,
+
+    /// CIDR blocks allowed to reach this route.
+    #[serde(default)]
+    pub ip_allow: Vec<String>,
+
+    /// CIDR blocks refused on this route; wins over `ip_allow`.
+    #[serde(default)]
+    pub ip_deny: Vec<String>,
+
+    /// Overrides `limits.upstream_timeout_secs` for this route.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+
+    /// Overrides `limits.requests_per_second` for this route. Zero inherits.
+    #[serde(default)]
+    pub requests_per_second: Option<u32>,
+
+    /// Bucket depth for the route limiter. Zero means the same as the rate.
+    #[serde(default)]
+    pub burst: Option<u32>,
+
+    /// What identifies a client for this route's limiter: `ip` (default),
+    /// `authorization`, `header:NAME` or `cookie:NAME`.
+    #[serde(default)]
+    pub rate_key: Option<String>,
+
+    /// Overrides `limits.max_body_bytes` for this route.
+    #[serde(default)]
+    pub max_body_bytes: Option<usize>,
+
+    /// Overrides `limits.max_response_bytes` for streamed app responses.
+    #[serde(default)]
+    pub max_response_bytes: Option<usize>,
+
+    /// Overrides `limits.max_upstream_response_bytes` for proxied responses.
+    #[serde(default)]
+    pub max_upstream_response_bytes: Option<usize>,
+
+    /// Idle FastCGI connections kept for this route's backend.
+    #[serde(default)]
+    pub fastcgi_pool_idle: Option<usize>,
+
+    /// Overrides whether this route uses the shared cache.
+    #[serde(default)]
+    pub cache_enabled: Option<bool>,
+
+    /// Overrides the cache TTL for this route.
+    #[serde(default)]
+    pub cache_ttl_secs: Option<u64>,
+
+    /// Write this route's requests to the access log.
+    #[serde(default = "Route::default_access_log")]
+    pub access_log: bool,
+
+    /// Fraction of this route's requests to log. Overrides `log.sample`.
+    #[serde(default)]
+    pub access_log_sample: Option<f64>,
+
+    /// Require a verified client certificate on this route.
+    #[serde(default)]
+    pub client_auth: bool,
+
+    /// Require this subject common name.
+    #[serde(default)]
+    pub client_cn: Option<String>,
+
+    /// Require this issuer common name.
+    #[serde(default)]
+    pub client_issuer_cn: Option<String>,
+
+    /// Error pages as `STATUS /path.html`, served from `error_root` or `root`.
+    #[serde(default)]
+    pub error_pages: Vec<String>,
+
+    /// Directory for `error_pages` when the route proxies instead of serving.
+    #[serde(default)]
+    pub error_root: Option<PathBuf>,
+
+    /// Response headers to set, as `Name: value`.
+    #[serde(default)]
+    pub add_headers: Vec<String>,
+
+    /// Response headers to drop.
+    #[serde(default)]
+    pub remove_headers: Vec<String>,
+
+    /// Request headers to set or replace before forwarding, as `Name: value`.
+    #[serde(default)]
+    pub request_headers: Vec<String>,
+
+    /// Request headers to drop before forwarding.
+    #[serde(default)]
+    pub request_remove_headers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Redirect {
+    pub to: String,
+    #[serde(default = "Redirect::default_status")]
+    pub status: u16,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteReturn {
+    pub status: u16,
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub content_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteIf {
+    /// Variable including the leading `$`.
+    pub variable: String,
+    #[serde(default)]
+    pub equals: Option<String>,
+    #[serde(default)]
+    pub matches: Option<String>,
+    #[serde(default, rename = "return")]
+    pub return_response: Option<RouteReturn>,
+}
+
+impl Route {
+    pub(crate) fn default_index() -> Vec<String> {
+        vec!["index.html".to_owned()]
+    }
+
+    pub(crate) fn default_fastcgi_index() -> String {
+        "index.php".to_owned()
+    }
+
+    pub(crate) fn default_access_log() -> bool {
+        true
+    }
+}
+
+impl Redirect {
+    fn default_status() -> u16 {
+        302
+    }
+}
