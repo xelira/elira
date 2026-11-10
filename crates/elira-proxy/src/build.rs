@@ -225,6 +225,7 @@ pub(crate) fn build_route(
         max_response: route.max_response_bytes,
         cache: route.cache_enabled,
         cache_ttl: route.cache_ttl_secs.map(Duration::from_secs),
+        cache_valid: route.cache_valid.clone(),
         access_log: route.access_log,
         access_log_sample: route.access_log_sample.unwrap_or(cfg.log.sample),
         client_auth: route.client_auth.then(|| ClientCertRule {

@@ -117,6 +117,7 @@ fn inherit(parent: &Route, child: &mut Route) -> Result<(), Error> {
     child.fastcgi_multiplex |= parent.fastcgi_multiplex;
     child.cache_enabled = child.cache_enabled.or(parent.cache_enabled);
     child.cache_ttl_secs = child.cache_ttl_secs.or(parent.cache_ttl_secs);
+    inherit_vec(&mut child.cache_valid, &parent.cache_valid);
     child.access_log_sample = child.access_log_sample.or(parent.access_log_sample);
     child.client_cn = child.client_cn.clone().or_else(|| parent.client_cn.clone());
     child.client_issuer_cn = child
@@ -292,6 +293,7 @@ mod tests {
             fastcgi_multiplex: false,
             cache_enabled: None,
             cache_ttl_secs: None,
+            cache_valid: Vec::new(),
             access_log: Route::default_access_log(),
             access_log_sample: None,
             client_auth: false,

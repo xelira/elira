@@ -623,6 +623,9 @@ loopback или под `auth_file`.
 Кэшируются только `200 OK` на `GET` с известным `Content-Length` не больше
 `max_item_bytes`, без `Set-Cookie` и без `Cache-Control: no-store/private`.
 Ответы с неизвестной длиной не кэшируются: тело не буферизуется.
+`cache_valid` добавляет другие статусы, например
+`[{ statuses = [404], ttl_secs = 60 }]`; для `200` по-прежнему действует
+`cache_ttl_secs`/`ttl_secs`.
 
 Ключ — нормализованный Host плюс путь с query. Ответ кэша отдаётся без
 сжатия. `X-Cache` принимает `HIT`, `MISS` или `STALE`. Вытеснение: сначала
@@ -870,6 +873,7 @@ buckets = [{ percent = 10, value = "a" }, { percent = 90, value = "b" }]
 | `max_upstream_response_bytes` | целое > 0 | `limits.max_upstream_response_bytes` | свой предел ответа upstream'а |
 | `cache_enabled` | bool | глобальный | использовать ли общий кэш для маршрута |
 | `cache_ttl_secs` | целое > 0 | глобальный | свой TTL записей маршрута |
+| `cache_valid` | массив таблиц | `[]` | TTL по статусам ответа |
 | `access_log` | bool | `true` | писать ли запросы этого маршрута в access-лог |
 | `access_log_sample` | дробь 0..1 | `log.sample` | доля запросов маршрута в access-логе |
 | `max_concurrent` | целое > 0 | `16` для app, выключено для proxy | одновременные запросы маршрута: FastCGI/CGI/module или прокси |

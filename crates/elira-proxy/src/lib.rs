@@ -23,7 +23,9 @@ use tokio::sync::Semaphore;
 
 use elira_auth::{BasicAuth, IpAcl};
 use elira_cache::Cache;
-use elira_config::{Compression, Config, Health, Map, RewriteFlag, Satisfy, SecureLink};
+use elira_config::{
+    CacheValid, Compression, Config, Health, Map, RewriteFlag, Satisfy, SecureLink,
+};
 use elira_limit::RateLimiter;
 use elira_tls::ClientIdentity;
 
@@ -256,6 +258,7 @@ struct RouteEntry {
     fastcgi_mux: Option<Arc<elira_fastcgi::MultiplexPool>>,
     cache: Option<bool>,
     cache_ttl: Option<Duration>,
+    cache_valid: Vec<CacheValid>,
     access_log: bool,
     access_log_sample: f64,
     client_auth: Option<ClientCertRule>,
@@ -267,6 +270,16 @@ struct RouteEntry {
     cgi_param: Vec<(String, String)>,
     scgi_param: Vec<(String, String)>,
     uwsgi_param: Vec<(String, String)>,
+}
+
+impl RouteEntry {
+    fn cache_ttl_for(&self, status: u16) -> Option<Duration> {
+        self.cache_valid
+            .iter()
+            .find(|valid| valid.statuses.contains(&status))
+            .map(|valid| Duration::from_secs(valid.ttl_secs))
+            .or(self.cache_ttl)
+    }
 }
 
 #[derive(Clone)]

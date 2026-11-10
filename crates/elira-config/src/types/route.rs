@@ -81,6 +81,13 @@ pub enum Satisfy {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct CacheValid {
+    pub statuses: Vec<u16>,
+    pub ttl_secs: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SecureLink {
     /// Shared secret used by the MD5 calculation.
     pub secret: String,
@@ -336,6 +343,11 @@ pub struct Route {
     /// Overrides the cache TTL for this route.
     #[serde(default)]
     pub cache_ttl_secs: Option<u64>,
+
+    /// Per-status cache TTLs. The first matching status wins over
+    /// `cache_ttl_secs`.
+    #[serde(default)]
+    pub cache_valid: Vec<CacheValid>,
 
     /// Write this route's requests to the access log.
     #[serde(default = "Route::default_access_log")]

@@ -737,7 +737,7 @@ impl Proxy {
                             upstream_path.to_owned(),
                             pool.clone(),
                             route_timeout,
-                            entry.cache_ttl,
+                            entry.cache_ttl_for(cached_status),
                         );
                     }
                     self.apply_route(&mut response, entry, vars, request_id);
@@ -1015,11 +1015,17 @@ impl Proxy {
             body
         };
 
+        let status_code = parts.status.as_u16();
+        let explicitly_valid = entry
+            .cache_valid
+            .iter()
+            .any(|valid| valid.statuses.contains(&status_code));
+        let store_ttl = entry.cache_ttl_for(status_code);
         let cacheable = self.inner.cache.is_some()
             && cache_allowed
             && is_get
             && requested_upgrade.is_none()
-            && parts.status == StatusCode::OK
+            && (status_code == StatusCode::OK.as_u16() || explicitly_valid)
             && upstream_len
                 .map(|length| {
                     length <= self.inner.cache_max_item
@@ -1045,7 +1051,7 @@ impl Proxy {
                     parts.status.as_u16(),
                     collected.to_vec(),
                     Instant::now(),
-                    entry.cache_ttl,
+                    store_ttl,
                 );
             }
 

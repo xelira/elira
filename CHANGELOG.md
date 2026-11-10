@@ -177,6 +177,7 @@
 - `X-Accel-Redirect` и `X-Sendfile` с ограничением файлов корнем маршрута.
 - `error_page` со сменой статуса (`404 =200 /404.html`).
 - `if_modified_since = false` для статики.
+- `cache_valid` для TTL по статусам ответа.
 - `CONNECT` поверх HTTP/3 с прямым туннелем QUIC-потока.
 - FastCGI multiplexing через `fastcgi_multiplex`.
 - OpenSSL TLS backend (`tls.backend = "openssl"`) с TLS 1.0/1.1/1.2/1.3,

@@ -3159,6 +3159,82 @@ async fn request_id_is_echoed_and_forwarded() {
 }
 
 #[tokio::test]
+async fn cache_valid_caches_configured_statuses() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind cache status upstream");
+    let upstream = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while let Ok(read) = stream.read(&mut chunk).await {
+                    if read == 0 {
+                        break;
+                    }
+                    head.extend_from_slice(&chunk[..read]);
+                    if head.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let text = String::from_utf8_lossy(&head);
+                let (status, body) = if text.starts_with("GET /missing ") {
+                    ("404 Not Found", "missing")
+                } else {
+                    ("200 OK", "present")
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[cache]
+enabled = true
+max_bytes = 1048576
+max_item_bytes = 8192
+ttl_secs = 60
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "*"
+upstream = "app"
+cache_valid = [{{ statuses = [404], ttl_secs = 60 }}]
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    for path in ["/missing", "/ok"] {
+        let request =
+            format!("GET {path} HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n");
+        let first = roundtrip(addr, &request).await;
+        assert!(
+            first.to_ascii_lowercase().contains("x-cache: miss"),
+            "{first}"
+        );
+        let second = roundtrip(addr, &request).await;
+        assert!(
+            second.to_ascii_lowercase().contains("x-cache: hit"),
+            "{second}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn cache_reports_miss_then_hit() {
     let upstream = upstream().await;
     let config = format!(

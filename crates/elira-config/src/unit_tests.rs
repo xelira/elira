@@ -1878,6 +1878,36 @@ if_modified_since = false
 }
 
 #[test]
+fn cache_valid_is_validated() {
+    let base = r#"
+listen = "127.0.0.1:8080"
+
+[[upstreams]]
+name = "app"
+servers = ["127.0.0.1:9000"]
+
+[[routes]]
+host = "*"
+upstream = "app"
+cache_valid = [{ statuses = [200, 404], ttl_secs = 60 }]
+"#;
+    let cfg = Config::parse(base).expect("valid");
+    assert_eq!(cfg.routes[0].cache_valid.len(), 1);
+
+    let bad_status = base.replace("[200, 404]", "[99, 404]");
+    assert!(matches!(
+        Config::parse(&bad_status),
+        Err(Error::BadCacheValid { .. })
+    ));
+
+    let bad_ttl = base.replace("ttl_secs = 60", "ttl_secs = 0");
+    assert!(matches!(
+        Config::parse(&bad_ttl),
+        Err(Error::BadCacheValid { .. })
+    ));
+}
+
+#[test]
 fn named_locations_are_validated() {
     let base = r#"
 listen = "127.0.0.1:8080"

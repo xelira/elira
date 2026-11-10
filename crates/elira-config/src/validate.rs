@@ -923,6 +923,16 @@ impl Config {
         if route.cache_ttl_secs == Some(0) {
             return Err(Error::BadRouteCacheTtl { index });
         }
+        if route.cache_valid.iter().any(|valid| {
+            valid.statuses.is_empty()
+                || valid.ttl_secs == 0
+                || valid
+                    .statuses
+                    .iter()
+                    .any(|status| !(100..=599).contains(status))
+        }) {
+            return Err(Error::BadCacheValid { index });
+        }
         Ok(())
     }
 
