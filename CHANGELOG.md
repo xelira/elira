@@ -154,6 +154,7 @@
 - Переменные `map`/`geo`/`split_clients` в шаблоне access-лога.
 - `lingering_close`, `lingering_timeout_secs` и `reset_timedout_connection`.
 - `keepalive_requests` для upstream-пула (ротация legacy-клиента).
+- Байты запроса/ответа в метриках по route и upstream.
 - `GET /config` на админском листенере: эффективный конфиг в JSON.
 - Тесты FastCGI/CGI на обрезанные заголовки, длину записи, padding и хвост
   после `END_REQUEST`.

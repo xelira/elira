@@ -203,7 +203,8 @@ Living list for the self-improvement loop. One item per session.
 - [x] `$upstream_addr`, `$upstream_status`, `$upstream_response_time` in
   access logs and templates.
 - [x] Map-derived log variables (`map`/`geo`/`split_clients`).
-- [ ] Request/response bytes and timings split per route and upstream.
+- [x] Request/response bytes split per route and upstream. Durations were
+  already recorded in the same labelled series.
 
 ### Section 7 — performance
 

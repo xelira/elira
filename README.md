@@ -311,7 +311,8 @@ Ops:
   `worker_rlimit_nofile` and a PID file
 - L4 TCP and UDP stream proxying with round robin, least connections or
   client-IP hashing, idle timeouts and optional TLS termination
-- Prometheus metrics plus JSON `/status` and `/config` on the admin listener
+- Prometheus metrics plus JSON `/status` and `/config` on the admin listener,
+  including per-route and per-upstream bytes and durations
 - `POST /reload`, `POST /drain`, `POST /cache/purge`, optional Basic auth
 - text or JSON access log with request id, file rotation, nginx-like templates
   and syslog; upstream address, status and response time are available as
