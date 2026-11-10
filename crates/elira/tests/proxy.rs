@@ -4618,6 +4618,119 @@ scgi_param = ["APP_ENV: test"]
     assert!(posted.contains("scgi:POST:/submit:test:data"), "{posted}");
 }
 
+/// A tiny uWSGI responder: parses the modifier header and the length-prefixed
+/// environment block, then answers with the request metadata.
+async fn uwsgi_upstream() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind uwsgi");
+    let addr = listener.local_addr().expect("uwsgi addr");
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut header = [0u8; 4];
+                if stream.read_exact(&mut header).await.is_err() {
+                    return;
+                }
+                let modifier1 = header[0];
+                let modifier2 = header[1];
+                let size = u16::from_le_bytes([header[2], header[3]]) as usize;
+                let mut block = vec![0u8; size];
+                if stream.read_exact(&mut block).await.is_err() {
+                    return;
+                }
+                let mut params = std::collections::HashMap::new();
+                let mut position = 0;
+                while position + 2 <= block.len() {
+                    let name_len =
+                        u16::from_le_bytes([block[position], block[position + 1]]) as usize;
+                    position += 2;
+                    if position + name_len + 2 > block.len() {
+                        return;
+                    }
+                    let name =
+                        String::from_utf8_lossy(&block[position..position + name_len]).to_string();
+                    position += name_len;
+                    let value_len =
+                        u16::from_le_bytes([block[position], block[position + 1]]) as usize;
+                    position += 2;
+                    if position + value_len > block.len() {
+                        return;
+                    }
+                    let value =
+                        String::from_utf8_lossy(&block[position..position + value_len]).to_string();
+                    position += value_len;
+                    params.insert(name, value);
+                }
+                let body_len = params
+                    .get("CONTENT_LENGTH")
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let mut body = vec![0u8; body_len];
+                if stream.read_exact(&mut body).await.is_err() {
+                    return;
+                }
+                let response = format!(
+                    "Status: 200 OK\r\nContent-Type: text/plain\r\n\r\nuwsgi:{}:{}:{}:{}:{}:{}",
+                    modifier1,
+                    modifier2,
+                    params
+                        .get("REQUEST_METHOD")
+                        .map(String::as_str)
+                        .unwrap_or(""),
+                    params.get("REQUEST_URI").map(String::as_str).unwrap_or(""),
+                    params.get("APP_ENV").map(String::as_str).unwrap_or(""),
+                    String::from_utf8_lossy(&body),
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+
+    addr
+}
+
+#[tokio::test]
+async fn uwsgi_route_talks_the_protocol() {
+    let upstream = uwsgi_upstream().await;
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[routes]]
+host = "*"
+uwsgi_pass = "{upstream}"
+uwsgi_modifier1 = 9
+uwsgi_modifier2 = 2
+uwsgi_param = ["APP_ENV: test"]
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let response = roundtrip(
+        addr,
+        "GET /uwsgi?name=elira HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&response), "HTTP/1.1 200 OK");
+    assert!(
+        response.contains("uwsgi:9:2:GET:/uwsgi?name=elira:test:"),
+        "{response}"
+    );
+
+    let posted = roundtrip(
+        addr,
+        "POST /submit HTTP/1.1\r\nHost: example.com\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndata",
+    )
+    .await;
+    assert!(
+        posted.contains("uwsgi:9:2:POST:/submit:test:data"),
+        "{posted}"
+    );
+}
+
 #[tokio::test]
 async fn cleartext_http2_is_available_with_prior_knowledge() {
     use http_body_util::Empty;

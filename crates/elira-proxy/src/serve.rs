@@ -208,7 +208,7 @@ impl Proxy {
                 self.apply_route(&mut response, entry, vars, request_id);
                 Ok(response)
             }
-            Target::Scgi { .. } | Target::Module(_) | Target::Wasm(_) => {
+            Target::Scgi { .. } | Target::Uwsgi { .. } | Target::Module(_) | Target::Wasm(_) => {
                 let mut response = self.serve_app(req, entry, peer, scheme).await;
                 if body_limit_hit.load(Ordering::Relaxed) {
                     return Err(self.body_too_large(entry, vars, peer).await);

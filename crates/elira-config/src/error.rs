@@ -501,4 +501,7 @@ pub enum Error {
 
     #[error("route {index}: scgi_root is empty")]
     BadScgiRoot { index: usize },
+
+    #[error("route {index}: uwsgi_pass is empty")]
+    EmptyUwsgiTarget { index: usize },
 }

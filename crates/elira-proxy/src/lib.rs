@@ -30,9 +30,11 @@ use elira_tls::ClientIdentity;
 pub mod files;
 
 mod admin;
+mod app_target;
 mod apps;
 mod body;
 mod build;
+mod cgi_response;
 mod forward;
 mod health;
 mod helpers;
@@ -41,6 +43,7 @@ mod response;
 mod scgi;
 mod serve;
 mod tunnel;
+mod uwsgi;
 mod variables;
 pub use body::timeout_body;
 pub(crate) use body::*;
@@ -156,8 +159,13 @@ enum Target {
         script: PathBuf,
     },
     Scgi {
-        target: crate::scgi::Target,
+        target: crate::app_target::Target,
         root: Option<PathBuf>,
+    },
+    Uwsgi {
+        target: crate::app_target::Target,
+        modifier1: u8,
+        modifier2: u8,
     },
     Module(ModuleTarget),
     Wasm(Arc<elira_wasm::WasmModule>),
@@ -229,6 +237,7 @@ struct RouteEntry {
     fastcgi_param: Vec<(String, String)>,
     cgi_param: Vec<(String, String)>,
     scgi_param: Vec<(String, String)>,
+    uwsgi_param: Vec<(String, String)>,
 }
 
 #[derive(Clone)]

@@ -1615,6 +1615,37 @@ scgi_param = ["APP_ENV: test"]
 }
 
 #[test]
+fn uwsgi_routes_are_validated() {
+    let base = r#"
+listen = "127.0.0.1:8080"
+
+[[routes]]
+host = "*"
+uwsgi_pass = "127.0.0.1:9000"
+uwsgi_modifier1 = 9
+uwsgi_param = ["APP_ENV: test"]
+"#;
+    let cfg = Config::parse(base).expect("valid");
+    assert_eq!(cfg.routes[0].uwsgi_pass.as_deref(), Some("127.0.0.1:9000"));
+    assert_eq!(cfg.routes[0].uwsgi_modifier1, Some(9));
+
+    let empty = base.replace("127.0.0.1:9000", "");
+    assert!(matches!(
+        Config::parse(&empty),
+        Err(Error::EmptyUwsgiTarget { .. })
+    ));
+
+    let two = base.replace(
+        "uwsgi_pass = \"127.0.0.1:9000\"",
+        "uwsgi_pass = \"127.0.0.1:9000\"\nroot = \"/srv\"",
+    );
+    assert!(matches!(
+        Config::parse(&two),
+        Err(Error::RouteHasTwoTargets { .. })
+    ));
+}
+
+#[test]
 fn named_locations_are_validated() {
     let base = r#"
 listen = "127.0.0.1:8080"

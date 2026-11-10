@@ -245,6 +245,11 @@ pub(crate) fn build_route(
             .iter()
             .filter_map(|line| parse_param(line))
             .collect(),
+        uwsgi_param: route
+            .uwsgi_param
+            .iter()
+            .filter_map(|line| parse_param(line))
+            .collect(),
         fastcgi_pool: route.fastcgi_pool_idle.map(|idle| {
             Arc::new(elira_fastcgi::Pool::new(
                 idle,
@@ -313,13 +318,23 @@ fn build_target(route: &elira_config::Route, cfg: &Config, pools: &Pools) -> Res
             script: script.clone(),
         }
     } else if let Some(pass) = &route.scgi_pass {
-        let target = crate::scgi::Target::parse(pass).ok_or_else(|| Error::RouteConfig {
+        let target = crate::app_target::Target::parse(pass).ok_or_else(|| Error::RouteConfig {
             host: route.host.clone(),
             reason: format!("scgi_pass {pass:?} is not host:port or unix:/path"),
         })?;
         Target::Scgi {
             target,
             root: route.scgi_root.clone(),
+        }
+    } else if let Some(pass) = &route.uwsgi_pass {
+        let target = crate::app_target::Target::parse(pass).ok_or_else(|| Error::RouteConfig {
+            host: route.host.clone(),
+            reason: format!("uwsgi_pass {pass:?} is not host:port or unix:/path"),
+        })?;
+        Target::Uwsgi {
+            target,
+            modifier1: route.uwsgi_modifier1.unwrap_or(0),
+            modifier2: route.uwsgi_modifier2.unwrap_or(0),
         }
     } else if let Some(path) = &route.wasm {
         let module = elira_wasm::WasmModule::load(path).map_err(|err| Error::RouteConfig {

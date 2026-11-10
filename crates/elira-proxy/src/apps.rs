@@ -445,6 +445,30 @@ impl Proxy {
                     }
                 }
             }
+            Target::Uwsgi {
+                target,
+                modifier1,
+                modifier2,
+            } => {
+                params.extend(entry.uwsgi_param.iter().cloned());
+                match crate::uwsgi::execute(
+                    target,
+                    *modifier1,
+                    *modifier2,
+                    &params,
+                    &body,
+                    timeout,
+                    entry.max_response.unwrap_or(self.inner.max_app_response),
+                )
+                .await
+                {
+                    Ok(response) => app_result(response.status, response.headers, response.body),
+                    Err(err) => {
+                        tracing::warn!(error = %err, "uWSGI request failed");
+                        Err(StatusCode::BAD_GATEWAY)
+                    }
+                }
+            }
             _ => Err(StatusCode::INTERNAL_SERVER_ERROR),
         };
 

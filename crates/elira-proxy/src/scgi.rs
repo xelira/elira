@@ -4,56 +4,24 @@
 //! headers. One connection carries one request; the server closes after the
 //! response.
 
-use std::path::PathBuf;
 use std::time::Duration;
 
-use http::uri::Authority;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UnixStream};
 
-#[derive(Clone, Debug)]
-pub(crate) enum Target {
-    Tcp(Authority),
-    Unix(PathBuf),
-}
-
-impl Target {
-    pub(crate) fn parse(value: &str) -> Option<Self> {
-        if let Some(path) = value.strip_prefix("unix:") {
-            return Some(Self::Unix(PathBuf::from(path)));
-        }
-        value.parse::<Authority>().ok().map(Self::Tcp)
-    }
-}
-
-impl std::fmt::Display for Target {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Tcp(authority) => authority.fmt(formatter),
-            Self::Unix(path) => write!(formatter, "unix:{}", path.display()),
-        }
-    }
-}
+use crate::app_target::Target;
+use crate::cgi_response::{self, Response};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum Error {
     #[error("scgi: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("scgi response is larger than the configured cap")]
-    TooLarge,
-
-    #[error("scgi response: {0}")]
-    BadResponse(String),
+    #[error(transparent)]
+    Response(#[from] cgi_response::Error),
 
     #[error("scgi exchange timed out")]
     Timeout,
-}
-
-pub(crate) struct Response {
-    pub(crate) status: u16,
-    pub(crate) headers: Vec<(String, String)>,
-    pub(crate) body: Vec<u8>,
 }
 
 trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -112,176 +80,5 @@ async fn exchange(
     stream.write_all(&packet).await?;
     stream.flush().await?;
 
-    let (status, headers, mut response) = read_head(&mut stream).await?;
-
-    let content_length = headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-        .and_then(|(_, value)| value.parse::<usize>().ok());
-
-    match content_length {
-        Some(length) => {
-            if max_response > 0 && length > max_response {
-                return Err(Error::TooLarge);
-            }
-            while response.len() < length {
-                let mut chunk = [0u8; 8192];
-                let read = stream.read(&mut chunk).await?;
-                if read == 0 {
-                    return Err(Error::BadResponse(
-                        "closed before Content-Length bytes".to_owned(),
-                    ));
-                }
-                response.extend_from_slice(&chunk[..read]);
-                if max_response > 0 && response.len() > max_response {
-                    return Err(Error::TooLarge);
-                }
-            }
-            response.truncate(length);
-        }
-        None => loop {
-            let mut chunk = [0u8; 8192];
-            let read = stream.read(&mut chunk).await?;
-            if read == 0 {
-                break;
-            }
-            response.extend_from_slice(&chunk[..read]);
-            if max_response > 0 && response.len() > max_response {
-                return Err(Error::TooLarge);
-            }
-        },
-    }
-
-    Ok(Response {
-        status,
-        headers,
-        body: response,
-    })
-}
-
-async fn read_head(
-    stream: &mut (impl AsyncRead + Unpin),
-) -> Result<(u16, Vec<(String, String)>, Vec<u8>), Error> {
-    let mut buffer = Vec::new();
-    let mut chunk = [0u8; 4096];
-
-    let split = loop {
-        let read = stream.read(&mut chunk).await?;
-        if read == 0 {
-            return Err(Error::BadResponse(
-                "connection closed before the header block".to_owned(),
-            ));
-        }
-        buffer.extend_from_slice(&chunk[..read]);
-        if let Some(position) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
-            break position;
-        }
-        if buffer.len() > 64 * 1024 {
-            return Err(Error::BadResponse("header block is too large".to_owned()));
-        }
-    };
-
-    let head = String::from_utf8_lossy(&buffer[..split]).to_string();
-    let body = buffer[split + 4..].to_vec();
-    let mut status = None;
-    let mut headers = Vec::new();
-
-    for line in head.split("\r\n") {
-        if line.is_empty() {
-            continue;
-        }
-        if line.starts_with("HTTP/") {
-            status = line
-                .split_whitespace()
-                .nth(1)
-                .and_then(|code| code.parse::<u16>().ok());
-            continue;
-        }
-        let Some((name, value)) = line.split_once(':') else {
-            return Err(Error::BadResponse(format!("bad header line {line:?}")));
-        };
-        if name.eq_ignore_ascii_case("status") {
-            status = value
-                .split_whitespace()
-                .next()
-                .and_then(|code| code.parse::<u16>().ok());
-        } else {
-            headers.push((name.trim().to_owned(), value.trim().to_owned()));
-        }
-    }
-
-    let status = status.unwrap_or_else(|| {
-        if headers
-            .iter()
-            .any(|(name, _)| name.eq_ignore_ascii_case("location"))
-        {
-            302
-        } else {
-            200
-        }
-    });
-
-    Ok((status, headers, body))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn target_parses_tcp_and_unix() {
-        assert!(matches!(
-            Target::parse("127.0.0.1:9000"),
-            Some(Target::Tcp(_))
-        ));
-        assert!(matches!(
-            Target::parse("unix:/run/app.sock"),
-            Some(Target::Unix(_))
-        ));
-        assert!(Target::parse("not a target").is_none());
-    }
-
-    #[test]
-    fn response_defaults_to_200_and_302_for_location() {
-        let (status, headers, body) = parse_for_test(b"Content-Type: text/plain\r\n\r\nhi");
-        assert_eq!(status, 200);
-        assert_eq!(headers.len(), 1);
-        assert_eq!(body, b"hi");
-
-        let (status, _, _) = parse_for_test(b"Location: /next\r\n\r\n");
-        assert_eq!(status, 302);
-    }
-
-    fn parse_for_test(raw: &[u8]) -> (u16, Vec<(String, String)>, Vec<u8>) {
-        let split = raw
-            .windows(4)
-            .position(|window| window == b"\r\n\r\n")
-            .expect("header split");
-        let head = String::from_utf8_lossy(&raw[..split]);
-        let body = raw[split + 4..].to_vec();
-        let mut status = None;
-        let mut headers = Vec::new();
-        for line in head.split("\r\n") {
-            let (name, value) = line.split_once(':').expect("header");
-            if name.eq_ignore_ascii_case("status") {
-                status = value
-                    .split_whitespace()
-                    .next()
-                    .and_then(|code| code.parse::<u16>().ok());
-            } else {
-                headers.push((name.to_owned(), value.trim().to_owned()));
-            }
-        }
-        let status = status.unwrap_or_else(|| {
-            if headers
-                .iter()
-                .any(|(name, _)| name.eq_ignore_ascii_case("location"))
-            {
-                302
-            } else {
-                200
-            }
-        });
-        (status, headers, body)
-    }
+    Ok(cgi_response::read(&mut stream, max_response).await?)
 }

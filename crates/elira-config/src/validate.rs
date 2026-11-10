@@ -764,6 +764,7 @@ impl Config {
             + usize::from(route.fastcgi_pass.is_some())
             + usize::from(route.cgi_pass.is_some())
             + usize::from(route.scgi_pass.is_some())
+            + usize::from(route.uwsgi_pass.is_some())
             + usize::from(route.module.is_some())
             + usize::from(route.wasm.is_some());
         if targets == 0 {
@@ -838,6 +839,7 @@ impl Config {
             .iter()
             .chain(route.cgi_param.iter())
             .chain(route.scgi_param.iter())
+            .chain(route.uwsgi_param.iter())
         {
             if parse_param(param).is_none() {
                 return Err(Error::BadAppParam {
@@ -861,6 +863,11 @@ impl Config {
                 .is_some_and(|root| root.as_os_str().is_empty())
             {
                 return Err(Error::BadScgiRoot { index });
+            }
+        }
+        if let Some(target) = &route.uwsgi_pass {
+            if target.trim().is_empty() {
+                return Err(Error::EmptyUwsgiTarget { index });
             }
         }
         if let Some(module) = &route.module {

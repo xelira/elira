@@ -225,7 +225,7 @@ Upstreams:
   HTTP/2 with an explicit allowlist
 - custom HTTP/2 and HTTP/3 upstream pools with connection/stream stats,
   selectable per upstream
-- FastCGI, SCGI and CGI upstreams, plus in-process and sandboxed modules
+- FastCGI, SCGI, uWSGI and CGI upstreams, plus in-process and sandboxed modules
 - RFC 7239 `Forwarded` plus `X-Forwarded-For/Proto/Host/Port`, with the
   client-supplied copies dropped and the chain extended only for
   `trusted_proxies`

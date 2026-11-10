@@ -87,6 +87,9 @@ fn inherit(parent: &Route, child: &mut Route) -> Result<(), Error> {
         child.cgi_pass = parent.cgi_pass.clone();
         child.scgi_pass = parent.scgi_pass.clone();
         child.scgi_root = parent.scgi_root.clone();
+        child.uwsgi_pass = parent.uwsgi_pass.clone();
+        child.uwsgi_modifier1 = parent.uwsgi_modifier1;
+        child.uwsgi_modifier2 = parent.uwsgi_modifier2;
         child.module = parent.module.clone();
         child.wasm = parent.wasm.clone();
     }
@@ -149,6 +152,7 @@ fn inherit(parent: &Route, child: &mut Route) -> Result<(), Error> {
     inherit_vec(&mut child.fastcgi_param, &parent.fastcgi_param);
     inherit_vec(&mut child.cgi_param, &parent.cgi_param);
     inherit_vec(&mut child.scgi_param, &parent.scgi_param);
+    inherit_vec(&mut child.uwsgi_param, &parent.uwsgi_param);
     inherit_vec(&mut child.if_conditions, &parent.if_conditions);
 
     Ok(())
@@ -169,6 +173,7 @@ fn has_target(route: &Route) -> bool {
         || route.fastcgi_pass.is_some()
         || route.cgi_pass.is_some()
         || route.scgi_pass.is_some()
+        || route.uwsgi_pass.is_some()
         || route.module.is_some()
         || route.wasm.is_some()
 }
@@ -238,6 +243,10 @@ mod tests {
             scgi_pass: None,
             scgi_root: None,
             scgi_param: Vec::new(),
+            uwsgi_pass: None,
+            uwsgi_modifier1: None,
+            uwsgi_modifier2: None,
+            uwsgi_param: Vec::new(),
             cgi_pass: None,
             module: None,
             module_sandbox: false,

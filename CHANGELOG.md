@@ -169,6 +169,7 @@
 - `CONNECT` поверх HTTP/2 и WebSocket over HTTP/2 (RFC 8441) с трансляцией
   extended `CONNECT` в HTTP/1.1 `Upgrade` для upstream.
 - SCGI upstream через `scgi_pass`, `scgi_root` и `scgi_param`.
+- uWSGI upstream через `uwsgi_pass`, `uwsgi_modifier1/2` и `uwsgi_param`.
 - `Cache-Control: must-revalidate` запрещает stale-выдачу; `Expires`/`Date`
   задают TTL, если `max-age` нет. Запросы с `no-cache`/`no-store` обходят кэш.
 - Заголовки `Forwarded` и `X-Forwarded-Port` к upstream.

@@ -809,6 +809,10 @@ buckets = [{ percent = 10, value = "a" }, { percent = 90, value = "b" }]
 | `scgi_pass` | строка | нет | SCGI target: `host:port` или `unix:/path` |
 | `scgi_root` | путь | нет | `DOCUMENT_ROOT` для SCGI |
 | `scgi_param` | массив строк | `[]` | дополнительные параметры SCGI `NAME: value` |
+| `uwsgi_pass` | строка | нет | uWSGI target: `host:port` или `unix:/path` |
+| `uwsgi_modifier1` | целое 0..255 | `0` | modifier1 в заголовке uWSGI |
+| `uwsgi_modifier2` | целое 0..255 | `0` | modifier2 в заголовке uWSGI |
+| `uwsgi_param` | массив строк | `[]` | дополнительные параметры uWSGI `NAME: value` |
 | `module` | путь | нет | абсолютный путь к `.so`-модулю |
 | `module_sandbox` | bool | `false` | запускать модуль в дочернем процессе |
 | `wasm` | путь | нет | WebAssembly-модуль как цель маршрута (fuel-бюджет на вызов) |
@@ -963,6 +967,11 @@ buckets = [{ percent = 10, value = "a" }, { percent = 90, value = "b" }]
   `DOCUMENT_ROOT`. Ответ читается как CGI: заголовки `Status`/`Content-Type`
   и тело. Соединение одно на запрос, тело ответа ограничено
   `max_response_bytes`.
+- `uwsgi_pass` отправляет запрос uWSGI-приложению: четырёхбайтовый заголовок
+  с `modifier1`/`modifier2`, length-prefixed переменные окружения и тело.
+  Параметры те же, что у SCGI, плюс `uwsgi_param`. Ответ читается как
+  CGI-заголовки с телом; поддерживаются `Content-Length`, chunked и закрытие
+  соединения. `uwsgi_modifier1` и `uwsgi_modifier2` задают байты заголовка.
 - `alias` работает как `root`, но сначала отрезает литеральный `path` маршрута:
   `path = "/static"` и `alias = "/srv/assets"` отдают
   `/static/app.js` из `/srv/assets/app.js`. `alias` требует `path` и не

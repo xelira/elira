@@ -186,6 +186,22 @@ pub struct Route {
     #[serde(default)]
     pub scgi_param: Vec<String>,
 
+    /// uWSGI target: `host:port` or `unix:/path`.
+    #[serde(default)]
+    pub uwsgi_pass: Option<String>,
+
+    /// uWSGI request modifier 1.
+    #[serde(default)]
+    pub uwsgi_modifier1: Option<u8>,
+
+    /// uWSGI request modifier 2.
+    #[serde(default)]
+    pub uwsgi_modifier2: Option<u8>,
+
+    /// Extra uWSGI params as `NAME: value`.
+    #[serde(default)]
+    pub uwsgi_param: Vec<String>,
+
     /// CGI script to execute for this route.
     #[serde(default)]
     pub cgi_pass: Option<PathBuf>,
