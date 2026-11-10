@@ -26,6 +26,8 @@ const STATUS_CLASSES: [&str; 6] = ["1xx", "2xx", "3xx", "4xx", "5xx", "other"];
 type LabeledRequests = Vec<(String, [u64; STATUS_CLASSES.len()])>;
 /// Duration sums and counts for one label, as `(label, sum_nanos, count)`.
 type LabeledDuration = Vec<(String, u64, u64)>;
+/// `(label, request_bytes, response_bytes)`.
+type LabeledBytes = Vec<(String, u64, u64)>;
 
 /// Maximum number of distinct route or upstream labels kept in memory.
 pub const MAX_LABELS: usize = 200;
@@ -93,6 +95,8 @@ struct Labeled {
     requests: [u64; STATUS_CLASSES.len()],
     duration_sum_nanos: u64,
     duration_count: u64,
+    request_bytes: u64,
+    response_bytes: u64,
     cache_hits: u64,
     cache_misses: u64,
     cache_stale: u64,
@@ -123,6 +127,11 @@ impl Labeled {
         *counter = counter.saturating_add(1);
     }
 
+    fn record_bytes(&mut self, request: u64, response: u64) {
+        self.request_bytes = self.request_bytes.saturating_add(request);
+        self.response_bytes = self.response_bytes.saturating_add(response);
+    }
+
     fn merge(&mut self, other: &Labeled) {
         for (target, value) in self.requests.iter_mut().zip(&other.requests) {
             *target = target.saturating_add(*value);
@@ -131,6 +140,8 @@ impl Labeled {
             .duration_sum_nanos
             .saturating_add(other.duration_sum_nanos);
         self.duration_count = self.duration_count.saturating_add(other.duration_count);
+        self.request_bytes = self.request_bytes.saturating_add(other.request_bytes);
+        self.response_bytes = self.response_bytes.saturating_add(other.response_bytes);
         self.cache_hits = self.cache_hits.saturating_add(other.cache_hits);
         self.cache_misses = self.cache_misses.saturating_add(other.cache_misses);
         self.cache_stale = self.cache_stale.saturating_add(other.cache_stale);
@@ -140,6 +151,8 @@ impl Labeled {
         self.requests.iter().all(|&value| value == 0)
             && self.duration_sum_nanos == 0
             && self.duration_count == 0
+            && self.request_bytes == 0
+            && self.response_bytes == 0
     }
 }
 
@@ -173,12 +186,18 @@ pub struct Delta {
     /// Per-route cache lookups: `(route, [hits, misses, stale])`.
     #[serde(default)]
     pub route_cache: Vec<(String, [u64; 3])>,
+    /// Per-route request and response body bytes: `(route, request, response)`.
+    #[serde(default)]
+    pub route_bytes: Vec<(String, u64, u64)>,
     /// Per-upstream requests by status class, sorted by upstream name.
     pub upstream_requests: Vec<(String, [u64; STATUS_CLASSES.len()])>,
     /// Per-upstream duration sums and counts, sorted by upstream name.
     ///
     /// Each entry is `(upstream, sum_nanos, count)`.
     pub upstream_duration: Vec<(String, u64, u64)>,
+    /// Per-upstream request and response body bytes.
+    #[serde(default)]
+    pub upstream_bytes: Vec<(String, u64, u64)>,
     /// Cache lookups that were hits.
     pub cache_hits: u64,
     /// Cache lookups that were misses.
@@ -238,6 +257,10 @@ impl Delta {
                 .iter()
                 .all(|(_, counts)| counts.iter().all(|&value| value == 0))
             && self
+                .route_bytes
+                .iter()
+                .all(|(_, request, response)| *request == 0 && *response == 0)
+            && self
                 .upstream_requests
                 .iter()
                 .all(|(_, counts)| counts.iter().all(|&value| value == 0))
@@ -245,6 +268,10 @@ impl Delta {
                 .upstream_duration
                 .iter()
                 .all(|(_, sum, count)| *sum == 0 && *count == 0)
+            && self
+                .upstream_bytes
+                .iter()
+                .all(|(_, request, response)| *request == 0 && *response == 0)
             && self.cache_hits == 0
             && self.cache_misses == 0
             && self.cache_stale == 0
@@ -371,6 +398,14 @@ impl Metrics {
         }
     }
 
+    /// Record request and response body bytes for an existing route label.
+    pub fn record_route_bytes(&self, route: &str, request: u64, response: u64) {
+        let mut routes = lock(&self.routes);
+        if let Some(stats) = routes.get_mut(route) {
+            stats.record_bytes(request, response);
+        }
+    }
+
     /// Record one finished request for an upstream.
     ///
     /// At most [`MAX_LABELS`] distinct upstreams are tracked; new labels are
@@ -379,6 +414,14 @@ impl Metrics {
         let nanos = nanos_of(duration);
         let mut upstreams = lock(&self.upstreams);
         record_labeled(&mut upstreams, upstream, status, nanos);
+    }
+
+    /// Record request and response body bytes for an existing upstream label.
+    pub fn record_upstream_bytes(&self, upstream: &str, request: u64, response: u64) {
+        let mut upstreams = lock(&self.upstreams);
+        if let Some(stats) = upstreams.get_mut(upstream) {
+            stats.record_bytes(request, response);
+        }
     }
 
     /// Record one cache hit.
@@ -532,8 +575,9 @@ impl Metrics {
             .collect();
         let duration_sum_nanos = self.duration_sum_nanos.swap(0, Ordering::Relaxed);
         let duration_count = self.duration_count.swap(0, Ordering::Relaxed);
-        let (route_requests, route_duration, route_cache) = take_labeled(&self.routes);
-        let (upstream_requests, upstream_duration, _) = take_labeled(&self.upstreams);
+        let (route_requests, route_duration, route_cache, route_bytes) = take_labeled(&self.routes);
+        let (upstream_requests, upstream_duration, _, upstream_bytes) =
+            take_labeled(&self.upstreams);
 
         Delta {
             requests,
@@ -543,8 +587,10 @@ impl Metrics {
             route_requests,
             route_duration,
             route_cache,
+            route_bytes,
             upstream_requests,
             upstream_duration,
+            upstream_bytes,
             cache_hits: self.cache_hits.swap(0, Ordering::Relaxed),
             cache_misses: self.cache_misses.swap(0, Ordering::Relaxed),
             cache_stale: self.cache_stale.swap(0, Ordering::Relaxed),
@@ -614,7 +660,12 @@ impl Metrics {
 
         {
             let mut routes = lock(&self.routes);
-            apply_labeled(&mut routes, &delta.route_requests, &delta.route_duration);
+            apply_labeled(
+                &mut routes,
+                &delta.route_requests,
+                &delta.route_duration,
+                &delta.route_bytes,
+            );
             apply_route_cache(&mut routes, &delta.route_cache);
         }
         {
@@ -623,6 +674,7 @@ impl Metrics {
                 &mut upstreams,
                 &delta.upstream_requests,
                 &delta.upstream_duration,
+                &delta.upstream_bytes,
             );
         }
 
@@ -760,11 +812,16 @@ impl Metrics {
         out.push_str("# TYPE elira_route_requests_total counter\n");
         out.push_str("# HELP elira_route_duration_seconds Time spent handling requests per configured route.\n");
         out.push_str("# TYPE elira_route_duration_seconds summary\n");
+        out.push_str(
+            "# HELP elira_route_bytes Request and response body bytes per configured route.\n",
+        );
+        out.push_str("# TYPE elira_route_bytes counter\n");
         render_labeled(
             out,
             &lock(&self.routes),
             "elira_route_requests_total",
             "elira_route_duration_seconds",
+            "elira_route_bytes",
             "route",
         );
 
@@ -799,11 +856,14 @@ impl Metrics {
             "# HELP elira_upstream_duration_seconds Time spent waiting for an upstream.\n",
         );
         out.push_str("# TYPE elira_upstream_duration_seconds summary\n");
+        out.push_str("# HELP elira_upstream_bytes Request and response body bytes per upstream.\n");
+        out.push_str("# TYPE elira_upstream_bytes counter\n");
         render_labeled(
             out,
             &lock(&self.upstreams),
             "elira_upstream_requests_total",
             "elira_upstream_duration_seconds",
+            "elira_upstream_bytes",
             "upstream",
         );
 
@@ -1010,14 +1070,21 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Remove all labelled series, returning requests and durations in name order.
+/// Remove all labelled series, returning requests, durations, cache results
+/// and bytes in name order.
 fn take_labeled(
     mutex: &Mutex<BTreeMap<String, Labeled>>,
-) -> (LabeledRequests, LabeledDuration, Vec<(String, [u64; 3])>) {
+) -> (
+    LabeledRequests,
+    LabeledDuration,
+    Vec<(String, [u64; 3])>,
+    LabeledBytes,
+) {
     let map = std::mem::take(&mut *lock(mutex));
     let mut requests = Vec::with_capacity(map.len());
     let mut duration = Vec::with_capacity(map.len());
     let mut cache = Vec::new();
+    let mut bytes = Vec::new();
     for (label, stats) in map {
         duration.push((
             label.clone(),
@@ -1027,10 +1094,13 @@ fn take_labeled(
         requests.push((label.clone(), stats.requests));
         let counts = [stats.cache_hits, stats.cache_misses, stats.cache_stale];
         if counts.iter().any(|&value| value != 0) {
-            cache.push((label, counts));
+            cache.push((label.clone(), counts));
+        }
+        if stats.request_bytes != 0 || stats.response_bytes != 0 {
+            bytes.push((label, stats.request_bytes, stats.response_bytes));
         }
     }
-    (requests, duration, cache)
+    (requests, duration, cache, bytes)
 }
 
 /// Merge the request and duration halves of a delta into one label map.
@@ -1042,6 +1112,7 @@ fn apply_labeled(
     map: &mut BTreeMap<String, Labeled>,
     requests: &[(String, [u64; STATUS_CLASSES.len()])],
     duration: &[(String, u64, u64)],
+    bytes: &[(String, u64, u64)],
 ) {
     let mut incoming: BTreeMap<&str, Labeled> = BTreeMap::new();
     for (label, counters) in requests {
@@ -1054,6 +1125,11 @@ fn apply_labeled(
         let stats = incoming.entry(label.as_str()).or_default();
         stats.duration_sum_nanos = stats.duration_sum_nanos.saturating_add(*sum);
         stats.duration_count = stats.duration_count.saturating_add(*count);
+    }
+    for (label, request, response) in bytes {
+        let stats = incoming.entry(label.as_str()).or_default();
+        stats.request_bytes = stats.request_bytes.saturating_add(*request);
+        stats.response_bytes = stats.response_bytes.saturating_add(*response);
     }
 
     for (label, stats) in incoming {
@@ -1106,6 +1182,7 @@ fn render_labeled(
     map: &BTreeMap<String, Labeled>,
     requests_name: &str,
     duration_name: &str,
+    bytes_name: &str,
     label_key: &str,
 ) {
     for (label, stats) in map {
@@ -1129,6 +1206,20 @@ fn render_labeled(
             out,
             "{duration_name}_count{{{label_key}=\"{label}\"}} {}",
             stats.duration_count
+        );
+    }
+
+    for (label, stats) in map {
+        let label = escape_label(label);
+        let _ = writeln!(
+            out,
+            "{bytes_name}_request_total{{{label_key}=\"{label}\"}} {}",
+            stats.request_bytes
+        );
+        let _ = writeln!(
+            out,
+            "{bytes_name}_response_total{{{label_key}=\"{label}\"}} {}",
+            stats.response_bytes
         );
     }
 }
@@ -1402,6 +1493,8 @@ mod tests {
         metrics.record_route("static", 404, Duration::ZERO);
         metrics.record_upstream("backend-a", 200, Duration::from_millis(15));
         metrics.record_upstream("backend-a", 502, Duration::from_millis(5));
+        metrics.record_route_bytes("api", 12, 34);
+        metrics.record_upstream_bytes("backend-a", 5, 21);
 
         let text = metrics.render();
         assert!(line(
@@ -1450,7 +1543,33 @@ mod tests {
             ),
             "2"
         );
+        assert_eq!(
+            series_value(&text, "elira_route_bytes_request_total{route=\"api\"}"),
+            "12"
+        );
+        assert_eq!(
+            series_value(&text, "elira_route_bytes_response_total{route=\"api\"}"),
+            "34"
+        );
+        assert_eq!(
+            series_value(
+                &text,
+                "elira_upstream_bytes_request_total{upstream=\"backend-a\"}"
+            ),
+            "5"
+        );
+        assert_eq!(
+            series_value(
+                &text,
+                "elira_upstream_bytes_response_total{upstream=\"backend-a\"}"
+            ),
+            "21"
+        );
         assert_valid_exposition(&text);
+
+        let delta = metrics.take_delta();
+        assert_eq!(delta.route_bytes, vec![("api".to_owned(), 12, 34)]);
+        assert_eq!(delta.upstream_bytes, vec![("backend-a".to_owned(), 5, 21)]);
     }
 
     #[test]

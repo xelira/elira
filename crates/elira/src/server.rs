@@ -1037,6 +1037,12 @@ async fn serve_conn<I>(
             }
             let bytes = response.body().size_hint().exact().unwrap_or(0);
             metrics.response_bytes(bytes);
+            if let Some(route) = &route_label {
+                metrics.record_route_bytes(route, request_bytes, bytes);
+            }
+            if let Some(name) = &upstream {
+                metrics.record_upstream_bytes(name, request_bytes, bytes);
+            }
             let write_log = access_log && elira_accesslog::sampled(&id, access_log_sample);
             let entry = Entry {
                 peer: peer.ip(),

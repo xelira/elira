@@ -513,6 +513,12 @@ where
     }
     let bytes = response.body().size_hint().exact().unwrap_or(0);
     metrics.response_bytes(bytes);
+    if let Some(labels) = response.extensions().get::<elira_proxy::Labels>() {
+        metrics.record_route_bytes(&labels.route, 0, bytes);
+        if let Some(name) = &labels.upstream {
+            metrics.record_upstream_bytes(name, 0, bytes);
+        }
+    }
 
     let (parts, body) = response.into_parts();
     let mut out = Response::builder().status(parts.status);
