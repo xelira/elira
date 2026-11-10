@@ -166,6 +166,8 @@
 - `match = "exact"` и `no_regex` (`location =` и `^~`).
 - `[[routes.locations]]`: вложенные location с наследованием цели и пути.
 - `name = "@fallback"` и `internal` для внутренних переходов из `try_files`.
+- `CONNECT` поверх HTTP/2 и WebSocket over HTTP/2 (RFC 8441) с трансляцией
+  extended `CONNECT` в HTTP/1.1 `Upgrade` для upstream.
 - `Cache-Control: must-revalidate` запрещает stale-выдачу; `Expires`/`Date`
   задают TTL, если `max-age` нет. Запросы с `no-cache`/`no-store` обходят кэш.
 - Заголовки `Forwarded` и `X-Forwarded-Port` к upstream.

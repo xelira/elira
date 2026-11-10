@@ -111,8 +111,21 @@ impl Proxy {
         scheme: &'static str,
         listener: &str,
     ) -> Result<Response<Body>, Response<Body>> {
-        if req.method() == Method::CONNECT {
+        let connect_protocol = req
+            .extensions()
+            .get::<hyper::ext::Protocol>()
+            .map(|protocol| protocol.as_str().to_owned());
+        if req.method() == Method::CONNECT && connect_protocol.is_none() {
             return self.connect(req).await;
+        }
+        if connect_protocol
+            .as_deref()
+            .is_some_and(|protocol| protocol != "websocket")
+        {
+            return Err(text(
+                StatusCode::NOT_IMPLEMENTED,
+                "unsupported CONNECT protocol",
+            ));
         }
         // hyper decodes only the chunked layer. `gzip, chunked` would reach
         // the backend still gzipped and without the header saying so.
@@ -144,7 +157,11 @@ impl Proxy {
         let is_get = req.method() == Method::GET;
         let forwarded_for = self.forwarded_for(&req, peer);
 
-        let requested_upgrade = wants_upgrade(req.headers());
+        let requested_upgrade = wants_upgrade(req.headers()).or_else(|| {
+            connect_protocol
+                .as_ref()
+                .map(|_| HeaderValue::from_static("websocket"))
+        });
         let client_upgrade = requested_upgrade
             .as_ref()
             .map(|_| hyper::upgrade::on(&mut req));
@@ -340,8 +357,13 @@ impl Proxy {
             let uri = upstream_uri(&server, &upstream_path, pool.scheme)
                 .ok_or_else(|| text(StatusCode::BAD_GATEWAY, "bad upstream address"))?;
 
+            let method = if connect_protocol.is_some() {
+                Method::GET
+            } else {
+                parts.method.clone()
+            };
             let mut upstream = Request::builder()
-                .method(parts.method.clone())
+                .method(method)
                 .uri(uri)
                 .body(body.take().unwrap_or_else(empty))
                 .map_err(|_| text(StatusCode::BAD_GATEWAY, "bad request"))?;
@@ -355,6 +377,7 @@ impl Proxy {
                     server,
                     route_timeout,
                     proxy_permit,
+                    connect_protocol.is_some(),
                 )
                 .await;
             match &result {

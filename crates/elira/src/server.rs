@@ -854,6 +854,7 @@ async fn serve_conn<I>(
     if opts.h2 {
         let conn = http2::Builder::new(TokioExecutor::new())
             .timer(TokioTimer::new())
+            .enable_connect_protocol()
             .keep_alive_interval(Some(Duration::from_secs(30)))
             .keep_alive_timeout(Duration::from_secs(20))
             .max_header_list_size(opts.max_buf_size as u32)

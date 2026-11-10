@@ -88,6 +88,7 @@ impl Proxy {
 
     /// Upgrades cannot go through the connection pool: hyper has to hand the
     /// socket over instead of returning it. Open a raw connection and tunnel.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn forward_upgrade(
         &self,
         upstream: Request<Body>,
@@ -96,6 +97,7 @@ impl Proxy {
         server: ServerAddr,
         timeout: Duration,
         client_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+        extended_connect: bool,
     ) -> Result<Response<Body>, Response<Body>> {
         // Tunnels outlive the connection task that the accept loop tracks,
         // so they need their own bound.
@@ -119,6 +121,12 @@ impl Proxy {
             read_head(&mut stream, timeout).await?;
 
         if status != StatusCode::SWITCHING_PROTOCOLS {
+            if extended_connect {
+                return Err(text(
+                    StatusCode::BAD_GATEWAY,
+                    "upstream refused the upgrade",
+                ));
+            }
             // The upstream refused the upgrade. Pass the answer through with
             // an empty body; upgrade attempts are small and rare.
             headers.insert(SERVER, HeaderValue::from_static("elira"));
@@ -137,8 +145,10 @@ impl Proxy {
 
         // The upstream decides which protocol it accepted.
         let upgrade = upstream_upgrade.unwrap_or(upgrade);
-        headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
-        headers.insert(UPGRADE, upgrade);
+        if !extended_connect {
+            headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
+            headers.insert(UPGRADE, upgrade);
+        }
         headers.insert(SERVER, HeaderValue::from_static("elira"));
 
         let idle = self.inner.tunnel_idle;
@@ -166,8 +176,13 @@ impl Proxy {
         let body = Full::new(Bytes::new())
             .map_err(|never| match never {})
             .boxed();
+        let status = if extended_connect {
+            StatusCode::OK
+        } else {
+            StatusCode::SWITCHING_PROTOCOLS
+        };
         Response::builder()
-            .status(StatusCode::SWITCHING_PROTOCOLS)
+            .status(status)
             .body(body)
             .map(|mut response| {
                 *response.headers_mut() = headers;

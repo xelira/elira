@@ -132,6 +132,16 @@ Living list for the self-improvement loop. One item per session.
 - [x] Named locations and `internal`.
 - [x] `alias` (distinct from `root`).
 - [x] `expires` and `etag off` for static responses.
+### Protocol gaps
+
+- [x] `CONNECT` over HTTP/2.
+- [x] WebSocket over HTTP/2 (RFC 8441), translated to an HTTP/1.1 upstream.
+- [ ] `CONNECT` over HTTP/3.
+- [ ] WebTransport and application HTTP/3 datagrams.
+- [ ] h2c via `Upgrade: h2c` (hyper cannot inject the upgraded stream 1).
+- [ ] SCGI, uWSGI and AJP upstreams.
+- [ ] FastCGI multiplexing.
+
 - [ ] `auth_request` subrequests.
 - [ ] `satisfy any/all` for auth plus ACL combinations.
 - [ ] `secure_link`.

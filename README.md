@@ -220,7 +220,9 @@ Upstreams:
   (in-process or in a child runner) and sandboxed WebAssembly modules
 - TCP and unix sockets in the same pool
 - TLS with a custom CA, explicit `insecure`, per-upstream SNI and HTTP/2
-- WebSocket and other `Upgrade` tunnelling, `CONNECT` with an explicit allowlist
+- WebSocket and other `Upgrade` tunnelling over HTTP/1.1, WebSocket over
+  HTTP/2 via RFC 8441 extended `CONNECT`, and `CONNECT` over HTTP/1.1 or
+  HTTP/2 with an explicit allowlist
 - custom HTTP/2 and HTTP/3 upstream pools with connection/stream stats,
   selectable per upstream
 - RFC 7239 `Forwarded` plus `X-Forwarded-For/Proto/Host/Port`, with the
@@ -239,6 +241,8 @@ TLS:
 HTTP:
 
 - HTTP/1.1, HTTP/2 (TLS or h2c with prior knowledge), HTTP/3 over QUIC
+- RFC 8441 WebSocket over HTTP/2, translated to an HTTP/1.1 `Upgrade` when the
+  upstream does not speak extended CONNECT
 - response trailers (gRPC `grpc-status`) forwarded end to end
 - optional TLS and HTTP/2 on the unix listener, using the same `[tls]`
 - body progress timeouts, websocket/CONNECT idle timeout and request-body caps

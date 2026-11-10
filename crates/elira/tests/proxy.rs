@@ -631,6 +631,111 @@ upstream = "app"
     assert_eq!(status(&denied), "HTTP/1.1 403 Forbidden");
 }
 
+#[tokio::test]
+async fn websocket_over_http2_extended_connect() {
+    use http_body_util::Empty;
+    use hyper::body::Bytes;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+
+    let upstream = upstream().await;
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+h2c = true
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "*"
+upstream = "app"
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let tcp = TcpStream::connect(addr).await.expect("connect");
+    let (mut sender, connection) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tcp))
+            .await
+            .expect("h2 handshake");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let mut request = hyper::Request::builder()
+        .method(http::Method::CONNECT)
+        .uri("http://example.com/ws")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("sec-websocket-version", "13")
+        .body(Empty::<Bytes>::new())
+        .expect("extended CONNECT");
+    request
+        .extensions_mut()
+        .insert(hyper::ext::Protocol::from_static("websocket"));
+
+    let response = sender
+        .send_request(request)
+        .await
+        .expect("extended CONNECT");
+    assert_eq!(response.status(), http::StatusCode::OK);
+
+    let upgraded = hyper::upgrade::on(response).await.expect("upgrade");
+    let mut upgraded = TokioIo::new(upgraded);
+    upgraded.write_all(b"ping").await.expect("write");
+    let mut echoed = [0u8; 4];
+    upgraded.read_exact(&mut echoed).await.expect("read");
+    assert_eq!(&echoed, b"ping");
+}
+
+#[tokio::test]
+async fn connect_tunnels_over_http2() {
+    use http_body_util::Empty;
+    use hyper::body::Bytes;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+
+    let echo = tcp_echo().await;
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+h2c = true
+
+[connect]
+enabled = true
+allow = ["{echo}"]
+
+[[routes]]
+host = "*"
+return = {{ status = 404, body = "no route" }}
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let tcp = TcpStream::connect(addr).await.expect("connect");
+    let (mut sender, connection) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tcp))
+            .await
+            .expect("h2 handshake");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let request = hyper::Request::builder()
+        .method(http::Method::CONNECT)
+        .uri(format!("{echo}"))
+        .body(Empty::<Bytes>::new())
+        .expect("CONNECT request");
+    let response = sender.send_request(request).await.expect("h2 CONNECT");
+    assert_eq!(response.status(), http::StatusCode::OK);
+
+    let upgraded = hyper::upgrade::on(response).await.expect("upgrade");
+    let mut upgraded = TokioIo::new(upgraded);
+    upgraded.write_all(b"ping").await.expect("write");
+    let mut echoed = [0u8; 4];
+    upgraded.read_exact(&mut echoed).await.expect("read");
+    assert_eq!(&echoed, b"ping");
+}
+
 fn temp_root(label: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static NEXT: AtomicUsize = AtomicUsize::new(0);
