@@ -102,6 +102,14 @@ pub struct Limits {
     #[serde(default)]
     pub limit_rate_after: u64,
 
+    /// Cache file metadata for up to this many paths. Zero disables the cache.
+    #[serde(default)]
+    pub open_file_cache: usize,
+
+    /// Metadata lifetime in the open-file cache.
+    #[serde(default = "Limits::default_open_file_cache_ttl_secs")]
+    pub open_file_cache_ttl_secs: u64,
+
     /// Token bucket per client IP. Zero disables the limiter.
     #[serde(default)]
     pub requests_per_second: u32,
@@ -244,6 +252,8 @@ impl Default for Limits {
             max_body_bytes: 0,
             limit_rate: 0,
             limit_rate_after: 0,
+            open_file_cache: 0,
+            open_file_cache_ttl_secs: Self::default_open_file_cache_ttl_secs(),
             requests_per_second: 0,
             burst: 0,
             trusted_proxies: Vec::new(),
@@ -300,6 +310,10 @@ impl Limits {
     }
 
     fn default_client_header_timeout_secs() -> u64 {
+        30
+    }
+
+    fn default_open_file_cache_ttl_secs() -> u64 {
         30
     }
 

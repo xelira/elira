@@ -58,7 +58,7 @@ pub(crate) use pool::*;
 pub use tunnel::ConnectError;
 use variables::*;
 
-use files::Files;
+use files::{FileCache, Files};
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -428,11 +428,17 @@ impl Proxy {
         let resolver = build_resolver(cfg);
         let (pools, all_pools) = build_pools(cfg, resolver.clone())?;
         let caches = build_caches(cfg);
+        let file_cache = (cfg.limits.open_file_cache > 0).then(|| {
+            Arc::new(FileCache::new(
+                cfg.limits.open_file_cache,
+                Duration::from_secs(cfg.limits.open_file_cache_ttl_secs),
+            ))
+        });
 
         let mut entries: Vec<(RouteEntry, Vec<String>)> = Vec::new();
         for route in &cfg.routes {
             entries.push((
-                build_route(route, cfg, &pools, &caches)?,
+                build_route(route, cfg, &pools, &caches, file_cache.as_ref())?,
                 route.listeners.clone(),
             ));
         }

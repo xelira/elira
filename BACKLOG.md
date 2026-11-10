@@ -183,7 +183,7 @@ Living list for the self-improvement loop. One item per session.
 - [x] Configurable `client_header_timeout`.
 - [ ] `lingering_close` and `reset_timedout_connection`.
 - [x] Log reopen on SIGUSR1 for external rotation.
-- [ ] `open_file_cache`.
+- [x] `open_file_cache` for static metadata.
 - [ ] `worker_rlimit_nofile` propagation tuning and `worker_processes auto`.
 
 ### Section 5 — HTTP details

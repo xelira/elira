@@ -400,6 +400,7 @@ pub(crate) fn error_page_set(
         None,
         true,
         true,
+        None,
     ));
     let mut out = Vec::new();
     for page in pages {

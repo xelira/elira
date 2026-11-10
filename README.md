@@ -237,6 +237,7 @@ Upstreams:
 - client keep-alive request caps via `limits.keepalive_requests`
 - response bandwidth throttling (`limit_rate`/`limit_rate_after`) and per-IP
   connection limits
+- an open-file metadata cache for static files (`open_file_cache`)
 - upstream keepalive pool sizing and idle lifetime (`keepalive`,
   `keepalive_secs`)
 - a shared DNS cache with positive/negative TTLs and static host overrides for

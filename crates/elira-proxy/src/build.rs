@@ -225,8 +225,9 @@ pub(crate) fn build_route(
     cfg: &Config,
     pools: &Pools,
     caches: &Caches,
+    file_cache: Option<&Arc<FileCache>>,
 ) -> Result<RouteEntry, Error> {
-    let target = build_target(route, cfg, pools)?;
+    let target = build_target(route, cfg, pools, file_cache)?;
     let (cache, cache_max_item) = if route.cache_enabled == Some(false) {
         (None, 0)
     } else if let Some(name) = &route.cache_zone {
@@ -427,7 +428,12 @@ pub(crate) fn build_route(
     Ok(entry)
 }
 
-fn build_target(route: &elira_config::Route, cfg: &Config, pools: &Pools) -> Result<Target, Error> {
+fn build_target(
+    route: &elira_config::Route,
+    cfg: &Config,
+    pools: &Pools,
+    file_cache: Option<&Arc<FileCache>>,
+) -> Result<Target, Error> {
     Ok(if let Some(upstream) = &route.upstream {
         Target::Proxy(
             pools
@@ -450,6 +456,7 @@ fn build_target(route: &elira_config::Route, cfg: &Config, pools: &Pools) -> Res
             route.expires_secs,
             route.etag.unwrap_or(true),
             route.if_modified_since.unwrap_or(true),
+            file_cache.cloned(),
         )))
     } else if let Some(alias) = &route.alias {
         Target::Files(Arc::new(Files::new(
@@ -464,6 +471,7 @@ fn build_target(route: &elira_config::Route, cfg: &Config, pools: &Pools) -> Res
             route.expires_secs,
             route.etag.unwrap_or(true),
             route.if_modified_since.unwrap_or(true),
+            file_cache.cloned(),
         )))
     } else if let Some(pass) = &route.fastcgi_pass {
         let target = elira_fastcgi::Target::parse(pass).map_err(|err| Error::RouteConfig {

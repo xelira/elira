@@ -2276,6 +2276,24 @@ limit_rate_after = 0
 }
 
 #[test]
+fn open_file_cache_is_parsed() {
+    let text = r#"
+listen = "127.0.0.1:8080"
+
+[limits]
+open_file_cache = 128
+open_file_cache_ttl_secs = 12
+
+[[routes]]
+host = "*"
+root = "/srv"
+"#;
+    let cfg = Config::parse(text).expect("valid config");
+    assert_eq!(cfg.limits.open_file_cache, 128);
+    assert_eq!(cfg.limits.open_file_cache_ttl_secs, 12);
+}
+
+#[test]
 fn named_locations_are_validated() {
     let base = r#"
 listen = "127.0.0.1:8080"

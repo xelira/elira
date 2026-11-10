@@ -4,10 +4,12 @@
 //! the root, answer conditional requests so browsers stop re-downloading, and
 //! honour a single byte range so video and resumable downloads work.
 
+use std::collections::HashMap;
 use std::io::SeekFrom;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use futures_util::TryStreamExt;
@@ -24,6 +26,64 @@ use tokio_util::io::ReaderStream;
 
 use super::{text, BoxError};
 
+pub(crate) struct FileCache {
+    ttl: Duration,
+    max: usize,
+    entries: Mutex<HashMap<PathBuf, CachedMeta>>,
+}
+
+struct CachedMeta {
+    at: Instant,
+    meta: std::fs::Metadata,
+}
+
+impl FileCache {
+    pub(crate) fn new(max: usize, ttl: Duration) -> Self {
+        Self {
+            ttl,
+            max: max.max(1),
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn metadata(&self, path: &Path) -> std::io::Result<std::fs::Metadata> {
+        {
+            let entries = self
+                .entries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(entry) = entries.get(path) {
+                if entry.at.elapsed() < self.ttl {
+                    return Ok(entry.meta.clone());
+                }
+            }
+        }
+
+        let meta = tokio::fs::metadata(path).await?;
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if entries.len() >= self.max {
+            if let Some(oldest) = entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.at)
+                .map(|(path, _)| path.clone())
+            {
+                entries.remove(&oldest);
+            }
+        }
+        entries.insert(
+            path.to_path_buf(),
+            CachedMeta {
+                at: Instant::now(),
+                meta: meta.clone(),
+            },
+        );
+        Ok(meta)
+    }
+}
+
 pub(crate) struct Files {
     root: PathBuf,
     prefix: Option<String>,
@@ -37,6 +97,7 @@ pub(crate) struct Files {
     expires: Option<u64>,
     etag: bool,
     if_modified_since: bool,
+    cache: Option<Arc<FileCache>>,
 }
 
 impl Files {
@@ -53,6 +114,7 @@ impl Files {
         expires: Option<u64>,
         etag: bool,
         if_modified_since: bool,
+        cache: Option<Arc<FileCache>>,
     ) -> Self {
         let mut try_files = try_files;
         let fallback_name = if try_files.last().is_some_and(|name| name.starts_with('@')) {
@@ -73,6 +135,14 @@ impl Files {
             expires,
             etag,
             if_modified_since,
+            cache,
+        }
+    }
+
+    async fn metadata(&self, path: &Path) -> std::io::Result<std::fs::Metadata> {
+        match &self.cache {
+            Some(cache) => cache.metadata(path).await,
+            None => tokio::fs::metadata(path).await,
         }
     }
 
@@ -123,7 +193,7 @@ impl Files {
         };
 
         let mut candidate = root.join(&relative);
-        let mut meta = tokio::fs::metadata(&candidate).await.ok();
+        let mut meta = self.metadata(&candidate).await.ok();
 
         if let Some(current) = &meta {
             if current.is_dir() {
@@ -144,7 +214,7 @@ impl Files {
         if meta.is_none() {
             if let Some(path) = self.try_files(&root, &relative).await {
                 candidate = path;
-                meta = tokio::fs::metadata(&candidate).await.ok();
+                meta = self.metadata(&candidate).await.ok();
             }
         }
 
@@ -194,7 +264,7 @@ impl Files {
 
         let root = tokio::fs::canonicalize(&self.root).await.ok()?;
         let mut candidate = root.join(&relative);
-        let mut meta = tokio::fs::metadata(&candidate).await.ok();
+        let mut meta = self.metadata(&candidate).await.ok();
 
         if let Some(current) = &meta {
             if current.is_dir() {
@@ -213,7 +283,7 @@ impl Files {
 
         if meta.is_none() {
             candidate = self.try_files(&root, &relative).await?;
-            meta = tokio::fs::metadata(&candidate).await.ok();
+            meta = self.metadata(&candidate).await.ok();
         }
 
         meta?;
@@ -228,7 +298,7 @@ impl Files {
     async fn index_for(&self, dir: &Path) -> Option<(PathBuf, std::fs::Metadata)> {
         for name in &self.index {
             let path = dir.join(name);
-            if let Ok(meta) = tokio::fs::metadata(&path).await {
+            if let Ok(meta) = self.metadata(&path).await {
                 if meta.is_file() {
                     return Some((path, meta));
                 }
@@ -243,7 +313,7 @@ impl Files {
         for pattern in &self.try_files {
             let candidate = pattern.replace("$uri", &uri);
             let path = root.join(candidate.trim_start_matches('/'));
-            if let Ok(meta) = tokio::fs::metadata(&path).await {
+            if let Ok(meta) = self.metadata(&path).await {
                 if meta.is_file() {
                     return Some(path);
                 }
@@ -310,7 +380,7 @@ impl Files {
             Ok(resolved) => resolved,
             Err(_) => return text(StatusCode::NOT_FOUND, "not found"),
         };
-        let meta = match tokio::fs::metadata(&resolved).await {
+        let meta = match self.metadata(&resolved).await {
             Ok(meta) => meta,
             Err(_) => return text(StatusCode::NOT_FOUND, "not found"),
         };
@@ -332,7 +402,7 @@ impl Files {
         let mut content_encoding = None;
         if let Some(encoding) = crate::preferred_encoding(req.headers()) {
             let candidate = PathBuf::from(format!("{}.{}", path.display(), encoding));
-            if let Ok(meta) = tokio::fs::metadata(&candidate).await {
+            if let Ok(meta) = self.metadata(&candidate).await {
                 if meta.is_file() {
                     path = candidate;
                     content_encoding = Some(encoding);
@@ -340,7 +410,7 @@ impl Files {
             }
         }
 
-        let meta = match tokio::fs::metadata(&path).await {
+        let meta = match self.metadata(&path).await {
             Ok(meta) => meta,
             Err(_) => meta.clone(),
         };
@@ -899,5 +969,32 @@ mod tests {
         );
         assert_eq!(content_type(Path::new("a.WASM")), "application/wasm");
         assert_eq!(content_type(Path::new("a.bin")), "application/octet-stream");
+    }
+
+    #[tokio::test]
+    async fn file_cache_reuses_metadata_until_ttl_expires() {
+        let path = std::env::temp_dir().join(format!(
+            "elira-file-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&path, b"cached").expect("write file");
+
+        let cache = FileCache::new(4, Duration::from_secs(30));
+        assert!(cache.metadata(&path).await.is_ok());
+        std::fs::remove_file(&path).expect("remove file");
+        assert!(
+            cache.metadata(&path).await.is_ok(),
+            "metadata should come from the cache"
+        );
+
+        std::fs::write(&path, b"fresh").expect("write file");
+        let no_cache = FileCache::new(4, Duration::ZERO);
+        assert!(no_cache.metadata(&path).await.is_ok());
+        std::fs::remove_file(&path).expect("remove file");
+        assert!(no_cache.metadata(&path).await.is_err());
     }
 }
