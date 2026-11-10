@@ -262,6 +262,7 @@ struct RouteEntry {
     max_upstream_response: Option<usize>,
     expires_secs: Option<u64>,
     etag: bool,
+    if_modified_since: bool,
     fastcgi_param: Vec<(String, String)>,
     cgi_param: Vec<(String, String)>,
     scgi_param: Vec<(String, String)>,
@@ -548,8 +549,9 @@ impl Proxy {
         {
             return None;
         }
-        // Cache headers and ETag policy belong to the Files response path.
-        if entry.expires_secs.is_some() || !entry.etag {
+        // Cache headers and ETag/If-Modified-Since policy belong to the Files
+        // response path.
+        if entry.expires_secs.is_some() || !entry.etag || !entry.if_modified_since {
             return None;
         }
 

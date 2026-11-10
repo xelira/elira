@@ -1860,6 +1860,24 @@ error_pages = ["404 =200 /404.html"]
 }
 
 #[test]
+fn if_modified_since_is_optional() {
+    let base = r#"
+listen = "127.0.0.1:8080"
+
+[[routes]]
+host = "*"
+root = "/srv"
+if_modified_since = false
+"#;
+    let cfg = Config::parse(base).expect("valid");
+    assert_eq!(cfg.routes[0].if_modified_since, Some(false));
+
+    let default = base.replace("if_modified_since = false\n", "");
+    let cfg = Config::parse(&default).expect("valid");
+    assert_eq!(cfg.routes[0].if_modified_since, None);
+}
+
+#[test]
 fn named_locations_are_validated() {
     let base = r#"
 listen = "127.0.0.1:8080"

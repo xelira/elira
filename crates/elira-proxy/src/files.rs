@@ -36,6 +36,7 @@ pub(crate) struct Files {
     min_bytes: u64,
     expires: Option<u64>,
     etag: bool,
+    if_modified_since: bool,
 }
 
 impl Files {
@@ -51,6 +52,7 @@ impl Files {
         min_bytes: usize,
         expires: Option<u64>,
         etag: bool,
+        if_modified_since: bool,
     ) -> Self {
         let mut try_files = try_files;
         let fallback_name = if try_files.last().is_some_and(|name| name.starts_with('@')) {
@@ -70,6 +72,7 @@ impl Files {
             min_bytes: min_bytes as u64,
             expires,
             etag,
+            if_modified_since,
         }
     }
 
@@ -347,7 +350,7 @@ impl Files {
         let etag_value = self.etag.then(|| etag(len, modified));
         let etag = etag_value.as_deref().unwrap_or_default();
 
-        if not_modified(req, etag_value.as_deref(), modified) {
+        if not_modified(req, etag_value.as_deref(), modified, self.if_modified_since) {
             let mut response = Response::new(empty());
             *response.status_mut() = StatusCode::NOT_MODIFIED;
             if let Some(etag) = etag_value {
@@ -576,6 +579,7 @@ fn not_modified(
     req: &Request<BoxBody<Bytes, BoxError>>,
     etag: Option<&str>,
     modified: Option<SystemTime>,
+    if_modified_since: bool,
 ) -> bool {
     if let (Some(etag), Some(value)) = (
         etag,
@@ -584,6 +588,10 @@ fn not_modified(
             .and_then(|v| v.to_str().ok()),
     ) {
         return value.trim() == "*" || value.split(',').any(|tag| tag.trim() == etag);
+    }
+
+    if !if_modified_since {
+        return false;
     }
 
     if let (Some(value), Some(modified)) = (

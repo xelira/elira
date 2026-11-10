@@ -1370,6 +1370,43 @@ x_sendfile_root = "{}"
     assert_eq!(status(&response), "HTTP/1.1 403 Forbidden", "{response}");
 }
 
+#[tokio::test]
+async fn if_modified_since_can_be_disabled() {
+    let root = temp_root("if-modified-since");
+    std::fs::write(root.join("index.html"), "home").unwrap();
+    let request = "GET / HTTP/1.1\r\nHost: example.com\r\nIf-Modified-Since: Wed, 21 Oct 2037 07:28:00 GMT\r\nConnection: close\r\n\r\n";
+
+    let enabled = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[routes]]
+host = "*"
+root = "{}"
+"#,
+        root.display()
+    );
+    let (addr, _stop, _metrics) = start(&enabled).await;
+    let response = roundtrip(addr, request).await;
+    assert_eq!(status(&response), "HTTP/1.1 304 Not Modified", "{response}");
+
+    let disabled = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[[routes]]
+host = "*"
+root = "{}"
+if_modified_since = false
+"#,
+        root.display()
+    );
+    let (addr, _stop, _metrics) = start(&disabled).await;
+    let response = roundtrip(addr, request).await;
+    assert_eq!(status(&response), "HTTP/1.1 200 OK", "{response}");
+    assert!(response.ends_with("home"), "{response}");
+}
+
 fn temp_root(label: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static NEXT: AtomicUsize = AtomicUsize::new(0);

@@ -154,7 +154,7 @@ Living list for the self-improvement loop. One item per session.
 - [x] `X-Accel-Redirect` and `X-Sendfile` from upstream responses.
 - [x] `error_page` status overrides (`=200`).
 - [ ] `error_page` named locations (`@name`).
-- [ ] `if_modified_since off` (response headers are already applied to every
+- [x] `if_modified_since off` (response headers are already applied to every
   status, matching `add_header ... always`).
 
 ### Section 3 — proxying and cache

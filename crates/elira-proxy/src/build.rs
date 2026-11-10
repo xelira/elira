@@ -234,6 +234,7 @@ pub(crate) fn build_route(
         max_upstream_response: route.max_upstream_response_bytes,
         expires_secs: route.expires_secs,
         etag: route.etag.unwrap_or(true),
+        if_modified_since: route.if_modified_since.unwrap_or(true),
         fastcgi_param: route
             .fastcgi_param
             .iter()
@@ -292,6 +293,7 @@ fn build_target(route: &elira_config::Route, cfg: &Config, pools: &Pools) -> Res
             cfg.compression.min_bytes,
             route.expires_secs,
             route.etag.unwrap_or(true),
+            route.if_modified_since.unwrap_or(true),
         )))
     } else if let Some(alias) = &route.alias {
         Target::Files(Arc::new(Files::new(
@@ -305,6 +307,7 @@ fn build_target(route: &elira_config::Route, cfg: &Config, pools: &Pools) -> Res
             cfg.compression.min_bytes,
             route.expires_secs,
             route.etag.unwrap_or(true),
+            route.if_modified_since.unwrap_or(true),
         )))
     } else if let Some(pass) = &route.fastcgi_pass {
         let target = elira_fastcgi::Target::parse(pass).map_err(|err| Error::RouteConfig {

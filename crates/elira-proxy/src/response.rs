@@ -318,6 +318,7 @@ impl Proxy {
             self.inner.compression.min_bytes,
             entry.expires_secs,
             entry.etag,
+            entry.if_modified_since,
         );
         let mut request = match Request::builder()
             .method(Method::GET)

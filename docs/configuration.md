@@ -835,6 +835,7 @@ buckets = [{ percent = 10, value = "a" }, { percent = 90, value = "b" }]
 | `alias` | путь | нет | каталог статики со срезом `path` |
 | `expires_secs` | целое ≥ 0 | нет | `Cache-Control: public, max-age` и `Expires` |
 | `etag` | bool | `true` | выдавать ли `ETag` для статики |
+| `if_modified_since` | bool | `true` | учитывать `If-Modified-Since` для статики |
 | `redirect` | таблица | нет | `{ to, status }`; вместо upstream и root |
 | `return` | таблица | нет | `{ status, body, content_type }` с переменными |
 | `if` | массив таблиц | `[]` | условие по переменной и `return` |
@@ -1024,8 +1025,9 @@ buckets = [{ percent = 10, value = "a" }, { percent = 90, value = "b" }]
   сочетается с `root`.
 - `expires_secs` добавляет к статике `Cache-Control: public, max-age=N` и
   `Expires`. `etag = false` убирает `ETag` и проверку `If-None-Match`, оставляя
-  `Last-Modified`. Оба поля не используются sendfile-быстрым путём — такие
-  ответы идут через hyper.
+  `Last-Modified`. `if_modified_since = false` отключает проверку
+  `If-Modified-Since` и всегда отдаёт тело. Эти поля не используются
+  sendfile-быстрым путём — такие ответы идут через hyper.
 - `index` — имена файлов, а не пути: элемент не может быть пустым, содержать
   `/` или `..`. Для каталога файлы перебираются по порядку. Запрос каталога
   без завершающего `/` получает `301`.

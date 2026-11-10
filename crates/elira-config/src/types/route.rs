@@ -163,6 +163,10 @@ pub struct Route {
     #[serde(default)]
     pub etag: Option<bool>,
 
+    /// Honour `If-Modified-Since` for static responses. Defaults to true.
+    #[serde(default)]
+    pub if_modified_since: Option<bool>,
+
     /// Redirect instead of proxying or serving. Exactly one target.
     #[serde(default)]
     pub redirect: Option<Redirect>,

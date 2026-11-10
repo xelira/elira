@@ -129,6 +129,7 @@ fn inherit(parent: &Route, child: &mut Route) -> Result<(), Error> {
         .or_else(|| parent.error_root.clone());
     child.expires_secs = child.expires_secs.or(parent.expires_secs);
     child.etag = child.etag.or(parent.etag);
+    child.if_modified_since = child.if_modified_since.or(parent.if_modified_since);
     child.auth_file = child.auth_file.clone().or_else(|| parent.auth_file.clone());
 
     if child.access_log == Route::default_access_log() {
@@ -249,6 +250,7 @@ mod tests {
             alias: None,
             expires_secs: None,
             etag: None,
+            if_modified_since: None,
             redirect: None,
             return_response: None,
             if_conditions: Vec::new(),

@@ -206,7 +206,8 @@ Routing:
 - `satisfy any` / `satisfy all` for ACL, basic auth and `auth_request`
 - `secure_link` MD5 signatures with query or path forms and expiry
 - `X-Accel-Redirect` and filesystem-scoped `X-Sendfile` from upstream
-- `error_page` status overrides such as `"404 =200 /soft-404.html"`, with
+- `error_page` status overrides such as `"404 =200 /soft-404.html"`
+- optional `if_modified_since = false` for static routes, with
   `$variable` expansion, plus `timeout_secs`, token bucket, concurrency limit,
   body cap and error pages
 - HTTP Basic auth from htpasswd (bcrypt) and IPv4/IPv6 allow/deny lists
