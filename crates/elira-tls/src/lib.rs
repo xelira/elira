@@ -25,7 +25,7 @@ use rustls::sign::CertifiedKey;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use rustls::{RootCertStore, ServerConfig};
+use rustls::{RootCertStore, ServerConfig, SignatureScheme};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -822,7 +822,7 @@ struct NamedResolver {
 }
 
 impl NamedResolver {
-    fn pick(&self, name: Option<&str>) -> Option<Arc<CertifiedKey>> {
+    fn pick(&self, name: Option<&str>, schemes: &[SignatureScheme]) -> Option<Arc<CertifiedKey>> {
         let Some(name) = name else {
             return if self.reject_unknown {
                 None
@@ -831,37 +831,48 @@ impl NamedResolver {
             };
         };
         let name = name.to_ascii_lowercase();
+        let mut fallback = None;
 
         for (names, key) in &self.named {
-            for pattern in names {
+            let matches = names.iter().any(|pattern| {
                 let pattern = pattern.to_ascii_lowercase();
                 if pattern == name {
-                    return Some(key.clone());
+                    return true;
                 }
-                if let Some(suffix) = pattern.strip_prefix("*.") {
-                    let suffix = format!(".{suffix}");
-                    if let Some(prefix) = name.strip_suffix(suffix.as_str()) {
-                        // The dot is part of the suffix, so `prefix` is the
-                        // label before it. A nested name must not match.
-                        if !prefix.is_empty() && !prefix.ends_with('.') && !prefix.contains('.') {
-                            return Some(key.clone());
-                        }
-                    }
-                }
+                let Some(suffix) = pattern.strip_prefix("*.") else {
+                    return false;
+                };
+                let suffix = format!(".{suffix}");
+                name.strip_suffix(suffix.as_str()).is_some_and(|prefix| {
+                    // The dot is part of the suffix, so `prefix` is the
+                    // label before it. A nested name must not match.
+                    !prefix.is_empty() && !prefix.ends_with('.') && !prefix.contains('.')
+                })
+            });
+            if !matches {
+                continue;
+            }
+            if key.key.choose_scheme(schemes).is_some() {
+                return Some(key.clone());
+            }
+            if fallback.is_none() {
+                fallback = Some(key.clone());
             }
         }
 
-        if self.reject_unknown {
-            None
-        } else {
-            self.default.clone()
-        }
+        fallback.or_else(|| {
+            if self.reject_unknown {
+                None
+            } else {
+                self.default.clone()
+            }
+        })
     }
 }
 
 impl ResolvesServerCert for NamedResolver {
     fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        self.pick(hello.server_name())
+        self.pick(hello.server_name(), hello.signature_schemes())
     }
 }
 
@@ -1293,22 +1304,22 @@ mod tests {
             reject_unknown: false,
         };
 
-        assert!(resolver.pick(Some("A.Example.COM")).is_some());
-        assert!(resolver.pick(Some("x.b.example.com")).is_some());
+        assert!(resolver.pick(Some("A.Example.COM"), &[]).is_some());
+        assert!(resolver.pick(Some("x.b.example.com"), &[]).is_some());
         assert!(
-            resolver.pick(Some("deep.x.b.example.com")).is_some(),
+            resolver.pick(Some("deep.x.b.example.com"), &[]).is_some(),
             "no match should still fall back to the default"
         );
-        assert!(resolver.pick(Some("x.wild.example.com")).is_some());
+        assert!(resolver.pick(Some("x.wild.example.com"), &[]).is_some());
 
         let no_default = NamedResolver {
             named: vec![(vec!["*.b.example.com".to_owned()], key)],
             default: None,
             reject_unknown: false,
         };
-        assert!(no_default.pick(Some("b.example.com")).is_none());
-        assert!(no_default.pick(Some("x.b.example.com")).is_some());
-        assert!(no_default.pick(Some("deep.x.b.example.com")).is_none());
+        assert!(no_default.pick(Some("b.example.com"), &[]).is_none());
+        assert!(no_default.pick(Some("x.b.example.com"), &[]).is_some());
+        assert!(no_default.pick(Some("deep.x.b.example.com"), &[]).is_none());
     }
 
     #[test]
@@ -1382,9 +1393,9 @@ mod tests {
             reject_unknown: false,
         };
 
-        let a = resolver.pick(Some("a.example.com")).expect("a");
+        let a = resolver.pick(Some("a.example.com"), &[]).expect("a");
         assert_eq!(a.ocsp.as_deref(), Some(&b"ocsp-for-a"[..]));
-        let b = resolver.pick(Some("b.example.com")).expect("b");
+        let b = resolver.pick(Some("b.example.com"), &[]).expect("b");
         assert_eq!(b.ocsp.as_deref(), Some(&b"ocsp-for-b"[..]));
     }
 

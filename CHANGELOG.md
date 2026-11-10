@@ -156,6 +156,7 @@
 - `keepalive_requests` для upstream-пула (ротация legacy-клиента).
 - Байты запроса/ответа в метриках по route и upstream.
 - `error_pages` с named locations (`@name`) для статики, `return` и `redirect`.
+- Одинаковые SNI-имена с RSA и ECDSA сертификатами: выбор по signature algorithms.
 - `GET /config` на админском листенере: эффективный конфиг в JSON.
 - Тесты FastCGI/CGI на обрезанные заголовки, длину записи, padding и хвост
   после `END_REQUEST`.

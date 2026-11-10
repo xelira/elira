@@ -727,30 +727,28 @@ redirect = { to = "https://example.com", status = 301 }
 }
 
 #[test]
-fn rejects_duplicate_certificate_names() {
+fn allows_duplicate_certificate_names_for_dual_certificates() {
     let text = r#"
 listen = "127.0.0.1:8443"
 
 [tls]
 
 [[tls.certificates]]
-cert = "/etc/elira/a.pem"
-key = "/etc/elira/a.key"
+cert = "/etc/elira/rsa.pem"
+key = "/etc/elira/rsa.key"
 names = ["example.com"]
 
 [[tls.certificates]]
-cert = "/etc/elira/b.pem"
-key = "/etc/elira/b.key"
+cert = "/etc/elira/ecdsa.pem"
+key = "/etc/elira/ecdsa.key"
 names = ["example.com"]
 
 [[routes]]
 host = "*"
 redirect = { to = "https://example.com", status = 301 }
 "#;
-    assert!(matches!(
-        Config::parse(text),
-        Err(Error::TlsCertificateNameDuplicate { .. })
-    ));
+    let cfg = Config::parse(text).expect("dual certificates");
+    assert_eq!(cfg.tls.as_ref().unwrap().certificates.len(), 2);
 }
 
 #[test]

@@ -192,8 +192,8 @@ Living list for the self-improvement loop. One item per session.
 - [ ] `103 Early Hints`: hyper's server side explicitly rejects 1xx
   responses, so this needs a different HTTP stack or a raw pre-hyper write.
 - [ ] `h2c Upgrade`.
-- [ ] Dual RSA + ECDSA certificates per name: rustls exposes one signing key
-  per SNI resolver result.
+- [x] Dual RSA + ECDSA certificates per name: duplicate SNI names are allowed
+  and the resolver picks a key compatible with the client's signature schemes.
 - [x] Verify stapled OCSP responses (`verify_ocsp`).
 - [x] `ssl_reject_handshake` for unknown SNI (`reject_unknown_sni`).
 - [x] HTTP/2 max concurrent streams and window tuning.

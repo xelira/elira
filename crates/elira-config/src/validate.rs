@@ -490,7 +490,6 @@ impl Config {
                     return Err(Error::ClientCrlWithoutAuth);
                 }
             }
-            let mut seen: Vec<String> = Vec::new();
             for (index, entry) in http3.certificates.iter().enumerate() {
                 if entry.cert.as_os_str().is_empty() || entry.key.as_os_str().is_empty() {
                     return Err(Error::TlsCertificatePair { index });
@@ -510,10 +509,6 @@ impl Config {
                             name: name.clone(),
                         });
                     }
-                    if seen.contains(&name) {
-                        return Err(Error::TlsCertificateNameDuplicate { name: name.clone() });
-                    }
-                    seen.push(name);
                 }
             }
         }
@@ -618,7 +613,6 @@ impl Config {
                 return Err(Error::RejectSniWithoutCertificates);
             }
 
-            let mut seen: Vec<String> = Vec::new();
             for (index, entry) in tls.certificates.iter().enumerate() {
                 if entry.cert.as_os_str().is_empty() || entry.key.as_os_str().is_empty() {
                     return Err(Error::TlsCertificatePair { index });
@@ -638,10 +632,6 @@ impl Config {
                             name: name.clone(),
                         });
                     }
-                    if seen.contains(&name) {
-                        return Err(Error::TlsCertificateNameDuplicate { name: name.clone() });
-                    }
-                    seen.push(name);
                 }
             }
         }
