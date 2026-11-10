@@ -62,6 +62,15 @@ pub struct Limits {
     #[serde(default = "Limits::default_upstream_timeout_secs")]
     pub upstream_timeout_secs: u64,
 
+    /// Time limit for the upstream TCP and TLS handshake.
+    #[serde(default = "Limits::default_upstream_connect_timeout_secs")]
+    pub upstream_connect_timeout_secs: u64,
+
+    /// Abort an upstream request body that stops making progress for this
+    /// long. Zero disables the check.
+    #[serde(default)]
+    pub upstream_send_timeout_secs: u64,
+
     /// How many client connections may be open at once.
     #[serde(default = "Limits::default_max_connections")]
     pub max_connections: usize,
@@ -204,6 +213,8 @@ impl Default for Limits {
             max_headers: Self::default_max_headers(),
             max_header_bytes: Self::default_max_header_bytes(),
             upstream_timeout_secs: Self::default_upstream_timeout_secs(),
+            upstream_connect_timeout_secs: Self::default_upstream_connect_timeout_secs(),
+            upstream_send_timeout_secs: 0,
             max_connections: Self::default_max_connections(),
             idle_timeout_secs: Self::default_idle_timeout_secs(),
             max_body_bytes: 0,
@@ -239,6 +250,10 @@ impl Limits {
 
     fn default_upstream_timeout_secs() -> u64 {
         30
+    }
+
+    fn default_upstream_connect_timeout_secs() -> u64 {
+        5
     }
 
     fn default_max_connections() -> usize {

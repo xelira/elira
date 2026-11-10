@@ -178,7 +178,9 @@ upstream. Нужен `error_root`; задавать их можно только
 | --- | --- | --- | --- |
 | `max_headers` | целое > 0 | `64` | максимум заголовков в запросе (HTTP/1.1) |
 | `max_header_bytes` | целое ≥ 8192 | `16384` (16 КиБ) | предел буфера заголовков |
-| `upstream_timeout_secs` | целое, секунды | `30` | таймаут запроса к upstream |
+| `upstream_timeout_secs` | целое, секунды | `30` | таймаут ожидания заголовков ответа upstream |
+| `upstream_connect_timeout_secs` | целое > 0 | `5` | таймаут TCP/TLS-соединения с upstream |
+| `upstream_send_timeout_secs` | целое, секунды | `0` | прервать запись тела в upstream без прогресса; `0` выключает |
 | `max_connections` | целое > 0 | `1024` | одновременные клиентские соединения |
 | `idle_timeout_secs` | целое, секунды | `60` | закрытие простаивающего keep-alive соединения |
 | `max_body_bytes` | целое ≥ 0 | `0` | `413`, если `Content-Length` больше; `0` — без лимита |
@@ -208,10 +210,15 @@ upstream. Нужен `error_root`; задавать их можно только
   `max_header_list_size` для HTTP/2. Слишком большой запрос получает `431`.
   Значение меньше `8192` отклоняется при загрузке: hyper не умеет работать с
   буфером меньше и паниковал бы внутри каждого соединения.
-- `upstream_timeout_secs` ограничивает ожидание ответа upstream'а, установку
-  соединения для `CONNECT` и для `Upgrade`, а также запись заголовков в
-  upstream при upgrade. По истечении — `504 Gateway Timeout` (для туннелей —
-  `502`).
+- `upstream_timeout_secs` ограничивает ожидание заголовков ответа upstream'а,
+  чтение заголовков при `Upgrade` и запись заголовков в upstream при upgrade.
+  По истечении — `504 Gateway Timeout` (для туннелей — `502`).
+- `upstream_connect_timeout_secs` ограничивает только TCP- и TLS-рукопожатие с
+  upstream, включая DNS-резолвинг в `HttpConnector`. Медленный, но уже
+  установленный ответ этим таймаутом не обрезается.
+- `upstream_send_timeout_secs` — idle-таймаут между порциями тела запроса,
+  которые Elira пишет в upstream. Он не ограничивает общее время загрузки и не
+  действует на ответ.
 - `max_connections` — семафор в цикле accept. При достижении лимита новый сокет
   просто закрывается, без ответа и без очереди; событие пишется в лог на уровне
   `debug`. То же число независимо ограничивает количество одновременных
@@ -575,8 +582,8 @@ HTTP/3 живёт на отдельном UDP-порту и не делит со
   сеть и на localhost (SSRF-плечо). Обратному прокси такой режим обычно не нужен
   вовсе, поэтому по умолчанию он выключен. Список `allow` — единственная защита,
   других проверок назначения нет.
-- Туннели ограничены тем же числом, что `limits.max_connections`, и тем же
-  `upstream_timeout_secs` на установку соединения.
+- Туннели ограничены тем же числом, что `limits.max_connections`, и
+  `upstream_connect_timeout_secs` на установку соединения.
 - `CONNECT` работает по HTTP/1.1, HTTP/2 и HTTP/3. Для HTTP/2 нужен TLS с
   ALPN `h2` или `h2c = true`; HTTP/3 использует QUIC-поток напрямую.
 - Extended `CONNECT` с `:protocol` (WebTransport, WebSocket over HTTP/3) не
@@ -889,7 +896,9 @@ buckets = [{ percent = 10, value = "a" }, { percent = 90, value = "b" }]
 | `client_issuer_cn` | строка | нет | требуемый CN издателя сертификата |
 | `ip_allow` | массив CIDR | `[]` | кому разрешено; пусто — всем |
 | `ip_deny` | массив CIDR | `[]` | кому запрещено; сильнее `ip_allow` |
-| `timeout_secs` | целое > 0 | `limits.upstream_timeout_secs` | таймаут ответа upstream'а для этого маршрута |
+| `timeout_secs` | целое > 0 | `limits.upstream_timeout_secs` | таймаут заголовков ответа upstream'а для этого маршрута |
+| `connect_timeout_secs` | целое > 0 | `limits.upstream_connect_timeout_secs` | таймаут соединения с upstream |
+| `send_timeout_secs` | целое ≥ 0 | `limits.upstream_send_timeout_secs` | idle-таймаут записи тела; `0` выключает |
 | `requests_per_second` | целое > 0 | глобальный лимит | свой token bucket для маршрута |
 | `burst` | целое ≥ 0 | равен rate | глубина bucket'а маршрута |
 | `rate_key` | строка | `"ip"` | ключ лимита: `ip`, `authorization`, `header:NAME`, `cookie:NAME`, `uri` |
@@ -1164,6 +1173,8 @@ proxy_protocol = true   # only when the port is reachable solely through the LB
 max_headers = 64
 max_header_bytes = 16384
 upstream_timeout_secs = 30
+upstream_connect_timeout_secs = 5
+upstream_send_timeout_secs = 30
 max_connections = 4096
 idle_timeout_secs = 60
 max_body_bytes = 8388608

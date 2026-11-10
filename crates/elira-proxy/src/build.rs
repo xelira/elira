@@ -60,6 +60,9 @@ pub(crate) fn build_pools(cfg: &Config) -> Result<(Pools, Vec<Arc<Pool>>), Error
             client_crl: cfg.upstream_tls.client_crl.clone(),
             cipher_suites: cfg.upstream_tls.cipher_suites.clone(),
             curves: cfg.upstream_tls.curves.clone(),
+            connect_timeout: Some(Duration::from_secs(
+                cfg.limits.upstream_connect_timeout_secs,
+            )),
         };
         let connector = https_connector(&tls).map_err(|err| Error::UpstreamTls {
             reason: err.to_string(),
@@ -100,14 +103,16 @@ pub(crate) fn build_pools(cfg: &Config) -> Result<(Pools, Vec<Arc<Pool>>), Error
                 h3: up.h3_pool.then(|| {
                     elira_h3upstream::Pool::new(elira_h3upstream::PoolConfig {
                         max_connections: 4,
-                        connect_timeout: Duration::from_secs(5),
+                        connect_timeout: Duration::from_secs(
+                            cfg.limits.upstream_connect_timeout_secs,
+                        ),
                         tls: tls.clone(),
                     })
                 }),
                 h2: up.h2_pool.then(|| {
                     elira_h2::Pool::new(elira_h2::PoolConfig::new(
                         4,
-                        Duration::from_secs(5),
+                        Duration::from_secs(cfg.limits.upstream_connect_timeout_secs),
                         tls.clone(),
                     ))
                 }),
@@ -246,6 +251,8 @@ pub(crate) fn build_route(
         auth,
         acl,
         timeout: route.timeout_secs.map(Duration::from_secs),
+        connect_timeout: route.connect_timeout_secs.map(Duration::from_secs),
+        send_timeout: route.send_timeout_secs.map(Duration::from_secs),
         limiter,
         rate_key: parse_request_key(route.rate_key.as_deref()),
         body_limit: route.max_body_bytes,

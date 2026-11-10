@@ -304,9 +304,19 @@ pub struct Route {
     #[serde(default)]
     pub ip_deny: Vec<String>,
 
-    /// Overrides `limits.upstream_timeout_secs` for this route.
+    /// Overrides `limits.upstream_timeout_secs` for this route. This is the
+    /// deadline for the upstream response headers.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+
+    /// Overrides `limits.upstream_connect_timeout_secs` for this route.
+    #[serde(default)]
+    pub connect_timeout_secs: Option<u64>,
+
+    /// Overrides `limits.upstream_send_timeout_secs` for this route. Zero
+    /// disables the send idle check.
+    #[serde(default)]
+    pub send_timeout_secs: Option<u64>,
 
     /// Overrides `limits.requests_per_second` for this route. Zero inherits.
     #[serde(default)]

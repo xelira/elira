@@ -120,6 +120,9 @@ pub enum Error {
     #[error("limits.shutdown_timeout_secs must be greater than zero")]
     ShutdownTimeoutZero,
 
+    #[error("limits.upstream_connect_timeout_secs must be greater than zero")]
+    UpstreamConnectTimeoutZero,
+
     #[error("workers must be between 1 and 64")]
     BadWorkers,
 
@@ -397,6 +400,9 @@ pub enum Error {
 
     #[error("route {index}: timeout_secs must be greater than zero")]
     BadRouteTimeout { index: usize },
+
+    #[error("route {index}: connect_timeout_secs must be greater than zero")]
+    BadRouteConnectTimeout { index: usize },
 
     #[error("route {index}: requests_per_second must be greater than zero")]
     BadRouteRate { index: usize },

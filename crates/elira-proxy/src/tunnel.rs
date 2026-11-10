@@ -126,6 +126,7 @@ impl Proxy {
         client_upgrade: hyper::upgrade::OnUpgrade,
         upgrade: HeaderValue,
         server: ServerAddr,
+        connect_timeout: Duration,
         timeout: Duration,
         client_permit: Option<tokio::sync::OwnedSemaphorePermit>,
         extended_connect: bool,
@@ -137,7 +138,7 @@ impl Proxy {
             Err(_) => return Err(text(StatusCode::SERVICE_UNAVAILABLE, "too many tunnels")),
         };
 
-        let mut stream = match connect_server(&server, timeout).await {
+        let mut stream = match connect_server(&server, connect_timeout).await {
             Some(stream) => stream,
             None => return Err(text(StatusCode::BAD_GATEWAY, "bad gateway")),
         };

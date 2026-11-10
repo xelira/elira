@@ -226,6 +226,9 @@ impl Config {
         if self.limits.shutdown_timeout_secs == 0 {
             return Err(Error::ShutdownTimeoutZero);
         }
+        if self.limits.upstream_connect_timeout_secs == 0 {
+            return Err(Error::UpstreamConnectTimeoutZero);
+        }
         if self.workers == 0 || self.workers > 64 {
             return Err(Error::BadWorkers);
         }
@@ -1008,6 +1011,10 @@ impl Config {
 
         if route.timeout_secs == Some(0) {
             return Err(Error::BadRouteTimeout { index });
+        }
+
+        if route.connect_timeout_secs == Some(0) {
+            return Err(Error::BadRouteConnectTimeout { index });
         }
 
         if route.requests_per_second == Some(0) {

@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use hyper_rustls::{FixedServerNameResolver, HttpsConnector, HttpsConnectorBuilder};
@@ -36,6 +37,9 @@ pub struct TlsOptions {
     /// Cipher suites and key exchange groups, using rustls names.
     pub cipher_suites: Option<Vec<String>>,
     pub curves: Option<Vec<String>>,
+    /// Time limit for the TCP and TLS handshake. `None` keeps the connector
+    /// default.
+    pub connect_timeout: Option<Duration>,
 }
 
 /// Build an HTTPS connector that accepts both `https` and `http` upstreams.
@@ -45,6 +49,14 @@ pub struct TlsOptions {
 /// the proxy layer.
 pub fn https_connector(options: &TlsOptions) -> anyhow::Result<HttpsConnector<HttpConnector>> {
     let config = client_config(options)?;
+
+    // Build the low-level connector explicitly so the handshake can be
+    // bounded without shortening the time allowed for the response.
+    let mut http = HttpConnector::new();
+    http.enforce_http(false);
+    if let Some(timeout) = options.connect_timeout {
+        http.set_connect_timeout(Some(timeout));
+    }
 
     let builder = HttpsConnectorBuilder::new()
         .with_tls_config(config)
@@ -62,9 +74,9 @@ pub fn https_connector(options: &TlsOptions) -> anyhow::Result<HttpsConnector<Ht
     };
 
     if options.http2 {
-        Ok(builder.enable_http1().enable_http2().build())
+        Ok(builder.enable_http1().enable_http2().wrap_connector(http))
     } else {
-        Ok(builder.enable_http1().build())
+        Ok(builder.enable_http1().wrap_connector(http))
     }
 }
 

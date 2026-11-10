@@ -2025,6 +2025,48 @@ cache_bypass = ["$http_x_nocache"]
 }
 
 #[test]
+fn separate_upstream_timeouts_are_validated() {
+    let base = r#"
+listen = "127.0.0.1:8080"
+
+[limits]
+upstream_timeout_secs = 30
+upstream_connect_timeout_secs = 2
+upstream_send_timeout_secs = 3
+
+[[upstreams]]
+name = "app"
+servers = ["127.0.0.1:9000"]
+
+[[routes]]
+host = "*"
+upstream = "app"
+connect_timeout_secs = 4
+send_timeout_secs = 0
+"#;
+    let cfg = Config::parse(base).expect("valid config");
+    assert_eq!(cfg.limits.upstream_connect_timeout_secs, 2);
+    assert_eq!(cfg.limits.upstream_send_timeout_secs, 3);
+    assert_eq!(cfg.routes[0].connect_timeout_secs, Some(4));
+    assert_eq!(cfg.routes[0].send_timeout_secs, Some(0));
+
+    let zero_limits = base.replace(
+        "upstream_connect_timeout_secs = 2",
+        "upstream_connect_timeout_secs = 0",
+    );
+    assert!(matches!(
+        Config::parse(&zero_limits),
+        Err(Error::UpstreamConnectTimeoutZero)
+    ));
+
+    let zero_route = base.replace("connect_timeout_secs = 4", "connect_timeout_secs = 0");
+    assert!(matches!(
+        Config::parse(&zero_route),
+        Err(Error::BadRouteConnectTimeout { .. })
+    ));
+}
+
+#[test]
 fn named_locations_are_validated() {
     let base = r#"
 listen = "127.0.0.1:8080"

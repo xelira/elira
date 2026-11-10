@@ -36,6 +36,9 @@
   в stdout или в файл с ротацией по размеру.
 - Basic auth из htpasswd (bcrypt) и списки `ip_allow`/`ip_deny` на маршруте.
 - Таймаут upstream'а, переопределяемый на маршруте через `timeout_secs`.
+- Отдельные таймауты соединения и записи тела upstream'а
+  (`upstream_connect_timeout_secs`, `upstream_send_timeout_secs`) с
+  переопределением на маршруте.
 - Таймауты на тело запроса и ответа, простой websocket/CONNECT и опциональная
   буферизация небольших ответов upstream'а.
 - Свой token bucket, предел тела и `error_pages` на маршруте.

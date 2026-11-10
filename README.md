@@ -44,6 +44,8 @@ max_header_bytes = 16384
 max_connections = 1024
 idle_timeout_secs = 60
 upstream_timeout_secs = 30
+upstream_connect_timeout_secs = 5
+upstream_send_timeout_secs = 30
 request_body_timeout_secs = 30
 upstream_body_timeout_secs = 30
 websocket_idle_secs = 3600
@@ -225,6 +227,8 @@ Upstreams:
   after repeated transport failures, retries for idempotent requests,
   including buffered `PUT`/`DELETE` bodies, with a configurable `retry_on`
   policy for errors, timeouts and 5xx statuses
+- separate upstream connect, send-idle and response-header deadlines, with
+  per-route overrides
 - streaming FastCGI over TCP (including DNS names) or unix sockets with an
   idle connection pool, streaming CGI scripts, and native `.so` modules
   (in-process or in a child runner) and sandboxed WebAssembly modules

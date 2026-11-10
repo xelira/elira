@@ -322,6 +322,7 @@ pub(crate) async fn send_request(
     server: &ServerAddr,
     request: Request<Body>,
     timeout: Duration,
+    connect_timeout: Duration,
 ) -> Result<Response<Body>, SendError> {
     let Some(path) = server.unix() else {
         if let Some(h3) = &pool.h3 {
@@ -350,8 +351,13 @@ pub(crate) async fn send_request(
         };
     };
 
+    let stream = match tokio::time::timeout(connect_timeout, UnixStream::connect(path)).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(err)) => return Err(SendError::Failed(err.to_string())),
+        Err(_) => return Err(SendError::Timeout),
+    };
+
     let work = async {
-        let stream = UnixStream::connect(path).await?;
         let (mut sender, connection) =
             hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
         tokio::spawn(async move {

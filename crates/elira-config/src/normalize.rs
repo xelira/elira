@@ -105,6 +105,8 @@ fn inherit(parent: &Route, child: &mut Route) -> Result<(), Error> {
     child.module_sandbox |= parent.module_sandbox;
     child.client_auth |= parent.client_auth;
     child.timeout_secs = child.timeout_secs.or(parent.timeout_secs);
+    child.connect_timeout_secs = child.connect_timeout_secs.or(parent.connect_timeout_secs);
+    child.send_timeout_secs = child.send_timeout_secs.or(parent.send_timeout_secs);
     child.requests_per_second = child.requests_per_second.or(parent.requests_per_second);
     child.burst = child.burst.or(parent.burst);
     child.rate_key = child.rate_key.clone().or_else(|| parent.rate_key.clone());
@@ -290,6 +292,8 @@ mod tests {
             ip_allow: Vec::new(),
             ip_deny: Vec::new(),
             timeout_secs: None,
+            connect_timeout_secs: None,
+            send_timeout_secs: None,
             requests_per_second: None,
             burst: None,
             rate_key: None,

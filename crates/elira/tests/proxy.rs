@@ -4197,6 +4197,56 @@ timeout_secs = 1
     assert_eq!(status(&response), "HTTP/1.1 504 Gateway Timeout");
 }
 
+#[tokio::test]
+async fn connect_and_send_timeouts_do_not_cut_the_response() {
+    // The upstream accepts, reads the request, then answers slowly. Neither
+    // the connect nor the send timeout may be read as a response deadline.
+    let slow = TcpListener::bind("127.0.0.1:0").await.expect("bind slow");
+    let slow_addr = slow.local_addr().expect("slow addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = slow.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut head = [0u8; 1024];
+                let _ = stream.read(&mut head).await;
+                tokio::time::sleep(Duration::from_millis(1200)).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .await;
+            });
+        }
+    });
+
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[limits]
+upstream_connect_timeout_secs = 1
+upstream_send_timeout_secs = 1
+
+[[upstreams]]
+name = "slow"
+servers = ["{slow_addr}"]
+
+[[routes]]
+host = "*"
+upstream = "slow"
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let response = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&response), "HTTP/1.1 200 OK", "{response}");
+    assert!(response.ends_with("ok"), "{response}");
+}
+
 /// An upstream that varies its answer by Accept-Language and says so.
 async fn vary_upstream() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0")

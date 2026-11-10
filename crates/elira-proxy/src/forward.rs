@@ -347,6 +347,11 @@ impl Proxy {
         );
 
         let route_timeout = entry.timeout.unwrap_or(self.inner.timeout);
+        let connect_timeout = entry.connect_timeout.unwrap_or(self.inner.connect_timeout);
+        let send_timeout = entry
+            .send_timeout
+            .or(self.inner.send_timeout)
+            .filter(|timeout| !timeout.is_zero());
 
         let mut body = Some(body);
 
@@ -366,6 +371,7 @@ impl Proxy {
                     &upstream_path,
                     is_head,
                     route_timeout,
+                    connect_timeout,
                 )
                 .await;
             _cache_flight = flight;
@@ -400,6 +406,7 @@ impl Proxy {
                     client,
                     upgrade,
                     server,
+                    connect_timeout,
                     route_timeout,
                     proxy_permit,
                     connect_protocol.is_some(),
@@ -425,6 +432,8 @@ impl Proxy {
                 &mut body,
                 can_retry,
                 route_timeout,
+                connect_timeout,
+                send_timeout,
                 &body_limit_hit,
                 entry,
                 &vars,
@@ -681,6 +690,7 @@ impl Proxy {
         upstream_path: &str,
         is_head: bool,
         route_timeout: Duration,
+        connect_timeout: Duration,
     ) -> (Option<Response<Body>>, Option<CacheFlightGuard>) {
         let mut flight = None;
         if let Some(cache) = &self.inner.cache {
@@ -747,6 +757,7 @@ impl Proxy {
                             upstream_path.to_owned(),
                             pool.clone(),
                             route_timeout,
+                            connect_timeout,
                             entry.cache_ttl_for(cached_status),
                         );
                     }
@@ -786,6 +797,8 @@ impl Proxy {
         body: &mut Option<Body>,
         can_retry: bool,
         route_timeout: Duration,
+        connect_timeout: Duration,
+        send_timeout: Option<Duration>,
         body_limit_hit: &AtomicBool,
         entry: &RouteEntry,
         vars: &RequestVars,
@@ -810,6 +823,13 @@ impl Proxy {
                 None if attempt == 0 => body.take().unwrap_or_else(empty),
                 None => empty(),
             };
+            // Bound stalls while the body is written to the upstream. The
+            // timer restarts on each chunk, so a large but steady upload is
+            // not cut off.
+            let payload = match send_timeout {
+                Some(idle) => crate::body::timeout_body(payload, idle),
+                None => payload,
+            };
 
             let mut upstream = Request::builder()
                 .method(method.clone())
@@ -818,7 +838,7 @@ impl Proxy {
                 .map_err(|_| text(StatusCode::BAD_GATEWAY, "bad request"))?;
             *upstream.headers_mut() = template.clone();
 
-            match send_request(pool, &server, upstream, route_timeout).await {
+            match send_request(pool, &server, upstream, route_timeout, connect_timeout).await {
                 Ok(answer) => {
                     if attempt + 1 < attempts && pool.retry_on.status(answer.status().as_u16()) {
                         pool.record_success(index);
