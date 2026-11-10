@@ -325,6 +325,7 @@ upstream. Нужен `error_root`; задавать их можно только
 | `session_cache` | целое ≥ 0 | `256` | записей resumption-кэша; `0` выключает |
 | `ticket_key` | путь | нет | общий 32-байтовый ключ тикетов для всех воркеров |
 | `certificates` | массив таблиц | `[]` | дополнительные сертификаты по SNI |
+| `reject_unknown_sni` | bool | `false` | отклонять handshake с неизвестным/пустым SNI |
 
 Элемент `certificates`:
 
@@ -345,6 +346,9 @@ upstream. Нужен `error_root`; задавать их можно только
 - Имена в `certificates` не повторяются. `*.example.com` совпадает ровно с
   одним уровнем (`a.example.com`), но не с `a.b.example.com` и не с самим
   `example.com`. Если SNI не совпал, берётся сертификат по умолчанию.
+- `reject_unknown_sni = true` отклоняет handshake, если SNI отсутствует или не
+  совпал ни с одним именем; сертификат по умолчанию в этом случае не
+  используется. Нужен хотя бы один `certificates`, иначе загрузка падает.
 - `ocsp` внутри `certificates` задаёт отдельный OCSP-ответ для этого имени.
   `ocsp_hook` может обновлять и его; reload перечитывает все файлы. Без
   default-`ocsp` hook разрешён, если OCSP задан хотя бы одному SNI-сертификату.
@@ -495,6 +499,7 @@ rustls: например `TLS13_AES_128_GCM_SHA256` и `X25519`; регистр 
 | `curves` | массив строк | по умолчанию rustls | key exchange groups для QUIC |
 | `ticket_key` | путь | нет | общий 32-байтовый ключ тикетов |
 | `certificates` | массив таблиц | `[]` | SNI-сертификаты на QUIC, формат как у `[tls]` |
+| `reject_unknown_sni` | bool | `false` | отклонять QUIC-handshake с неизвестным/пустым SNI |
 | `idle_timeout_secs` | целое > 0 | `30` | idle timeout QUIC-соединения |
 | `max_concurrent_bidi_streams` | целое > 0 | по умолчанию quinn | одновременные двунаправленные потоки |
 | `stream_receive_window` | целое > 0 | по умолчанию quinn | окно приёма одного потока |

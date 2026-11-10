@@ -44,6 +44,7 @@ pub struct Config {
     pub stream_receive_window: Option<u64>,
     pub receive_window: Option<u64>,
     pub send_window: Option<u64>,
+    pub reject_unknown_sni: bool,
 }
 
 pub async fn serve(
@@ -65,6 +66,7 @@ pub async fn serve(
         cfg.curves.as_deref(),
         cfg.client_crl.as_deref(),
         cfg.ticket_key.as_deref(),
+        cfg.reject_unknown_sni,
     )?;
     let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls)?;
     let mut transport = quinn::TransportConfig::default();

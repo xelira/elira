@@ -59,6 +59,7 @@ root = "{}"
             stream_receive_window: None,
             receive_window: None,
             send_window: None,
+            reject_unknown_sni: false,
         },
         loader,
         Arc::new(Metrics::new()),

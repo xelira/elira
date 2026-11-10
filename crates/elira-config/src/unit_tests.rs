@@ -2374,6 +2374,32 @@ root = "/srv"
 }
 
 #[test]
+fn reject_unknown_sni_requires_certificates() {
+    let base = r#"
+listen = "127.0.0.1:8080"
+
+[tls]
+cert = "cert.pem"
+key = "key.pem"
+reject_unknown_sni = true
+
+[[routes]]
+host = "*"
+root = "/srv"
+"#;
+    assert!(matches!(
+        Config::parse(base),
+        Err(Error::RejectSniWithoutCertificates)
+    ));
+
+    let with_cert = format!(
+        "{base}\n[[tls.certificates]]\nnames = [\"a.example\"]\ncert = \"a.pem\"\nkey = \"a.key\"\n"
+    );
+    let cfg = Config::parse(&with_cert).expect("named certificate");
+    assert!(cfg.tls.as_ref().unwrap().reject_unknown_sni);
+}
+
+#[test]
 fn named_locations_are_validated() {
     let base = r#"
 listen = "127.0.0.1:8080"

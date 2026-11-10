@@ -75,6 +75,11 @@ pub struct Tls {
     /// stays the default when no name matches.
     #[serde(default)]
     pub certificates: Vec<ServerCert>,
+
+    /// Reject a handshake whose SNI matches no configured name. Missing SNI
+    /// is rejected too, so this needs `[[tls.certificates]]` entries.
+    #[serde(default)]
+    pub reject_unknown_sni: bool,
 }
 
 /// A certificate and the names it should answer for.
@@ -219,6 +224,10 @@ pub struct Http3 {
     /// 32-byte ticket key shared by all QUIC workers.
     #[serde(default)]
     pub ticket_key: Option<PathBuf>,
+
+    /// Reject QUIC handshakes with unknown or missing SNI.
+    #[serde(default)]
+    pub reject_unknown_sni: bool,
 }
 
 impl Http3 {

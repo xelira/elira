@@ -674,6 +674,7 @@ fn spawn_h3(
             stream_receive_window: http3.stream_receive_window,
             receive_window: http3.receive_window,
             send_window: http3.send_window,
+            reject_unknown_sni: http3.reject_unknown_sni,
             proxy_protocol,
         };
         if let Err(err) = elira_h3::serve(cfg, proxy, metrics, body_timeout, log, stop).await {

@@ -192,7 +192,7 @@ Living list for the self-improvement loop. One item per session.
 - [ ] `h2c Upgrade`.
 - [ ] Dual RSA + ECDSA certificates per name.
 - [ ] Verify stapled OCSP responses (`ssl_stapling_verify`).
-- [ ] `ssl_reject_handshake` for unknown SNI.
+- [x] `ssl_reject_handshake` for unknown SNI (`reject_unknown_sni`).
 - [x] HTTP/2 max concurrent streams and window tuning.
 - [x] HTTP/3 QUIC transport tuning exposed in `[http3]`.
 

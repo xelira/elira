@@ -126,6 +126,9 @@ pub enum Error {
     #[error("[http2] {field} is out of range")]
     BadHttp2Setting { field: String },
 
+    #[error("reject_unknown_sni needs at least one SNI certificate")]
+    RejectSniWithoutCertificates,
+
     #[error("resolver: host name must not be empty or contain whitespace")]
     BadResolverHost { name: String },
 

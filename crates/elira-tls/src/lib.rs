@@ -42,6 +42,8 @@ pub struct ServerOptions<'a> {
     /// The certificate used when SNI does not match anything.
     pub default: Option<(&'a Path, &'a Path)>,
     pub named: &'a [NamedCert],
+    /// Reject clients whose SNI does not match a named certificate.
+    pub reject_unknown_sni: bool,
     pub client_ca: Option<&'a Path>,
     /// Pem bundle of CRLs used when a client certificate is presented.
     pub client_crl: Option<&'a Path>,
@@ -319,6 +321,7 @@ pub fn server_config(cert: &Path, key: &Path) -> Result<ServerConfig, Error> {
     server_config_with_options(&ServerOptions {
         default: Some((cert, key)),
         named: &[],
+        reject_unknown_sni: false,
         client_ca: None,
         client_crl: None,
         client_auth: ClientAuth::Off,
@@ -354,6 +357,7 @@ pub fn server_config_with_client_auth(
     server_config_with_options(&ServerOptions {
         default: Some((cert, key)),
         named: &[],
+        reject_unknown_sni: false,
         client_ca,
         client_crl: None,
         client_auth: mode,
@@ -381,7 +385,19 @@ pub fn quic_server_config_with_client_auth(
     client_ca: Option<&Path>,
     mode: ClientAuth,
 ) -> Result<ServerConfig, Error> {
-    quic_server_config_full(cert, key, &[], client_ca, mode, 0, None, None, None, None)
+    quic_server_config_full(
+        cert,
+        key,
+        &[],
+        client_ca,
+        mode,
+        0,
+        None,
+        None,
+        None,
+        None,
+        false,
+    )
 }
 
 /// QUIC listener with SNI-selected certificates as well as client auth.
@@ -397,11 +413,13 @@ pub fn quic_server_config_full(
     curves: Option<&[String]>,
     client_crl: Option<&Path>,
     ticket_key: Option<&Path>,
+    reject_unknown_sni: bool,
 ) -> Result<ServerConfig, Error> {
     build(
         &ServerOptions {
             default: Some((cert, key)),
             named,
+            reject_unknown_sni,
             client_ca,
             client_crl,
             client_auth: mode,
@@ -664,7 +682,11 @@ fn build(options: &ServerOptions<'_>, alpn: &[&[u8]]) -> Result<ServerConfig, Er
         });
     }
 
-    let resolver = NamedResolver { named, default };
+    let resolver = NamedResolver {
+        named,
+        default,
+        reject_unknown: options.reject_unknown_sni,
+    };
     let mut config = builder.with_cert_resolver(Arc::new(resolver));
     if let Some(path) = options.ticket_key {
         config.ticketer = Arc::new(KeyTicketer::new(load_ticket_key(path)?)?);
@@ -724,12 +746,17 @@ fn certified(cert: &Path, key: &Path, ocsp: Option<Vec<u8>>) -> Result<Certified
 struct NamedResolver {
     named: Vec<NamedCertKey>,
     default: Option<Arc<CertifiedKey>>,
+    reject_unknown: bool,
 }
 
 impl NamedResolver {
     fn pick(&self, name: Option<&str>) -> Option<Arc<CertifiedKey>> {
         let Some(name) = name else {
-            return self.default.clone();
+            return if self.reject_unknown {
+                None
+            } else {
+                self.default.clone()
+            };
         };
         let name = name.to_ascii_lowercase();
 
@@ -752,7 +779,11 @@ impl NamedResolver {
             }
         }
 
-        self.default.clone()
+        if self.reject_unknown {
+            None
+        } else {
+            self.default.clone()
+        }
     }
 }
 
@@ -1182,6 +1213,7 @@ mod tests {
                 key.clone(),
             )],
             default: Some(key.clone()),
+            reject_unknown: false,
         };
 
         assert!(resolver.pick(Some("A.Example.COM")).is_some());
@@ -1195,6 +1227,7 @@ mod tests {
         let no_default = NamedResolver {
             named: vec![(vec!["*.b.example.com".to_owned()], key)],
             default: None,
+            reject_unknown: false,
         };
         assert!(no_default.pick(Some("b.example.com")).is_none());
         assert!(no_default.pick(Some("x.b.example.com")).is_some());
@@ -1211,6 +1244,7 @@ mod tests {
             server_config_with_options(&ServerOptions {
                 default: Some((&fixtures.join("cert.pem"), &fixtures.join("key.pem"))),
                 named: &[],
+                reject_unknown_sni: false,
                 client_ca: None,
                 client_crl: None,
                 client_auth: ClientAuth::Off,
@@ -1267,6 +1301,7 @@ mod tests {
         let resolver = NamedResolver {
             named: build_named(&named).expect("named certificates"),
             default: None,
+            reject_unknown: false,
         };
 
         let a = resolver.pick(Some("a.example.com")).expect("a");
@@ -1284,6 +1319,7 @@ mod tests {
         let config = server_config_with_options(&ServerOptions {
             default: Some((&fixtures.join("cert.pem"), &fixtures.join("key.pem"))),
             named: &[],
+            reject_unknown_sni: false,
             client_ca: None,
             client_crl: None,
             client_auth: ClientAuth::Off,
@@ -1315,6 +1351,7 @@ mod tests {
         let err = server_config_with_options(&ServerOptions {
             default: Some((&fixtures.join("cert.pem"), &fixtures.join("key.pem"))),
             named: &[],
+            reject_unknown_sni: false,
             client_ca: None,
             client_crl: None,
             client_auth: ClientAuth::Off,
@@ -1334,6 +1371,7 @@ mod tests {
         let err = server_config_with_options(&ServerOptions {
             default: Some((&fixtures.join("cert.pem"), &fixtures.join("key.pem"))),
             named: &[],
+            reject_unknown_sni: false,
             client_ca: None,
             client_crl: None,
             client_auth: ClientAuth::Off,
@@ -1365,6 +1403,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .expect_err("TLS 1.2 suite on QUIC");
         assert!(matches!(err, Error::QuicNeedsTls13Suite), "{err:?}");

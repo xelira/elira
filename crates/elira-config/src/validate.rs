@@ -449,6 +449,9 @@ impl Config {
             if http3.idle_timeout_secs == 0 {
                 return Err(Error::Http3IdleTimeoutZero);
             }
+            if http3.reject_unknown_sni && http3.certificates.is_empty() {
+                return Err(Error::RejectSniWithoutCertificates);
+            }
             for (field, value) in [
                 (
                     "max_concurrent_bidi_streams",
@@ -610,6 +613,9 @@ impl Config {
             let has_default = has_cert && has_key;
             if tls.certificates.is_empty() && !has_default {
                 return Err(Error::TlsMissingCert);
+            }
+            if tls.reject_unknown_sni && tls.certificates.is_empty() {
+                return Err(Error::RejectSniWithoutCertificates);
             }
 
             let mut seen: Vec<String> = Vec::new();
