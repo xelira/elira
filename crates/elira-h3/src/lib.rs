@@ -284,13 +284,17 @@ async fn connect<S, B>(
 ) -> Result<(), BoxError>
 where
     S: h3::quic::BidiStream<B> + Send + 'static,
+    S::SendStream: Send + 'static,
     S::RecvStream: Send + 'static,
     B: Buf + From<Bytes> + Send + 'static,
 {
     let started = Instant::now();
-    if req.extensions().get::<h3::ext::Protocol>().is_some() {
-        // WebTransport and WebSocket over HTTP/3 need a defined backend
-        // protocol; they are not raw CONNECT tunnels.
+    if let Some(protocol) = req.extensions().get::<h3::ext::Protocol>() {
+        if protocol.as_str() == "websocket" {
+            return websocket(req, stream, peer, proxy, metrics).await;
+        }
+        // WebTransport and CONNECT-UDP need a defined backend protocol; they
+        // are not raw CONNECT tunnels.
         let response = Response::builder()
             .status(http::StatusCode::NOT_IMPLEMENTED)
             .body(())?;
@@ -383,6 +387,117 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn websocket<S, B>(
+    req: Request<()>,
+    mut stream: h3::server::RequestStream<S, B>,
+    peer: SocketAddr,
+    proxy: Arc<dyn Fn() -> Proxy + Send + Sync>,
+    metrics: Arc<Metrics>,
+) -> Result<(), BoxError>
+where
+    S: h3::quic::BidiStream<B> + Send + 'static,
+    S::SendStream: Send + 'static,
+    S::RecvStream: Send + 'static,
+    B: Buf + From<Bytes> + Send + 'static,
+{
+    let started = Instant::now();
+    let (mut parts, _) = req.into_parts();
+    if parts.headers.get(http::header::HOST).is_none() {
+        if let Some(authority) = parts.uri.authority() {
+            parts.headers.insert(
+                http::header::HOST,
+                http::HeaderValue::from_str(authority.as_str())?,
+            );
+        }
+    }
+    let empty = http_body_util::Empty::<Bytes>::new()
+        .map_err(|never| -> elira_proxy::BoxError { match never {} })
+        .boxed();
+    let mut request = Request::from_parts(parts, empty);
+    request
+        .extensions_mut()
+        .insert(hyper::ext::Protocol::from_static("websocket"));
+
+    let (upgrade_tx, upgrade_rx) =
+        tokio::sync::oneshot::channel::<std::io::Result<elira_proxy::UpgradeStream>>();
+    request
+        .extensions_mut()
+        .insert(elira_proxy::ExternalUpgrade::new(Box::pin(async move {
+            match upgrade_rx.await {
+                Ok(result) => result,
+                Err(_) => Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "h3 upgrade cancelled",
+                )),
+            }
+        })));
+
+    let response = proxy().handle(request, peer, "https", "http3").await;
+    let status = response.status();
+    metrics.record_request(status.as_u16(), started.elapsed());
+
+    let mut out = Response::builder().status(status);
+    if let Some(headers) = out.headers_mut() {
+        for (name, value) in response.headers() {
+            if name == http::header::CONNECTION
+                || name == http::header::TRANSFER_ENCODING
+                || name == http::header::CONTENT_LENGTH
+                || name == http::header::UPGRADE
+            {
+                continue;
+            }
+            headers.insert(name.clone(), value.clone());
+        }
+    }
+    stream.send_response(out.body(())?).await?;
+
+    if status != http::StatusCode::OK {
+        stream.finish().await?;
+        return Ok(());
+    }
+
+    let (client_io, h3_io) = tokio::io::duplex(64 * 1024);
+    let _ = upgrade_tx.send(Ok(Box::new(client_io)));
+    let (mut h3_send, mut h3_recv) = stream.split();
+    tokio::spawn(async move {
+        let (mut read, mut write) = tokio::io::split(h3_io);
+        let mut buf = vec![0u8; 16 * 1024];
+        let from_proxy = async {
+            loop {
+                let read = match read.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(read) => read,
+                    Err(_) => break,
+                };
+                if h3_send
+                    .send_data(B::from(Bytes::copy_from_slice(&buf[..read])))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            let _ = h3_send.finish().await;
+        };
+        let from_h3 = async {
+            while let Ok(Some(mut data)) = h3_recv.recv_data().await {
+                let bytes = data.copy_to_bytes(data.remaining());
+                if write.write_all(&bytes).await.is_err() {
+                    break;
+                }
+            }
+            let _ = write.shutdown().await;
+        };
+        tokio::select! {
+            _ = from_proxy => {}
+            _ = from_h3 => {}
+        }
+    });
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn request<S, B>(
     req: Request<()>,
     stream: h3::server::RequestStream<S, B>,
@@ -395,6 +510,7 @@ async fn request<S, B>(
 ) -> Result<(), BoxError>
 where
     S: h3::quic::BidiStream<B> + Send + 'static,
+    S::SendStream: Send + 'static,
     S::RecvStream: Send + 'static,
     B: Buf + From<Bytes> + Send + 'static,
 {

@@ -40,11 +40,60 @@ async fn tcp_echo() -> std::net::SocketAddr {
     addr
 }
 
+async fn websocket_upstream() -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ws upstream");
+    let addr = listener.local_addr().expect("ws addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut buffer = [0u8; 4096];
+                loop {
+                    let Ok(read) = stream.read(&mut buffer).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        return;
+                    }
+                    head.extend_from_slice(&buffer[..read]);
+                    if head.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                if stream
+                    .write_all(
+                        b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+                    )
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                while let Ok(read) = stream.read(&mut buffer).await {
+                    if read == 0 {
+                        break;
+                    }
+                    if stream.write_all(&buffer[..read]).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
 #[tokio::test]
 async fn connect_tunnels_over_http3() {
     let fixtures =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../elira-tls/tests/fixtures");
     let echo = tcp_echo().await;
+    let ws = websocket_upstream().await;
 
     let config = Config::parse(&format!(
         r#"
@@ -53,6 +102,15 @@ listen = "127.0.0.1:0"
 [connect]
 enabled = true
 allow = ["{echo}"]
+
+[[upstreams]]
+name = "ws"
+servers = ["{ws}"]
+
+[[routes]]
+host = "*"
+path = "/ws"
+upstream = "ws"
 
 [[routes]]
 host = "*"
@@ -137,6 +195,32 @@ return = {{ status = 404, body = "no route" }}
     let mut echoed = stream.recv_data().await.expect("recv").expect("data");
     assert_eq!(&echoed.copy_to_bytes(echoed.remaining())[..], b"ping");
 
+    stream.finish().await.expect("finish");
+
+    let mut request = http::Request::builder()
+        .method(http::Method::CONNECT)
+        .uri("https://example.com/ws")
+        .header(http::header::HOST, "example.com")
+        .body(())
+        .expect("WebSocket request");
+    request.extensions_mut().insert(
+        "websocket"
+            .parse::<h3::ext::Protocol>()
+            .ok()
+            .expect("protocol"),
+    );
+    let mut stream = send_request
+        .send_request(request)
+        .await
+        .expect("send WebSocket");
+    let response = stream.recv_response().await.expect("response");
+    assert_eq!(response.status(), http::StatusCode::OK);
+    stream
+        .send_data(bytes::Bytes::from_static(b"ping"))
+        .await
+        .expect("send data");
+    let mut echoed = stream.recv_data().await.expect("recv").expect("data");
+    assert_eq!(&echoed.copy_to_bytes(echoed.remaining())[..], b"ping");
     stream.finish().await.expect("finish");
 
     let mut request = http::Request::builder()

@@ -124,7 +124,7 @@ impl Proxy {
     pub(crate) async fn forward_upgrade(
         &self,
         upstream: Request<Body>,
-        client_upgrade: hyper::upgrade::OnUpgrade,
+        client_upgrade: crate::ClientUpgrade,
         upgrade: HeaderValue,
         server: ServerAddr,
         connect_timeout: Duration,
@@ -209,9 +209,17 @@ impl Proxy {
             let _permit = permit;
             let _client_permit = client_permit;
             let _hold = hold;
-            match client_upgrade.await {
-                Ok(client) => {
-                    let mut client = TokioIo::new(client);
+            let client = match client_upgrade {
+                crate::ClientUpgrade::Hyper(upgrade) => upgrade
+                    .await
+                    .map(|client| Box::new(TokioIo::new(client)) as crate::UpgradeStream)
+                    .map_err(|err| err.to_string()),
+                crate::ClientUpgrade::External(upgrade) => {
+                    upgrade.await.map_err(|err| err.to_string())
+                }
+            };
+            match client {
+                Ok(mut client) => {
                     let mut upstream = stream;
                     // Bytes the upstream sent right after the 101 would
                     // otherwise be dropped by the copy loop.

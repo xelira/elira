@@ -68,6 +68,8 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 #[derive(Clone, Debug)]
 pub struct FastStatic {
     pub file: std::path::PathBuf,
+    pub meta: std::fs::Metadata,
+    pub cached: Option<Bytes>,
     pub add_headers: Vec<(HeaderName, HeaderValue)>,
     pub remove_headers: Vec<HeaderName>,
     pub server_header: bool,
@@ -106,6 +108,43 @@ impl EarlyHints {
     ) -> Self {
         Self(writer)
     }
+}
+
+/// I/O yielded by an upgrade that did not come from hyper (for example an
+/// HTTP/3 bidirectional stream).
+pub trait UpgradeIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> UpgradeIo for T {}
+
+/// Boxed I/O yielded by an upgrade that did not come from hyper.
+pub type UpgradeStream = Box<dyn UpgradeIo>;
+
+/// An upgrade future supplied by a non-hyper listener.
+#[derive(Clone)]
+pub struct ExternalUpgrade(
+    Arc<Mutex<Option<futures_util::future::BoxFuture<'static, std::io::Result<UpgradeStream>>>>>,
+);
+
+impl ExternalUpgrade {
+    pub fn new(
+        future: futures_util::future::BoxFuture<'static, std::io::Result<UpgradeStream>>,
+    ) -> Self {
+        Self(Arc::new(Mutex::new(Some(future))))
+    }
+
+    pub(crate) fn take(
+        &self,
+    ) -> Option<futures_util::future::BoxFuture<'static, std::io::Result<UpgradeStream>>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+}
+
+/// The client side of an upgrade, from hyper or from another protocol stack.
+pub(crate) enum ClientUpgrade {
+    Hyper(hyper::upgrade::OnUpgrade),
+    External(futures_util::future::BoxFuture<'static, std::io::Result<UpgradeStream>>),
 }
 
 /// Per-request upstream details for access logs and admin output.
@@ -522,6 +561,7 @@ impl Proxy {
             Arc::new(FileCache::new(
                 cfg.limits.open_file_cache,
                 Duration::from_secs(cfg.limits.open_file_cache_ttl_secs),
+                cfg.limits.open_file_cache_max_file_bytes,
             ))
         });
 
@@ -681,6 +721,14 @@ impl Proxy {
             Target::Files(files) => files.resolve(path).await?,
             _ => return None,
         };
+        let cached = match &entry.target {
+            Target::Files(files) => files.cached_body(&file).await,
+            _ => None,
+        };
+        let meta = match &entry.target {
+            Target::Files(files) => files.metadata(&file).await.ok()?,
+            _ => return None,
+        };
 
         if let Some(acl) = &entry.acl {
             if !acl.allows(peer) {
@@ -704,6 +752,8 @@ impl Proxy {
 
         Some(FastStatic {
             file,
+            meta,
+            cached,
             add_headers: entry
                 .add_headers
                 .iter()

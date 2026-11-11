@@ -162,9 +162,24 @@ impl Proxy {
                 .as_ref()
                 .map(|_| HeaderValue::from_static("websocket"))
         });
-        let client_upgrade = requested_upgrade
-            .as_ref()
-            .map(|_| hyper::upgrade::on(&mut req));
+        let client_upgrade = match requested_upgrade.as_ref() {
+            Some(_) => {
+                if let Some(external) = req.extensions_mut().remove::<ExternalUpgrade>() {
+                    match external.take() {
+                        Some(future) => Some(ClientUpgrade::External(future)),
+                        None => {
+                            return Err(text(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "upgrade already consumed",
+                            ))
+                        }
+                    }
+                } else {
+                    Some(ClientUpgrade::Hyper(hyper::upgrade::on(&mut req)))
+                }
+            }
+            None => None,
+        };
 
         // No upgrade protocol carries a body. Refusing one keeps the raw
         // upstream write from sending a Content-Length with zero bytes.

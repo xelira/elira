@@ -110,6 +110,11 @@ pub struct Limits {
     #[serde(default = "Limits::default_open_file_cache_ttl_secs")]
     pub open_file_cache_ttl_secs: u64,
 
+    /// Cache whole bodies up to this size in the open-file cache. Zero
+    /// disables body caching.
+    #[serde(default = "Limits::default_open_file_cache_max_file_bytes")]
+    pub open_file_cache_max_file_bytes: usize,
+
     /// Token bucket per client IP. Zero disables the limiter.
     #[serde(default)]
     pub requests_per_second: u32,
@@ -317,6 +322,7 @@ impl Default for Limits {
             limit_rate_after: 0,
             open_file_cache: 0,
             open_file_cache_ttl_secs: Self::default_open_file_cache_ttl_secs(),
+            open_file_cache_max_file_bytes: Self::default_open_file_cache_max_file_bytes(),
             requests_per_second: 0,
             burst: 0,
             trusted_proxies: Vec::new(),
@@ -381,6 +387,10 @@ impl Limits {
 
     fn default_open_file_cache_ttl_secs() -> u64 {
         30
+    }
+
+    fn default_open_file_cache_max_file_bytes() -> usize {
+        64 * 1024
     }
 
     fn default_websocket_idle_secs() -> u64 {

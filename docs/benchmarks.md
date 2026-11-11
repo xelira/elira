@@ -21,14 +21,14 @@ Static `549 B`, `wrk -t2 -c50 -d10s`:
 | Server | Requests/sec | p50 | p99 |
 | --- | ---: | ---: | ---: |
 | nginx | 46.5k | 0.78 ms | 3.5 ms |
-| Elira | 10.3k | 6.2 ms | 20 ms |
+| Elira | 38.0k | 0.93 ms | 7.0 ms |
 
 Static `1 MiB`, `wrk -t2 -c20 -d10s`:
 
 | Server | Requests/sec | Throughput |
 | --- | ---: | ---: |
 | nginx | 3.07k | 3.0 GB/s |
-| Elira | 1.51k | 1.48 GB/s |
+| Elira | 2.91k | 2.84 GB/s |
 
 Proxy `549 B`, `wrk -t2 -c50 -d10s`:
 
@@ -39,19 +39,18 @@ Proxy `549 B`, `wrk -t2 -c50 -d10s`:
 
 ## Findings
 
-- The sendfile fast path only serves the first request on a plain HTTP/1.1
-  connection; later keep-alive requests go through hyper. This is why large
-  static files do not reach nginx throughput.
-- Using sendfile for small files is slower than hyper streaming. The
-  `sendfile_min_bytes` threshold (default 64 KiB) avoids that regression:
-  the 549-byte case improved from 6.8k to 10.3k req/s.
-- `open_file_cache` removed a further ~20% of static metadata work.
+- The fast static path now keeps the connection and serves every keep-alive
+  `GET`/`HEAD`, falling back to hyper through a prefixed stream when a request
+  needs the full pipeline.
+- Small file bodies and canonical paths are cached in `open_file_cache`.
+  Caching canonical paths and reusing metadata from `fast_static` removed two
+  syscalls per request and moved the small-file case from 10k to 38k req/s.
+- The sendfile fast path now handles large files on every keep-alive request,
+  so the 1 MiB case is close to nginx.
 - The proxy gap is roughly 1.9x and comes from hyper's generic request path
   plus per-request bookkeeping, not from the upstream connection pool.
 
 ## Next steps
 
-- A persistent static connection loop that keeps serving `GET`/`HEAD` after
-  the first sendfile response would close most of the large-file gap.
-- Caching small file bodies alongside metadata would cut the remaining
-  per-request `open`/`read` cost.
+- Profile the hyper proxy path: header copying and the access-log/labels
+  extensions are the likely remaining costs.

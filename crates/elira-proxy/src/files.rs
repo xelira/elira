@@ -29,21 +29,100 @@ use super::{text, BoxError};
 pub(crate) struct FileCache {
     ttl: Duration,
     max: usize,
+    max_file: usize,
     entries: Mutex<HashMap<PathBuf, CachedMeta>>,
+    canonical: Mutex<HashMap<PathBuf, (Instant, PathBuf)>>,
 }
 
 struct CachedMeta {
     at: Instant,
     meta: std::fs::Metadata,
+    body: Option<Bytes>,
 }
 
 impl FileCache {
-    pub(crate) fn new(max: usize, ttl: Duration) -> Self {
+    pub(crate) fn new(max: usize, ttl: Duration, max_file: usize) -> Self {
         Self {
             ttl,
             max: max.max(1),
+            max_file,
             entries: Mutex::new(HashMap::new()),
+            canonical: Mutex::new(HashMap::new()),
         }
+    }
+
+    async fn canonicalize(&self, path: &Path) -> std::io::Result<PathBuf> {
+        {
+            let cached = self
+                .canonical
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some((at, resolved)) = cached.get(path) {
+                if at.elapsed() < self.ttl {
+                    return Ok(resolved.clone());
+                }
+            }
+        }
+        let resolved = tokio::fs::canonicalize(path).await?;
+        let mut cached = self
+            .canonical
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if cached.len() >= self.max {
+            if let Some(oldest) = cached
+                .iter()
+                .min_by_key(|(_, (at, _))| *at)
+                .map(|(path, _)| path.clone())
+            {
+                cached.remove(&oldest);
+            }
+        }
+        cached.insert(path.to_path_buf(), (Instant::now(), resolved.clone()));
+        Ok(resolved)
+    }
+
+    /// Return the whole file, caching it when it fits the configured limit.
+    async fn body(&self, path: &Path) -> Option<Bytes> {
+        {
+            let entries = self
+                .entries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(entry) = entries.get(path) {
+                if entry.at.elapsed() < self.ttl {
+                    if let Some(body) = &entry.body {
+                        return Some(body.clone());
+                    }
+                }
+            }
+        }
+
+        if self.max_file == 0 {
+            return None;
+        }
+        let meta = self.metadata(path).await.ok()?;
+        if meta.len() > self.max_file as u64 {
+            return None;
+        }
+        let body = tokio::fs::read(path).await.ok()?;
+        let bytes = Bytes::from(body);
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = entries.get_mut(path) {
+            entry.body = Some(bytes.clone());
+        } else if entries.len() < self.max {
+            entries.insert(
+                path.to_path_buf(),
+                CachedMeta {
+                    at: Instant::now(),
+                    meta,
+                    body: Some(bytes.clone()),
+                },
+            );
+        }
+        Some(bytes)
     }
 
     async fn metadata(&self, path: &Path) -> std::io::Result<std::fs::Metadata> {
@@ -78,6 +157,7 @@ impl FileCache {
             CachedMeta {
                 at: Instant::now(),
                 meta: meta.clone(),
+                body: None,
             },
         );
         Ok(meta)
@@ -122,6 +202,9 @@ impl Files {
         } else {
             None
         };
+        // Resolve the root once. Doing it per request costs several syscalls
+        // on the static hot path.
+        let root = std::fs::canonicalize(&root).unwrap_or(root);
         Self {
             root,
             prefix,
@@ -139,11 +222,17 @@ impl Files {
         }
     }
 
-    async fn metadata(&self, path: &Path) -> std::io::Result<std::fs::Metadata> {
+    pub(crate) async fn metadata(&self, path: &Path) -> std::io::Result<std::fs::Metadata> {
         match &self.cache {
             Some(cache) => cache.metadata(path).await,
             None => tokio::fs::metadata(path).await,
         }
+    }
+
+    /// Whole file from the body cache when one is configured and the file
+    /// fits its size limit.
+    pub(crate) async fn cached_body(&self, path: &Path) -> Option<Bytes> {
+        self.cache.as_ref()?.body(path).await
     }
 
     pub(crate) async fn serve(
@@ -262,7 +351,7 @@ impl Files {
             }
         }
 
-        let root = tokio::fs::canonicalize(&self.root).await.ok()?;
+        let root = self.root.clone();
         let mut candidate = root.join(&relative);
         let mut meta = self.metadata(&candidate).await.ok();
 
@@ -287,7 +376,10 @@ impl Files {
         }
 
         meta?;
-        let resolved = tokio::fs::canonicalize(&candidate).await.ok()?;
+        let resolved = match &self.cache {
+            Some(cache) => cache.canonicalize(&candidate).await.ok()?,
+            None => tokio::fs::canonicalize(&candidate).await.ok()?,
+        };
         if !resolved.starts_with(&root) {
             return None;
         }
@@ -983,7 +1075,7 @@ mod tests {
         ));
         std::fs::write(&path, b"cached").expect("write file");
 
-        let cache = FileCache::new(4, Duration::from_secs(30));
+        let cache = FileCache::new(4, Duration::from_secs(30), 0);
         assert!(cache.metadata(&path).await.is_ok());
         std::fs::remove_file(&path).expect("remove file");
         assert!(
@@ -992,7 +1084,7 @@ mod tests {
         );
 
         std::fs::write(&path, b"fresh").expect("write file");
-        let no_cache = FileCache::new(4, Duration::ZERO);
+        let no_cache = FileCache::new(4, Duration::ZERO, 0);
         assert!(no_cache.metadata(&path).await.is_ok());
         std::fs::remove_file(&path).expect("remove file");
         assert!(no_cache.metadata(&path).await.is_err());

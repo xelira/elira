@@ -19,6 +19,7 @@ h3-quinn = { workspace = true }
 http = { workspace = true }
 http-body = { workspace = true }
 http-body-util = { workspace = true }
+hyper = { workspace = true }
 quinn = { workspace = true }
 rustls = { workspace = true }
 socket2 = { workspace = true }

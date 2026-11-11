@@ -4661,6 +4661,86 @@ upstream = "app"
 }
 
 #[tokio::test]
+async fn fast_static_keeps_the_connection_alive() {
+    let root = temp_root("fast-keepalive");
+    std::fs::write(root.join("index.html"), "cached body").unwrap();
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[limits]
+open_file_cache = 16
+open_file_cache_ttl_secs = 30
+
+[[routes]]
+host = "*"
+root = "{}"
+"#,
+        root.display()
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    let request = "GET /index.html HTTP/1.1\r\nHost: example.com\r\n\r\n";
+    for _ in 0..2 {
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write request");
+        let response = read_http_response(&mut stream).await;
+        assert_eq!(status(&response), "HTTP/1.1 200 OK", "{response}");
+        assert!(response.ends_with("cached body"), "{response}");
+    }
+}
+
+#[tokio::test]
+async fn fast_static_falls_back_to_hyper_on_the_same_connection() {
+    let upstream = fixed_upstream("via proxy").await;
+    let root = temp_root("fast-fallback");
+    std::fs::write(root.join("index.html"), "from disk").unwrap();
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+
+[limits]
+open_file_cache = 16
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "*"
+path = "/api"
+upstream = "app"
+
+[[routes]]
+host = "*"
+root = "{}"
+"#,
+        root.display()
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    stream
+        .write_all(b"GET /index.html HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        .await
+        .expect("write static");
+    let response = read_http_response(&mut stream).await;
+    assert_eq!(status(&response), "HTTP/1.1 200 OK", "{response}");
+    assert!(response.ends_with("from disk"), "{response}");
+
+    stream
+        .write_all(b"GET /api HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("write proxy");
+    let response = read_http_response(&mut stream).await;
+    assert_eq!(status(&response), "HTTP/1.1 200 OK", "{response}");
+    assert!(response.ends_with("via proxy"), "{response}");
+}
+
+#[tokio::test]
 async fn route_limit_conn_rejects_parallel_requests() {
     let slow = TcpListener::bind("127.0.0.1:0").await.expect("bind slow");
     let slow_addr = slow.local_addr().expect("slow addr");

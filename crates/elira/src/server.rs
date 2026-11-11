@@ -837,21 +837,25 @@ async fn serve_stream(
 
     // Plain HTTP/1.1 only: TLS and HTTP/2 have their own write paths, and the
     // fast path would duplicate them.
-    if options.sendfile
-        && tls.is_none()
-        && crate::sendfile::try_serve(
-            &mut stream,
+    let stream = if options.sendfile && tls.is_none() && !options.h2c {
+        let idle = (!options.idle_timeout.is_zero()).then_some(options.idle_timeout);
+        match crate::sendfile::try_serve(
+            stream,
             &runtime,
             &metrics,
             peer,
             &options.name,
             options.sendfile_min_bytes,
+            idle,
         )
         .await
-        .is_some()
-    {
-        return;
-    }
+        {
+            crate::sendfile::FastOutcome::Served => return,
+            crate::sendfile::FastOutcome::Fallback(stream) => stream,
+        }
+    } else {
+        crate::sendfile::PrefixedStream::plain(stream)
+    };
 
     let conn = ConnOptions {
         secure,

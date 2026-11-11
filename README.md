@@ -252,8 +252,8 @@ Upstreams:
   upstream client certificates, CRL checks and cipher/curve policy
 - per-upstream source address binding and PROXY protocol v1 toward upstreams
 - WebSocket and other `Upgrade` tunnelling over HTTP/1.1, WebSocket over
-  HTTP/2 via RFC 8441 extended `CONNECT`, and `CONNECT` over HTTP/1.1,
-  HTTP/2 or HTTP/3 with an explicit allowlist
+  HTTP/2 via RFC 8441 extended `CONNECT`, WebSocket over HTTP/3, and `CONNECT`
+  over HTTP/1.1, HTTP/2 or HTTP/3 with an explicit allowlist
 - custom HTTP/2 and HTTP/3 upstream pools with connection/stream stats,
   selectable per upstream
 - FastCGI (with optional multiplexing), SCGI, uWSGI, AJP13 and CGI upstreams,

@@ -141,7 +141,8 @@ Living list for the self-improvement loop. One item per session.
 - [x] Reject WebTransport/WebSocket extended CONNECT over HTTP/3 with `501`.
 - [ ] WebTransport gateway: needs an upstream WebTransport protocol, not a
   generic HTTP or TCP target.
-- [ ] WebSocket over HTTP/3 (`:protocol = websocket`).
+- [x] WebSocket over HTTP/3 (`:protocol = websocket`) translated to an
+  HTTP/1.1 upstream.
 - [ ] h2c via `Upgrade: h2c` (hyper cannot inject the upgraded stream 1).
 - [x] SCGI upstreams.
 - [x] uWSGI upstreams.
@@ -213,7 +214,8 @@ Living list for the self-improvement loop. One item per session.
 - [ ] Zero-copy `sendfile` through TLS and HTTP/2.
 - [x] Baseline benchmark and tuning against nginx; results and bottlenecks in
   `docs/benchmarks.md`.
-- [ ] Persistent static keep-alive loop and small-file body cache.
+- [x] Persistent static keep-alive loop and small-file body/canonical-path
+  cache.
 
 ## Done
 
