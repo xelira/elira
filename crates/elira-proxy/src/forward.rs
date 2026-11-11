@@ -243,6 +243,19 @@ impl Proxy {
 
         let vars = self.request_vars(&req, &key, &forward_host, scheme, peer, &request_id);
 
+        if !entry.early_hints.is_empty() {
+            if let Some(hints) = req.extensions().get::<EarlyHints>().cloned() {
+                let mut payload = String::from("HTTP/1.1 103 Early Hints\r\n");
+                for link in &entry.early_hints {
+                    payload.push_str("Link: ");
+                    payload.push_str(&vars.render(link));
+                    payload.push_str("\r\n");
+                }
+                payload.push_str("\r\n");
+                let _ = (hints.0)(payload.into_bytes()).await;
+            }
+        }
+
         let conn_guard = match &entry.conn_limit {
             Some(limiter) => {
                 let bucket =

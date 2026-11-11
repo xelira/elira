@@ -134,6 +134,7 @@ fn inherit(parent: &Route, child: &mut Route) -> Result<(), Error> {
     child.cache_key = child.cache_key.clone().or_else(|| parent.cache_key.clone());
     inherit_vec(&mut child.cache_bypass, &parent.cache_bypass);
     inherit_vec(&mut child.cache_valid, &parent.cache_valid);
+    inherit_vec(&mut child.early_hints, &parent.early_hints);
     child.access_log_sample = child.access_log_sample.or(parent.access_log_sample);
     child.client_cn = child.client_cn.clone().or_else(|| parent.client_cn.clone());
     child.client_issuer_cn = child
@@ -325,6 +326,7 @@ mod tests {
             cache_key: None,
             cache_bypass: Vec::new(),
             cache_valid: Vec::new(),
+            early_hints: Vec::new(),
             access_log: Route::default_access_log(),
             access_log_sample: None,
             client_auth: false,

@@ -402,6 +402,11 @@ pub struct Route {
     #[serde(default)]
     pub cache_valid: Vec<CacheValid>,
 
+    /// `Link` values sent in a `103 Early Hints` response before the final
+    /// one. Only plain HTTP/1.1 listeners can emit them.
+    #[serde(default)]
+    pub early_hints: Vec<String>,
+
     /// Write this route's requests to the access log.
     #[serde(default = "Route::default_access_log")]
     pub access_log: bool,

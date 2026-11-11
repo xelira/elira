@@ -4749,6 +4749,42 @@ upstream = "app"
     assert_eq!(line.trim(), "gold");
 }
 
+#[tokio::test]
+async fn early_hints_precede_plain_http_responses() {
+    let upstream = fixed_upstream("ok").await;
+    let config = format!(
+        r#"
+listen = "127.0.0.1:0"
+sendfile = false
+
+[[upstreams]]
+name = "app"
+servers = ["{upstream}"]
+
+[[routes]]
+host = "*"
+upstream = "app"
+early_hints = ["</app.css>; rel=preload; as=style"]
+"#
+    );
+    let (addr, _stop, _metrics) = start(&config).await;
+
+    let response = roundtrip(
+        addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(
+        response.starts_with("HTTP/1.1 103 Early Hints\r\n"),
+        "{response}"
+    );
+    assert!(
+        response.contains("Link: </app.css>; rel=preload; as=style"),
+        "{response}"
+    );
+    assert!(response.contains("HTTP/1.1 200 OK"), "{response}");
+}
+
 /// An upstream that varies its answer by Accept-Language and says so.
 async fn vary_upstream() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0")

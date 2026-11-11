@@ -2478,6 +2478,26 @@ return = { status = 200, body = "fallback" }
 }
 
 #[test]
+fn early_hints_are_validated() {
+    let base = r#"
+listen = "127.0.0.1:8080"
+
+[[routes]]
+host = "*"
+root = "/srv"
+early_hints = ["</app.css>; rel=preload; as=style"]
+"#;
+    let cfg = Config::parse(base).expect("valid early hints");
+    assert_eq!(cfg.routes[0].early_hints.len(), 1);
+
+    let bad = base.replace("</app.css>", "</app\\r.css>");
+    assert!(matches!(
+        Config::parse(&bad),
+        Err(Error::BadEarlyHint { .. })
+    ));
+}
+
+#[test]
 fn named_locations_are_validated() {
     let base = r#"
 listen = "127.0.0.1:8080"

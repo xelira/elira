@@ -1130,6 +1130,13 @@ impl Config {
                 return Err(Error::BadLimitConnKey { index });
             }
         }
+        if route
+            .early_hints
+            .iter()
+            .any(|hint| hint.is_empty() || hint.chars().any(char::is_control))
+        {
+            return Err(Error::BadEarlyHint { index });
+        }
 
         if route.error_root.is_some() && route.error_pages.is_empty() {
             return Err(Error::ErrorRootWithoutPages { index });

@@ -442,6 +442,9 @@ pub enum Error {
     #[error("route {index}: limit_conn_key needs limit_conn and a valid key")]
     BadLimitConnKey { index: usize },
 
+    #[error("route {index}: early_hints contains an invalid header value")]
+    BadEarlyHint { index: usize },
+
     #[error("route {index}: requests_per_second must be greater than zero")]
     BadRouteRate { index: usize },
 

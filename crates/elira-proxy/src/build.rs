@@ -402,6 +402,7 @@ pub(crate) fn build_route(
         max_response: route.max_response_bytes,
         cache,
         cache_max_item,
+        early_hints: route.early_hints.clone(),
         cache_ttl: route.cache_ttl_secs.map(Duration::from_secs),
         cache_key: route.cache_key.clone(),
         cache_bypass: route.cache_bypass.clone(),

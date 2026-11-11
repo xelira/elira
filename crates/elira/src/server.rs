@@ -546,6 +546,7 @@ pub async fn serve_unix(
                             None,
                             "unix".to_owned(),
                             None,
+                            None,
                         )
                         .await;
                         return;
@@ -581,6 +582,7 @@ pub async fn serve_unix(
                                 None,
                                 identity,
                                 "unix".to_owned(),
+                            None,
                             None,
                             )
                             .await;
@@ -711,6 +713,18 @@ async fn serve_stream(
         None
     };
 
+    let early_hints = if !options.tls && !options.h2c && !options.sendfile {
+        clone_tcp(&stream).ok().map(|stream| {
+            let stream = Arc::new(tokio::sync::Mutex::new(stream));
+            elira_proxy::EarlyHints::new(Arc::new(move |bytes| {
+                let stream = stream.clone();
+                Box::pin(async move { stream.lock().await.write_all(&bytes).await })
+            }))
+        })
+    } else {
+        None
+    };
+
     let conn = ConnOptions {
         max_headers: options.max_headers,
         max_buf_size: options.max_buf_size,
@@ -742,6 +756,7 @@ async fn serve_stream(
                 None,
                 options.name.clone(),
                 tcp_guard.take(),
+                None,
             )
             .await;
             return;
@@ -765,6 +780,7 @@ async fn serve_stream(
                     None,
                     options.name.clone(),
                     tcp_guard.take(),
+                    None,
                 )
                 .await;
             }
@@ -808,6 +824,7 @@ async fn serve_stream(
                     None,
                     options.name.clone(),
                     tcp_guard.take(),
+                    None,
                 )
                 .await;
                 return;
@@ -856,6 +873,7 @@ async fn serve_stream(
                         identity,
                         options.name.clone(),
                         tcp_guard.take(),
+                        None,
                     )
                     .await;
                 }
@@ -881,6 +899,7 @@ async fn serve_stream(
                 None,
                 options.name.clone(),
                 tcp_guard.take(),
+                early_hints,
             )
             .await
         }
@@ -899,6 +918,7 @@ async fn serve_conn<I>(
     client_cert: Option<elira_tls::ClientIdentity>,
     listener: String,
     guard: Option<TcpGuard>,
+    hints: Option<elira_proxy::EarlyHints>,
 ) where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -912,6 +932,7 @@ async fn serve_conn<I>(
     let served_for_service = Arc::new(AtomicU64::new(0));
     let upgraded = Arc::new(AtomicBool::new(false));
     let upgraded_for_service = upgraded.clone();
+    let hints_for_service = hints;
     let metrics_for_service = metrics.clone();
     let acme_for_service = acme.clone();
     let client_cert = client_cert.map(Arc::new);
@@ -921,6 +942,7 @@ async fn serve_conn<I>(
         let runtime = runtime.clone();
         let served = served_for_service.clone();
         let upgraded = upgraded_for_service.clone();
+        let hints = hints_for_service.clone();
         let idle = idle_for_service.clone();
         let metrics = metrics_for_service.clone();
         let acme = acme_for_service.clone();
@@ -930,6 +952,10 @@ async fn serve_conn<I>(
             // Reset the keep-alive watchdog: a request means the client is
             // still there, even if the response takes a while.
             idle.notify_one();
+
+            if let Some(hints) = &hints {
+                req.extensions_mut().insert(hints.clone());
+            }
 
             if req.method() == hyper::Method::CONNECT
                 || req.headers().contains_key(hyper::header::UPGRADE)

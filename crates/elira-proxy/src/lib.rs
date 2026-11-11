@@ -86,6 +86,28 @@ pub struct Labels {
     pub mapped: HashMap<String, String>,
 }
 
+/// Writes a raw `103 Early Hints` response to a plain HTTP/1.1 connection.
+#[derive(Clone)]
+pub struct EarlyHints(
+    pub  Arc<
+        dyn Fn(Vec<u8>) -> futures_util::future::BoxFuture<'static, std::io::Result<()>>
+            + Send
+            + Sync,
+    >,
+);
+
+impl EarlyHints {
+    pub fn new(
+        writer: Arc<
+            dyn Fn(Vec<u8>) -> futures_util::future::BoxFuture<'static, std::io::Result<()>>
+                + Send
+                + Sync,
+        >,
+    ) -> Self {
+        Self(writer)
+    }
+}
+
 /// Per-request upstream details for access logs and admin output.
 #[derive(Clone, Debug)]
 pub struct UpstreamInfo {
@@ -336,6 +358,7 @@ struct RouteEntry {
     fastcgi_mux: Option<Arc<elira_fastcgi::MultiplexPool>>,
     cache: Option<Arc<Cache>>,
     cache_max_item: usize,
+    early_hints: Vec<String>,
     cache_ttl: Option<Duration>,
     cache_key: Option<String>,
     cache_bypass: Vec<String>,

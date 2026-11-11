@@ -189,8 +189,8 @@ Living list for the self-improvement loop. One item per session.
 
 ### Section 5 — HTTP details
 
-- [ ] `103 Early Hints`: hyper's server side explicitly rejects 1xx
-  responses, so this needs a different HTTP stack or a raw pre-hyper write.
+- [x] `103 Early Hints` for plain HTTP/1.1 via a raw socket write; TLS and
+  HTTP/2/3 stay unsupported because hyper has no server-side 1xx hook.
 - [ ] `h2c Upgrade`.
 - [x] Dual RSA + ECDSA certificates per name: duplicate SNI names are allowed
   and the resolver picks a key compatible with the client's signature schemes.

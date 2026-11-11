@@ -209,6 +209,7 @@ Routing:
 - `satisfy any` / `satisfy all` for ACL, basic auth and `auth_request`
 - `secure_link` MD5 signatures with query or path forms and expiry
 - `X-Accel-Redirect` and filesystem-scoped `X-Sendfile` from upstream
+- `103 Early Hints` on plain HTTP/1.1 routes
 - `error_page` status overrides such as `"404 =200 /soft-404.html"`
 - optional `if_modified_since = false` for static routes
 - per-status cache TTLs with `cache_valid`
