@@ -336,6 +336,11 @@ pub struct Route {
     #[serde(default)]
     pub limit_conn: Option<u32>,
 
+    /// What identifies a client for `limit_conn`: `ip` (default),
+    /// `authorization`, `header:NAME`, `cookie:NAME` or `uri`.
+    #[serde(default)]
+    pub limit_conn_key: Option<String>,
+
     /// Delay requests over the rate instead of rejecting them until the burst
     /// queue is full. False keeps nginx's `nodelay` behaviour.
     #[serde(default)]

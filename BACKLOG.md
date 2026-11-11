@@ -178,7 +178,7 @@ Living list for the self-improvement loop. One item per session.
 
 - [x] `limit_rate` and `limit_rate_after` bandwidth throttling.
 - [x] Per-IP connection limit at the listener (`limits.limit_conn_per_ip`).
-- [x] Per-route `limit_conn`.
+- [x] Per-route `limit_conn` with an IP/header/cookie/authorization/URI key.
 - [x] `limit_req` delay/nodelay semantics on top of the token bucket.
 - [x] `keepalive_requests` per connection.
 - [x] Configurable `client_header_timeout`.

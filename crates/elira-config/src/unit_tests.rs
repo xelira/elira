@@ -2269,6 +2269,7 @@ limit_rate = 2000
 limit_rate_after = 0
 rate_delay = true
 limit_conn = 4
+limit_conn_key = "header:X-Tenant"
 "#;
     let cfg = Config::parse(base).expect("valid config");
     assert_eq!(cfg.limits.limit_rate, 1000);
@@ -2277,6 +2278,19 @@ limit_conn = 4
     assert_eq!(cfg.routes[0].limit_rate_after, Some(0));
     assert_eq!(cfg.routes[0].rate_delay, Some(true));
     assert_eq!(cfg.routes[0].limit_conn, Some(4));
+    assert_eq!(
+        cfg.routes[0].limit_conn_key.as_deref(),
+        Some("header:X-Tenant")
+    );
+
+    let bad_key = base.replace(
+        "limit_conn_key = \"header:X-Tenant\"",
+        "limit_conn_key = \"header:bad name\"",
+    );
+    assert!(matches!(
+        Config::parse(&bad_key),
+        Err(Error::BadLimitConnKey { .. })
+    ));
 }
 
 #[test]

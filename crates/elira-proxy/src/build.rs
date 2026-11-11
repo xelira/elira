@@ -392,6 +392,7 @@ pub(crate) fn build_route(
             .limit_conn
             .filter(|limit| *limit > 0)
             .map(|limit| Arc::new(RequestLimiter::new(limit as usize))),
+        conn_key: parse_request_key(route.limit_conn_key.as_deref()),
         limiter,
         rate_key: parse_request_key(route.rate_key.as_deref()),
         body_limit: route.max_body_bytes,

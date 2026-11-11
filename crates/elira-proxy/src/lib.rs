@@ -97,7 +97,7 @@ pub struct UpstreamInfo {
 /// Counts in-flight requests per client IP for a route's `limit_conn`.
 pub(crate) struct RequestLimiter {
     limit: usize,
-    active: Mutex<HashMap<std::net::IpAddr, usize>>,
+    active: Mutex<HashMap<String, usize>>,
 }
 
 impl RequestLimiter {
@@ -108,26 +108,26 @@ impl RequestLimiter {
         }
     }
 
-    fn try_enter(self: &Arc<Self>, ip: std::net::IpAddr) -> Option<RequestGuard> {
+    fn try_enter(self: &Arc<Self>, key: &str) -> Option<RequestGuard> {
         let mut active = self
             .active
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let count = active.entry(ip).or_insert(0);
+        let count = active.entry(key.to_owned()).or_insert(0);
         if *count >= self.limit {
             return None;
         }
         *count += 1;
         Some(RequestGuard {
             limiter: self.clone(),
-            ip,
+            key: key.to_owned(),
         })
     }
 }
 
 pub(crate) struct RequestGuard {
     limiter: Arc<RequestLimiter>,
-    ip: std::net::IpAddr,
+    key: String,
 }
 
 impl Drop for RequestGuard {
@@ -137,10 +137,10 @@ impl Drop for RequestGuard {
             .active
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(count) = active.get_mut(&self.ip) {
+        if let Some(count) = active.get_mut(&self.key) {
             *count = count.saturating_sub(1);
             if *count == 0 {
-                active.remove(&self.ip);
+                active.remove(&self.key);
             }
         }
     }
@@ -324,6 +324,7 @@ struct RouteEntry {
     rate_after: u64,
     rate_delay: bool,
     conn_limit: Option<Arc<RequestLimiter>>,
+    conn_key: RequestKey,
     limiter: Option<Arc<RateLimiter>>,
     rate_key: RequestKey,
     body_limit: Option<usize>,

@@ -244,18 +244,22 @@ impl Proxy {
         let vars = self.request_vars(&req, &key, &forward_host, scheme, peer, &request_id);
 
         let conn_guard = match &entry.conn_limit {
-            Some(limiter) => match limiter.try_enter(peer.ip()) {
-                Some(guard) => Some(guard),
-                None => {
-                    let mut response = text(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "too many concurrent requests",
-                    );
-                    self.apply_error_page(&mut response, entry, &vars, peer)
-                        .await;
-                    return Err(response);
+            Some(limiter) => {
+                let bucket =
+                    request_key_value(&entry.conn_key, req.headers(), peer.ip(), &vars.path);
+                match limiter.try_enter(bucket.as_ref()) {
+                    Some(guard) => Some(guard),
+                    None => {
+                        let mut response = text(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "too many concurrent requests",
+                        );
+                        self.apply_error_page(&mut response, entry, &vars, peer)
+                            .await;
+                        return Err(response);
+                    }
                 }
-            },
+            }
             None => None,
         };
 

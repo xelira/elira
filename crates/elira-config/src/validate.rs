@@ -1125,6 +1125,11 @@ impl Config {
                 });
             }
         }
+        if let Some(key) = &route.limit_conn_key {
+            if !matches!(route.limit_conn, Some(limit) if limit > 0) || !valid_rate_key(key) {
+                return Err(Error::BadLimitConnKey { index });
+            }
+        }
 
         if route.error_root.is_some() && route.error_pages.is_empty() {
             return Err(Error::ErrorRootWithoutPages { index });
