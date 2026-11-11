@@ -681,6 +681,7 @@ async fn serve_stream(
     metrics: Arc<Metrics>,
     stop: &mut watch::Receiver<bool>,
 ) {
+    let _ = stream.set_nodelay(true);
     if options.proxy_protocol {
         match crate::proxy_protocol::read_peer(&mut stream).await {
             Some(real) => peer = real,

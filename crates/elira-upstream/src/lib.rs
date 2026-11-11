@@ -64,6 +64,7 @@ pub fn https_connector(
     // bounded without shortening the time allowed for the response.
     let mut http = HttpConnector::new_with_resolver(resolver);
     http.enforce_http(false);
+    http.set_nodelay(true);
     if let Some(timeout) = options.connect_timeout {
         http.set_connect_timeout(Some(timeout));
     }
@@ -248,7 +249,9 @@ pub async fn tcp_connect(
     resolver: Option<&Resolver>,
 ) -> std::io::Result<tokio::net::TcpStream> {
     if bind.is_none() && resolver.is_none() {
-        return tokio::net::TcpStream::connect((host, port)).await;
+        let stream = tokio::net::TcpStream::connect((host, port)).await?;
+        let _ = stream.set_nodelay(true);
+        return Ok(stream);
     }
 
     let addrs = match resolver {
@@ -260,7 +263,10 @@ pub async fn tcp_connect(
         let mut last = None;
         for addr in addrs {
             match tokio::net::TcpStream::connect(addr).await {
-                Ok(stream) => return Ok(stream),
+                Ok(stream) => {
+                    let _ = stream.set_nodelay(true);
+                    return Ok(stream);
+                }
                 Err(err) => last = Some(err),
             }
         }
@@ -281,7 +287,10 @@ pub async fn tcp_connect(
             continue;
         }
         match socket.connect(addr).await {
-            Ok(stream) => return Ok(stream),
+            Ok(stream) => {
+                let _ = stream.set_nodelay(true);
+                return Ok(stream);
+            }
             Err(err) => last = Some(err),
         }
     }
