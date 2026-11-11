@@ -211,7 +211,9 @@ Living list for the self-improvement loop. One item per session.
 
 - [ ] `io_uring`/AIO and `open_file_cache` for static files.
 - [ ] Zero-copy `sendfile` through TLS and HTTP/2.
-- [ ] Benchmark and tune the tokio/hyper hot path against nginx baselines.
+- [x] Baseline benchmark and tuning against nginx; results and bottlenecks in
+  `docs/benchmarks.md`.
+- [ ] Persistent static keep-alive loop and small-file body cache.
 
 ## Done
 

@@ -147,6 +147,11 @@ pub struct Config {
     /// request. Linux only.
     #[serde(default = "Config::default_sendfile")]
     pub sendfile: bool,
+    /// Files smaller than this use the normal streaming path. The sendfile
+    /// fast path has per-connection setup cost that does not pay off for
+    /// small bodies.
+    #[serde(default = "Config::default_sendfile_min_bytes")]
+    pub sendfile_min_bytes: u64,
     #[serde(default)]
     pub tls: Option<Tls>,
     #[serde(default)]
@@ -183,6 +188,10 @@ impl Config {
 
     fn default_sendfile() -> bool {
         true
+    }
+
+    fn default_sendfile_min_bytes() -> u64 {
+        64 * 1024
     }
 
     pub fn load(path: &Path) -> Result<Self, Error> {

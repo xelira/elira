@@ -316,6 +316,7 @@ pub struct Options {
     pub reset_timedout_connection: bool,
     pub proxy_protocol: bool,
     pub sendfile: bool,
+    pub sendfile_min_bytes: u64,
     pub h2c: bool,
     pub unix_tls: bool,
     /// This TCP listener terminates TLS.
@@ -349,6 +350,7 @@ impl Options {
             reset_timedout_connection: cfg.limits.reset_timedout_connection,
             proxy_protocol: cfg.proxy_protocol,
             sendfile: cfg.sendfile,
+            sendfile_min_bytes: cfg.sendfile_min_bytes,
             h2c: cfg.h2c,
             unix_tls: cfg.unix_tls,
             tls: cfg.tls.is_some() || cfg.acme.is_some(),
@@ -837,9 +839,16 @@ async fn serve_stream(
     // fast path would duplicate them.
     if options.sendfile
         && tls.is_none()
-        && crate::sendfile::try_serve(&mut stream, &runtime, &metrics, peer, &options.name)
-            .await
-            .is_some()
+        && crate::sendfile::try_serve(
+            &mut stream,
+            &runtime,
+            &metrics,
+            peer,
+            &options.name,
+            options.sendfile_min_bytes,
+        )
+        .await
+        .is_some()
     {
         return;
     }

@@ -131,6 +131,7 @@ tls = true   # использует общий [tls] или [acme]
 | `proxy_protocol` | bool | `false` | ждать PROXY protocol (v1/v2) на каждом соединении |
 | `reuse_port` | bool | `false` | SO_REUSEPORT; нужен для hot restart по SIGUSR2 |
 | `sendfile` | bool | `true` | zero-copy статика на Linux через `sendfile(2)` |
+| `sendfile_min_bytes` | целое ≥ 0 | `65536` | файлы меньше этого размера идут обычным путём |
 | `server_header` | bool | `true` | отдавать `Server: elira` и сохранять заголовок upstream |
 | `limits` | таблица | значения по умолчанию | лимиты соединений и заголовков |
 | `tls` | таблица | нет (HTTP без TLS) | сертификат для TCP-листенера |
@@ -156,7 +157,10 @@ HTTP/1.1-соединении подглядывается до hyper, и про
 путь не используется для `Range`, `If-None-Match`, `If-Modified-Since`,
 `Upgrade`, при наличии предсжатого `.br`/`.gz`, а также если у маршрута есть
 `add_headers`/`remove_headers`, выключен `server_header` или задан
-`Alt-Svc` — всё это уходит в hyper. Работает только на Linux.
+`Alt-Svc` — всё это уходит в hyper. Работает только на Linux. Файлы меньше
+`sendfile_min_bytes` намеренно идут обычным потоковым путём: на коротких телах
+стоимость `sendfile`-обвязки выше выигрыша. Быстрый путь обслуживает только
+первый запрос соединения; дальнейшие keep-alive запросы обрабатывает hyper.
 
 `proxy_protocol` включает разбор заголовка PROXY до TLS и до HTTP. Поддержаны
 версии 1 и 2. Заголовок при этом обязателен: соединение без него закрывается

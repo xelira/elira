@@ -188,7 +188,8 @@ remove_headers = ["X-Powered-By"]
 
 The full reference, reload table and error list live in
 [docs/configuration.md](docs/configuration.md). How a request moves through
-the code is in [docs/architecture.md](docs/architecture.md).
+the code is in [docs/architecture.md](docs/architecture.md). Baseline numbers
+against nginx are in [docs/benchmarks.md](docs/benchmarks.md).
 
 ## What it does
 

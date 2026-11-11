@@ -17,7 +17,7 @@ use std::os::fd::AsRawFd;
 
 use arc_swap::ArcSwap;
 use http::Method;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
 use tokio::net::TcpStream;
 
 use elira_accesslog::{request_id, Entry};
@@ -35,6 +35,7 @@ pub(crate) async fn try_serve(
     metrics: &Metrics,
     peer: SocketAddr,
     listener: &str,
+    min_bytes: u64,
 ) -> Option<()> {
     if !cfg!(target_os = "linux") {
         return None;
@@ -97,6 +98,9 @@ pub(crate) async fn try_serve(
     let file = fast.file;
     let meta = tokio::fs::metadata(&file).await.ok()?;
     if !meta.is_file() {
+        return None;
+    }
+    if meta.len() < min_bytes {
         return None;
     }
 
@@ -327,29 +331,15 @@ async fn send_file(
     len: u64,
 ) -> io::Result<()> {
     let input = file.as_raw_fd();
-    // `AsyncFd` wants to own the descriptor. Duplicate it so the socket is
-    // closed once, by the original `TcpStream`.
-    let duplicate = unsafe { libc::dup(stream.as_raw_fd()) };
-    if duplicate < 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    // SAFETY: `OwnedFd` owns a private duplicate and closes it on drop, so the
-    // descriptor stays valid for as long as `AsyncFd` holds it.
-    let async_fd = unsafe { tokio::io::unix::AsyncFd::register(OwnedFd(duplicate)) }
-        .map_err(|err| io::Error::other(err.to_string()))?;
-
+    let output = stream.as_raw_fd();
     let mut offset: i64 = offset as i64;
     let mut remaining = len;
 
     while remaining > 0 {
-        let mut guard = async_fd.writable().await?;
-
-        let result = guard.try_io(|inner| {
-            let output = inner.get_ref().as_raw_fd();
-            let count = remaining.min(1 << 20) as usize;
+        stream.writable().await?;
+        let count = remaining.min(1 << 20) as usize;
+        let result = stream.try_io(Interest::WRITABLE, || {
             let written = unsafe { libc::sendfile(output, input, &mut offset, count) };
-
             if written < 0 {
                 Err(io::Error::last_os_error())
             } else {
@@ -358,33 +348,14 @@ async fn send_file(
         });
 
         match result {
-            Ok(Ok(0)) => break,
-            Ok(Ok(written)) => remaining -= written as u64,
-            Ok(Err(err)) => return Err(err),
-            Err(_would_block) => continue,
+            Ok(0) => break,
+            Ok(written) => remaining -= written as u64,
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(err) => return Err(err),
         }
     }
 
     Ok(())
-}
-
-#[cfg(target_os = "linux")]
-struct OwnedFd(std::os::fd::RawFd);
-
-#[cfg(target_os = "linux")]
-impl AsRawFd for OwnedFd {
-    fn as_raw_fd(&self) -> std::os::fd::RawFd {
-        self.0
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl Drop for OwnedFd {
-    fn drop(&mut self) {
-        unsafe {
-            libc::close(self.0);
-        }
-    }
 }
 
 #[cfg(not(target_os = "linux"))]

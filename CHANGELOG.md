@@ -158,6 +158,7 @@
 - `error_pages` с named locations (`@name`) для статики, `return` и `redirect`.
 - `limit_conn_key` для выбора ключа лимита одновременных запросов.
 - `early_hints` с `103 Early Hints` для открытого HTTP/1.1.
+- `sendfile_min_bytes`: мелкие файлы идут потоковым путём, крупные — через sendfile.
 - Одинаковые SNI-имена с RSA и ECDSA сертификатами: выбор по signature algorithms.
 - `GET /config` на админском листенере: эффективный конфиг в JSON.
 - Тесты FastCGI/CGI на обрезанные заголовки, длину записи, padding и хвост
