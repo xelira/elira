@@ -1,0 +1,79 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/elira",
+    "crates/elira-config",
+    "crates/elira-proxy",
+    "crates/elira-tls",
+    "crates/elira-accesslog",
+    "crates/elira-h3",
+    "crates/elira-metrics",
+    "crates/elira-limit",
+    "crates/elira-cache",
+    "crates/elira-acme",
+    "crates/elira-upstream",
+    "crates/elira-auth",
+    "crates/elira-migrate",
+    "crates/elira-fastcgi",
+    "crates/elira-cgi",
+    "crates/elira-module",
+    "crates/elira-wasm",
+    "crates/elira-h2",
+    "crates/elira-h1upstream",
+    "crates/elira-h3upstream",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/xelira/elira"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal", "time", "sync", "io-util", "fs", "process", "test-util"] }
+hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1", "server-auto"] }
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+regex = "1"
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+thiserror = "2"
+http-body = "1"
+arc-swap = "1"
+rustls = "0.23"
+rustls-pemfile = "2"
+tokio-rustls = "0.26"
+openssl = "0.10"
+openssl-sys = "0.9"
+foreign-types-shared = "0.1"
+tokio-openssl = "0.6"
+quinn = "0.11"
+h3 = { git = "https://github.com/hyperium/h3", rev = "43745ad87e95b0c035ac9c547aad467303213425" }
+h3-quinn = { git = "https://github.com/hyperium/h3", rev = "43745ad87e95b0c035ac9c547aad467303213425" }
+futures-util = "0.3"
+tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = { version = "0.7", features = ["io"] }
+percent-encoding = "2"
+httpdate = "1"
+ipnet = "2"
+socket2 = { version = "0.5", features = ["all"] }
+libc = "0.2"
+async-compression = { version = "0.4", features = ["tokio", "gzip", "brotli"] }
+md-5 = "0.10"
+base64 = "0.22"
+
+[profile.dev]
+
+debug = 0
+incremental = false
+
+[profile.test]
+debug = 0
+incremental = false

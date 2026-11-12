@@ -1,0 +1,270 @@
+# Changelog
+
+Формат основан на [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/),
+версии следуют [Semantic Versioning](https://semver.org/lang/ru/).
+
+## [0.1.0] — не выпущена
+
+### Added
+
+- HTTP/1.1 и HTTP/2 на TCP-листенере; HTTP/3 поверх QUIC на отдельном
+  UDP-листенере.
+- TLS через rustls с ALPN `h2`, затем `http/1.1`; перечитывание сертификата и
+  ключа по `SIGHUP`.
+- Маршрутизация по Host без учёта регистра, порта и userinfo; для HTTP/2
+  используется `:authority`; маршрут `host = "*"` ловит остальные запросы.
+- Upstream'ы с балансировкой `round_robin` и `least_conn`, активными
+  health-проверками (живым считается ответ `2xx`/`3xx`) и fail-open, когда все
+  серверы помечены мёртвыми.
+- Повторы для GET, HEAD и OPTIONS без тела при ошибке соединения или таймауте.
+- Websockets и другие протоколы `Upgrade` через отдельное TCP-соединение к
+  upstream'у.
+- `CONNECT`-туннели: выключены по умолчанию, разрешены только для точных
+  `host:port` из `connect.allow`, только по HTTP/1.1.
+- Статика: index-файлы, MIME-типы, `ETag` и `If-None-Match`,
+  `If-Modified-Since`, одиночные byte ranges, `HEAD`, SPA fallback и редирект
+  каталога без завершающего `/`.
+- Сжатие gzip/brotli для подходящих ответов и статики, с `Vary` и потоковой
+  передачей тела; предсжатые `.br`/`.gz` рядом с файлом выигрывают.
+- `sendfile(2)` для простых статических GET/HEAD по HTTP/1.1 без TLS.
+- Ограничение частоты запросов на IP через token bucket и лимит тела по
+  `Content-Length`.
+- `trusted_proxies` для `X-Forwarded-For`; заголовки `Forwarded`,
+  `X-Forwarded-*`, `X-Real-IP` и их underscore-алиасы от клиента отбрасываются.
+- PROXY protocol версий 1 и 2 до TLS и HTTP.
+- Access-лог в текстовом или JSON-формате с request id на каждый запрос; вывод
+  в stdout или в файл с ротацией по размеру.
+- Basic auth из htpasswd (bcrypt) и списки `ip_allow`/`ip_deny` на маршруте.
+- Таймаут upstream'а, переопределяемый на маршруте через `timeout_secs`.
+- Отдельные таймауты соединения и записи тела upstream'а
+  (`upstream_connect_timeout_secs`, `upstream_send_timeout_secs`) с
+  переопределением на маршруте.
+- Таймауты на тело запроса и ответа, простой websocket/CONNECT и опциональная
+  буферизация небольших ответов upstream'а.
+- Свой token bucket, предел тела и `error_pages` на маршруте.
+- Кэш учитывает `Vary`, `Cache-Control`, `Authorization` и `Cookie`; не
+  смешивает ответы разных пользователей и выставляет `Age`. Тела можно
+  хранить на диске (`cache.dir`), а `stale_secs` включает
+  stale-while-revalidate с фоновым обновлением.
+- `dns_ttl_secs` ограничивает жизнь соединения в пуле, чтобы смена DNS
+  подхватывалась за предсказуемое время.
+- Микробенчмарки кэша и разбора конфига (`cargo bench`).
+- mTLS на TCP- и QUIC-листенерах: `client_auth` и `client_ca`.
+- SNI-сертификаты через `[[tls.certificates]]`, минимальная версия TLS.
+- Свои `sni`, `health_path`, `tls_insecure`, `tls_ca` и `http2` у upstream'а;
+  health-проба для TLS-бэкенда делает настоящее рукопожатие.
+- Unix-сокеты как адреса upstream'ов (`unix:/run/app.sock`), включая
+  upgrade и health-пробу, и дополнительный HTTP/1.1-листенер `listen_unix`.
+- HTTP/2 до upstream'а по `[upstream_tls] http2 = true`.
+- Prometheus-метрики на отдельном листенере: запросы по классам статусов,
+  гистограмма задержки, число соединений в работе и состояние upstream'ов.
+  Там же `GET /status` с JSON-снимком upstream'ов и их серверов, а также
+  `POST /reload`, `POST /drain` и `POST /cache/purge`; `metrics.auth_file`
+  закрывает весь листенер Basic auth.
+- Шаблоны access-лога в стиле nginx и отправка в syslog.
+- `SIGUSR2` ждёт готовности замены (файл готовности и systemd `READY=1`),
+  поэтому неудачный рестарт оставляет старый процесс живым.
+- Перезагрузка конфигурации по `SIGHUP`: маршруты, upstream'ы, сертификаты и
+  формат лога применяются без разрыва HTTP/1.1 и HTTP/2 соединений.
+- Ограничения на число и размер заголовков, число соединений, idle-таймаут,
+  таймаут upstream'а и размер тела запроса.
+- Удаление hop-by-hop заголовков, включая токены из `Connection`.
+- Graceful shutdown по `SIGINT` и `SIGTERM` с ограниченным временем на
+  завершение соединений.
+- Команда `elira check` для разбора и валидации конфигурации без открытия
+  сокетов и `elira migrate` для конвертации подмножества nginx-конфига.
+- ACME проверен против Let's Encrypt staging и production на реальном домене
+  и публичном порту 443; HTTP-01 проверен на staging через отдельный
+  plain-листенер за nginx.
+- PROXY protocol v2 на QUIC-датаграммах: заголовок снимается до quinn.
+- HTTP/3-листенер переживает SIGHUP, если не менялись адрес, сертификат и
+  клиентская аутентификация.
+- Дисковый кэш переживает перезапуск; метаданные и тела загружаются обратно.
+- sendfile обслуживает одиночные range, conditionals, auth/ACL и per-route
+  заголовки; TLS, HTTP/2, сжатие и multi-range остаются в hyper.
+- Маршруты по регулярному выражению пути (`path_regex`) после префиксных.
+- FastCGI принимает DNS-имена в `fastcgi_pass`.
+- Кэш делает условную revalidation (`ETag`/`Last-Modified` → `304`) и сжимает
+  HIT-ответы.
+- SNI-сертификаты и mTLS на QUIC-листенере.
+- `include` с масками и рекурсивным слиянием, подстановка `${ENV}` в конфиге.
+- Агрегированные `/metrics` и `/status` супервизором при `workers > 1`.
+- `max_concurrent` для FastCGI/CGI/module-маршрутов и запрет загрузки
+  world-writable модулей.
+- Потоковые FastCGI/CGI: stdin/stdout с backpressure и лимитом ответа.
+- OCSP stapling из DER-файла, перечитываемого по SIGHUP.
+- Пул idle-соединений FastCGI с TTL и повторной попыткой на мёртвом сокете.
+- ACME DNS-01 через внешний hook: wildcard-сертификаты, кэш аккаунта,
+  обновление раз в 12 часов.
+- `ocsp_hook` с периодическим обновлением OCSP-файла и reload.
+- `module_sandbox`: изоляция `.so` в дочернем процессе через JSON-протокол.
+- `POST /reload` и `/drain` на агрегированном админ-листенере воркеров.
+- Per-route `cache_enabled` и `cache_ttl_secs`.
+- Метрики TLS handshake и принятых QUIC-соединений.
+- Имя upstream в текстовом/JSON access-логе и `$upstream`.
+- Gauge активных запросов по пулам upstream.
+- Счётчики stale-попаданий кэша и health-проверок.
+- `limits.connection_drain_secs` и `limits.shutdown_timeout_secs`.
+- Gauge `elira_tls_certificate_expires_seconds` для TCP/QUIC сертификатов.
+- Per-route `access_log = false`.
+- WASM-модули как цель маршрута (`wasm = "/path/echo.wasm"`) с fuel-бюджетом
+  против бесконечных циклов.
+- Собственный HTTP/2-пул upstream (`h2_pool`), h2c prior knowledge,
+  connections/active/total/queued в `/status` и Prometheus-gauges.
+- Собственный HTTP/3-пул upstream (`h3_pool`) на quinn/h3 с
+  Prometheus-gauges.
+- `scripts/cloudflare-dns.sh` для DNS-01 через Cloudflare API token.
+- `fastcgi_param` и `cgi_param` на маршруте.
+- `limits.max_upstream_response_bytes` и одноимённый per-route предел ответа
+  проксируемого upstream.
+- Глобальные `error_pages`/`error_root`: страницы для `401`, `403`, `404` без
+  маршрута, `429` и ошибок upstream.
+- Сэмплирование access-лога: `log.sample` и `access_log_sample` на маршруте.
+- Per-route mTLS: `client_auth`, `client_cn`, `client_issuer_cn`; работает на
+  HTTP/1.1, HTTP/2 и HTTP/3.
+- `rate_key` на маршруте: лимит по заголовку, cookie или `Authorization`.
+- OCSP stapling для SNI-сертификатов на TCP и QUIC; `ocsp_hook` обновляет все
+  файлы.
+- `cipher_suites`/`curves` для TCP и отдельно для HTTP/3.
+- Клиентские сертификаты, CRL и cipher/curve policy для TLS-upstream'ов в
+  `[upstream_tls]`.
+- `bind` и `proxy_protocol` для исходящих соединений к upstream'ам.
+- Балансировка `random` и настройка keepalive-пула (`keepalive`,
+  `keepalive_secs`).
+- Опции сервера в `servers`: `backup`, `down`, `max_conns` и
+  `slow_start_secs`.
+- Общий DNS-резолвер с TTL, negative TTL и статическими записями
+  `[[resolver.hosts]]`.
+- Кэширование ответов FastCGI, CGI и модулей с буферизацией до
+  `max_item_bytes`.
+- `limits.keepalive_requests` для ограничения запросов на клиентском
+  keep-alive соединении.
+- Именованные зоны кэша `[cache.zones.NAME]` и маршрутный `cache_zone`.
+- `limit_rate`/`limit_rate_after` и `limit_conn_per_ip`.
+- Повторное открытие access-лога по `SIGUSR1` для внешней ротации.
+- `limits.client_header_timeout_secs`.
+- `open_file_cache`/`open_file_cache_ttl_secs` для метаданных статики.
+- `rate_delay` для задержки запросов сверх `requests_per_second`.
+- `workers = "auto"` для числа воркеров по доступным CPU.
+- `$upstream_addr`, `$upstream_status` и `$upstream_response_time` в access-логе.
+- Секция `[http2]` для потоков и окон, поля QUIC-транспорта в `[http3]`.
+- `reject_unknown_sni` для TCP/QUIC: отказ при неизвестном SNI.
+- `verify_ocsp` для проверки stapled OCSP при загрузке.
+- `limit_conn` для ограничения одновременных запросов на маршруте.
+- Переменные `map`/`geo`/`split_clients` в шаблоне access-лога.
+- `lingering_close`, `lingering_timeout_secs` и `reset_timedout_connection`.
+- `keepalive_requests` для upstream-пула (ротация legacy-клиента).
+- Байты запроса/ответа в метриках по route и upstream.
+- `error_pages` с named locations (`@name`) для статики, `return` и `redirect`.
+- `limit_conn_key` для выбора ключа лимита одновременных запросов.
+- `early_hints` с `103 Early Hints` для открытого HTTP/1.1.
+- `sendfile_min_bytes`: мелкие файлы идут потоковым путём, крупные — через sendfile.
+- Постоянный keep-alive цикл для статики, кэш тел и canonical-путей.
+- WebSocket over HTTP/3 через `:protocol = websocket` и HTTP/1.1 upstream.
+- Меньше аллокаций в прокси-пути: cache key только при включённом кэше,
+  access-log entry только при записи, заголовки upstream без лишней копии.
+- Статика быстрее nginx на стенде: 51.7k против 46.5k req/s; ответы с
+  кэшированным телом пишутся одним `write_all`.
+- `h1_pool` — собственный HTTP/1.1 keep-alive пул для upstream.
+- Одинаковые SNI-имена с RSA и ECDSA сертификатами: выбор по signature algorithms.
+- `GET /config` на админском листенере: эффективный конфиг в JSON.
+- Тесты FastCGI/CGI на обрезанные заголовки, длину записи, padding и хвост
+  после `END_REQUEST`.
+- DNS-01 проверен на production CA Let's Encrypt через Cloudflare-зону
+  (`elira-dns-prod.owaw.online`).
+- `request_headers`/`request_remove_headers` на маршруте.
+- Пассивная эвикция upstream: `failures_before_eject` и `eject_secs`.
+- Балансировка `hash` (rendezvous) по IP/заголовку/cookie/URI.
+- Multi-range для статики: `multipart/byteranges`, склейка и лимит 64.
+- Дисковая буферизация ответов upstream (`response_spool_bytes`).
+- TLS на `listen_unix` через общую секцию `[tls]`.
+- Сквозной тест gRPC-трейлеров через собственный HTTP/2-пул.
+- Per-route метрики кэша: `elira_route_cache_requests_total`.
+- Веса upstream-серверов (`weights`) для round robin и least connections.
+- Потоковый лимит тела запроса для chunked-загрузок.
+- Настраиваемые health-пробы: метод, ожидаемые коды, Host.
+- `If-Range` и сильные `ETag` для диапазонов.
+- Лимиты количества и размера заголовков для HTTP/3.
+- Тест клиентских gRPC-трейлеров через HTTP/2-пул.
+- Глобальный бюджет spool-файлов с fallback на streaming.
+- CRL для клиентских сертификатов на TCP и QUIC.
+- `max_concurrent` для проксирующих маршрутов.
+- Буферизация и spooling тела запроса; ретраи `PUT`/`DELETE` с телом.
+- Single-flight заполнение кэша при одновременных промахах.
+- Политика `retry_on`: ошибки, таймауты и 5xx.
+- Права и владелец unix-сокета (`listen_unix_mode`, `listen_unix_owner`).
+- Буферизация chunked-тел запроса с replay префикса при переполнении.
+- Replay префикса для тел с `Content-Length` выше spool-лимита.
+- Дополнительные TCP-листенеры с отдельным TLS.
+- `user`, `worker_rlimit_nofile` и `pid_file`.
+- L4 TCP/UDP stream-прокси с TLS-терминацией.
+- Общий TLS 1.3 ticket key между воркерами.
+- Переменные `$host`, `$remote_addr`, `$request_uri` и другие в заголовках и
+  редиректах.
+- Переменные в путях `error_pages`.
+- `alias`, `expires_secs` и `etag = false` для статики.
+- `return` с переменными в теле и `content_type`.
+- `[[rewrites]]`: regex-замены пути с `last`/`break`/`redirect`/`permanent`.
+- `[[maps]]`: именованные переменные из таблицы значений.
+- `[[geos]]`, `[[splits]]` и route-level `if` с `return`.
+- `match = "exact"` и `no_regex` (`location =` и `^~`).
+- `[[routes.locations]]`: вложенные location с наследованием цели и пути.
+- `name = "@fallback"` и `internal` для внутренних переходов из `try_files`.
+- `CONNECT` поверх HTTP/2 и WebSocket over HTTP/2 (RFC 8441) с трансляцией
+  extended `CONNECT` в HTTP/1.1 `Upgrade` для upstream.
+- SCGI upstream через `scgi_pass`, `scgi_root` и `scgi_param`.
+- uWSGI upstream через `uwsgi_pass`, `uwsgi_modifier1/2` и `uwsgi_param`.
+- AJP13 upstream через `ajp_pass` и `ajp_secret`.
+- `auth_request` с внутренними маршрутами авторизации.
+- `satisfy any/all` для ACL, `auth_file` и `auth_request`.
+- `secure_link` с query- и path-формой, base64url/hex и сроком действия.
+- `X-Accel-Redirect` и `X-Sendfile` с ограничением файлов корнем маршрута.
+- `error_page` со сменой статуса (`404 =200 /404.html`).
+- `if_modified_since = false` для статики.
+- `cache_valid` для TTL по статусам ответа.
+- `cache_key` и `cache_bypass` для управления ключом и обходом кэша.
+- Перезапись заголовков upstream: `proxy_hide_header`, `proxy_pass_header`,
+  `proxy_redirect`, `proxy_cookie_domain/path`.
+- `CONNECT` поверх HTTP/3 с прямым туннелем QUIC-потока.
+- FastCGI multiplexing через `fastcgi_multiplex`.
+- OpenSSL TLS backend (`tls.backend = "openssl"`) с TLS 1.0/1.1/1.2/1.3,
+  SNI, mTLS, CRL, OCSP и общим `ticket_key`.
+- `Cache-Control: must-revalidate` запрещает stale-выдачу; `Expires`/`Date`
+  задают TTL, если `max-age` нет. Запросы с `no-cache`/`no-store` обходят кэш.
+- Заголовки `Forwarded` и `X-Forwarded-Port` к upstream.
+- Задокументировано, что handoff установленных соединений между воркерами не
+  выполняется: воркер дожидается активных запросов и завершается.
+- `cache.shared`: read-through общего дискового кэша между воркерами,
+  общий бюджет, advisory-lock и стабильное имя файла на key+Vary.
+- `http3.idle_timeout_secs` и `http3.early_data` (0-RTT проверен QUIC-клиентом);
+  настройки TLS resumption
+  (`session_tickets`, `session_cache`).
+- `POST /cache/purge?prefix=` и prefix-инвалидация кэша во всех воркерах.
+- `dns_cleanup_hook` для удаления TXT после DNS-01 и OCSP hook в режиме
+  воркеров.
+- `elira migrate` переносит `try_files`, `add_header`, `allow`/`deny`,
+  `auth_basic_user_file`, `client_max_body_size`, `gzip`, TLS и regex-location.
+- FastCGI-бэкенды по TCP и unix-сокетам, CGI-скрипты и нативные
+  динамические модули (`.so`).
+- Режим `workers > 1` с супервизором, SO_REUSEPORT, перезапуском упавших
+  воркеров и rolling restart по SIGUSR2.
+- HTTP/2 prior knowledge (h2c) на plain TCP.
+- Fuzz-цели для конфига, мигратора, заголовков и PROXY protocol; CI-джобы
+  MSRV, `cargo-audit`, `cargo-deny`, musl и Docker; e2e-тесты mTLS и
+  неудачного hot restart.
+- Dockerfile, unit для systemd и release workflow для `x86_64` и `aarch64`.
+
+### Changed
+
+Нет. 0.1.0 — первый выпуск.
+
+### Fixed
+
+Нет. 0.1.0 — первый выпуск.
+
+### Security
+
+Исправленных уязвимостей нет. `CONNECT` выключен по умолчанию и ограничен явным
+списком назначений; статика не выходит за пределы `root`; клиентские
+forwarding-заголовки не передаются upstream'у. О проблемах безопасности
+сообщайте по правилам из [SECURITY.md](SECURITY.md).

@@ -1,0 +1,18 @@
+listen = "127.0.0.1:8080"
+
+[limits]
+max_headers = 64
+max_header_bytes = 16384
+max_connections = 1024
+idle_timeout_secs = 60
+max_body_bytes = 1048576
+
+[compression]
+enabled = true
+min_bytes = 1024
+
+[[routes]]
+host = "*"
+root = "/srv/www"
+index = ["index.html"]
+spa = true

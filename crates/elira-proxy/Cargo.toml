@@ -1,0 +1,45 @@
+[package]
+name = "elira-proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+elira-accesslog = { path = "../elira-accesslog" }
+elira-auth = { path = "../elira-auth" }
+elira-cache = { path = "../elira-cache" }
+elira-cgi = { path = "../elira-cgi" }
+elira-config = { path = "../elira-config" }
+elira-fastcgi = { path = "../elira-fastcgi" }
+elira-h1upstream = { path = "../elira-h1upstream" }
+elira-h2 = { path = "../elira-h2" }
+elira-h3upstream = { path = "../elira-h3upstream" }
+elira-module = { path = "../elira-module" }
+elira-tls = { path = "../elira-tls" }
+elira-upstream = { path = "../elira-upstream" }
+elira-wasm = { path = "../elira-wasm" }
+elira-limit = { path = "../elira-limit" }
+futures-util = { workspace = true }
+httpdate = { workspace = true }
+ipnet = { workspace = true }
+libc = { workspace = true }
+async-compression = { workspace = true }
+base64 = { workspace = true }
+md-5 = { workspace = true }
+percent-encoding = { workspace = true }
+regex = { workspace = true }
+tokio-rustls = { workspace = true }
+tokio-util = { workspace = true }
+bytes = { workspace = true }
+http = { workspace = true }
+http-body = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+hyper-rustls = "0.27.10"
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tempfile = "3"
+tracing = { workspace = true }

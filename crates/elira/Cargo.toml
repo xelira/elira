@@ -1,0 +1,54 @@
+[package]
+name = "elira"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "HTTP server and reverse proxy"
+
+[dependencies]
+elira-accesslog = { path = "../elira-accesslog" }
+elira-auth = { path = "../elira-auth" }
+elira-acme = { path = "../elira-acme" }
+elira-cgi = { path = "../elira-cgi" }
+elira-config = { path = "../elira-config" }
+elira-fastcgi = { path = "../elira-fastcgi" }
+elira-module = { path = "../elira-module" }
+elira-h3 = { path = "../elira-h3" }
+elira-metrics = { path = "../elira-metrics" }
+elira-migrate = { path = "../elira-migrate" }
+elira-proxy = { path = "../elira-proxy" }
+elira-tls = { path = "../elira-tls" }
+anyhow = { workspace = true }
+libc = { workspace = true }
+arc-swap = { workspace = true }
+clap = { workspace = true }
+http = { workspace = true }
+httpdate = { workspace = true }
+http-body = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+rustls = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+socket2 = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+bcrypt = "0.17"
+base64 = "0.22"
+md-5 = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
+h3 = { workspace = true }
+h3-quinn = { workspace = true }
+openssl = { workspace = true }
+quinn = { workspace = true }
+elira-upstream = { path = "../elira-upstream" }
+elira-wasm = { path = "../elira-wasm" }
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
+time = "0.3"

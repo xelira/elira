@@ -1,0 +1,43 @@
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+
+    "RUSTSEC-2025-0134",
+]
+
+[licenses]
+version = 2
+
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "OpenSSL",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.8
+exceptions = []
+
+unused-allowed-license = "allow"
+
+[bans]
+
+multiple-versions = "allow"
+
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = ["https://github.com/hyperium/h3"]

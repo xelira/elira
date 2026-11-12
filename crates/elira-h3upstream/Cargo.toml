@@ -1,0 +1,31 @@
+[package]
+name = "elira-h3upstream"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+elira-upstream = { path = "../elira-upstream" }
+futures-util = { workspace = true }
+h3 = { workspace = true }
+h3-quinn = { workspace = true }
+http = { workspace = true }
+http-body = { workspace = true }
+http-body-util = { workspace = true }
+quinn = { workspace = true }
+rustls = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+elira-config = { path = "../elira-config" }
+elira-h3 = { path = "../elira-h3" }
+elira-metrics = { path = "../elira-metrics" }
+elira-proxy = { path = "../elira-proxy" }
+elira-tls = { path = "../elira-tls" }
+hyper = { workspace = true }
+hyper-util = { workspace = true }

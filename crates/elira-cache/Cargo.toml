@@ -1,0 +1,15 @@
+[package]
+name = "elira-cache"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+http = { workspace = true }
+httpdate = { workspace = true }
+libc = { workspace = true }
+
+[[bench]]
+name = "cache"
+harness = false
