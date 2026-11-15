@@ -52,7 +52,7 @@ rustls-pemfile = "2"
 tokio-rustls = "0.26"
 openssl = "0.10"
 openssl-sys = "0.9"
-foreign-types-shared = "0.1"
+foreign-types-shared = "0.3"
 tokio-openssl = "0.6"
 quinn = "0.11"
 h3 = { git = "https://github.com/hyperium/h3", rev = "43745ad87e95b0c035ac9c547aad467303213425" }
