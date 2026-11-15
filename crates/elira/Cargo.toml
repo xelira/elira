@@ -40,7 +40,7 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 bcrypt = "0.17"
-base64 = "0.22"
+base64 = "0.23"
 md-5 = { workspace = true }
 bytes = { workspace = true }
 futures-util = { workspace = true }

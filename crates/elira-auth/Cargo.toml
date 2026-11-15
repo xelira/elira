@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-base64 = "0.22"
+base64 = "0.23"
 bcrypt = "0.17"
 ipnet = { workspace = true }
 thiserror = { workspace = true }
