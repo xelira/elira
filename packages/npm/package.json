@@ -1,0 +1,29 @@
+{
+  "name": "elira",
+  "version": "0.0.2",
+  "description": "HTTP server and reverse proxy. Launcher for the native elira binary.",
+  "license": "MIT",
+  "main": "index.js",
+  "bin": {
+    "elira": "./bin/elira.js"
+  },
+  "files": [
+    "index.js",
+    "bin/elira.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xelira/elira.git"
+  },
+  "keywords": [
+    "http",
+    "server",
+    "proxy",
+    "reverse-proxy"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}

@@ -1,0 +1,6 @@
+listen = "127.0.0.1:8080"
+
+[[routes]]
+host = "cgi.example"
+path = "/cgi"
+cgi_pass = "/srv/cgi/hello"

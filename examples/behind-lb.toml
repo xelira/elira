@@ -1,0 +1,22 @@
+listen = "0.0.0.0:443"
+proxy_protocol = true
+
+[limits]
+trusted_proxies = ["10.0.0.0/8"]
+
+[tls]
+cert = "/etc/elira/fullchain.pem"
+key = "/etc/elira/privkey.pem"
+
+[http3]
+listen = "0.0.0.0:443"
+cert = "/etc/elira/fullchain.pem"
+key = "/etc/elira/privkey.pem"
+
+[[upstreams]]
+name = "app"
+servers = ["10.0.0.21:8080", "10.0.0.22:8080"]
+
+[[routes]]
+host = "*"
+upstream = "app"

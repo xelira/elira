@@ -1,0 +1,28 @@
+listen = "127.0.0.1:8080"
+proxy_protocol = false
+
+[limits]
+max_headers = 64
+max_header_bytes = 16384
+upstream_timeout_secs = 30
+max_connections = 1024
+
+[log]
+format = "text"
+
+[compression]
+enabled = true
+min_bytes = 1024
+
+[cache]
+enabled = false
+ttl_secs = 60
+max_item_bytes = 1048576
+
+[[upstreams]]
+name = "app"
+servers = ["127.0.0.1:3000"]
+
+[[routes]]
+host = "*"
+upstream = "app"

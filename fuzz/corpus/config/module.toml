@@ -1,0 +1,7 @@
+listen = "127.0.0.1:8080"
+
+[[routes]]
+host = "module.example"
+path = "/app"
+module = "/etc/elira/hello.so"
+module_sandbox = true

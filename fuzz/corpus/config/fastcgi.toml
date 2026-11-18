@@ -1,0 +1,8 @@
+listen = "127.0.0.1:8080"
+
+[[routes]]
+host = "php.example"
+path = "/"
+fastcgi_pass = "unix:/run/php/php-fpm.sock"
+fastcgi_root = "/srv/www"
+fastcgi_index = "index.php"

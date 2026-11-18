@@ -1,0 +1,10 @@
+[package]
+name = "elira-pem"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+base64 = { workspace = true }
+rustls-pki-types = { workspace = true }
