@@ -1,0 +1,2 @@
+Test-only self-signed certificate for localhost, valid for 100 years.
+Not trusted by anything and not used outside the unit tests.

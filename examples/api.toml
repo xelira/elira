@@ -1,0 +1,31 @@
+listen = "127.0.0.1:8080"
+
+[limits]
+max_headers = 64
+max_header_bytes = 16384
+upstream_timeout_secs = 30
+max_connections = 2048
+idle_timeout_secs = 60
+max_body_bytes = 8388608
+requests_per_second = 100
+burst = 200
+trusted_proxies = ["10.0.0.0/8", "192.168.0.0/16"]
+
+[health]
+enabled = true
+path = "/health"
+interval_secs = 5
+timeout_secs = 2
+
+[metrics]
+listen = "127.0.0.1:9090"
+
+[[upstreams]]
+name = "api"
+servers = ["10.0.0.11:8080", "10.0.0.12:8080"]
+balance = "least_conn"
+retries = 2
+
+[[routes]]
+host = "*"
+upstream = "api"

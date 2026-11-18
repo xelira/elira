@@ -1,0 +1,1 @@
+$remote_addr - $host "$request" $status $body_bytes_sent "$http_user_agent" $request_time

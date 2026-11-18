@@ -1,0 +1,21 @@
+[package]
+name = "elira-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Sandboxed WebAssembly module runtime used by the elira proxy"
+publish = false
+
+[dependencies]
+elira-module = { path = "../elira-module" }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+wasmi = "2.0.0"
+
+[dev-dependencies]
+wat = "1"
+
+[lib]
+name = "elira_wasm"
+path = "src/lib.rs"

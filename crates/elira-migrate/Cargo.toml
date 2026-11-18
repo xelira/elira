@@ -1,0 +1,13 @@
+[package]
+name = "elira-migrate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ipnet = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+elira-config = { path = "../elira-config" }

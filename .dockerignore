@@ -1,0 +1,15 @@
+.git
+.github
+target
+fuzz
+dist
+docs
+examples
+notes
+packages
+deploy
+scripts
+*.pem
+*.key
+*.htpasswd
+.env
